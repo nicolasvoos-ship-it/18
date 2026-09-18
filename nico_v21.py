@@ -1,0 +1,1004 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""NICO V21 - moteur unique de dossier.
+
+Usage :  python3 nico_v21.py Dossier_Societe_TICKER_AAAA-MM-JJ.json [-o dossier_sortie]
+
+Fait tout ce qui est mecanique, pour que le modele n'ecrive que des faits et des phrases :
+  1. calculs financiers (TRI, flux ponderes, P12/P15/P18, capital preserve, horizons,
+     regime alternatif, decomposition du TRI, multiple exige, croissance exigee, taille, tranches)
+  2. attribution des niveaux de couleur selon le bareme du fichier A V21 (section 13)
+  3. controles automatiques (ordre des prix, residus, garde-fous de clause, coherence du verdict)
+  4. rendu HTML autonome fond noir (le livrable)
+  5. ligne NICO 16 champs + resume de chat
+
+Aucun appel reseau. Les seuils sont ici ET dans le fichier A : ne jamais modifier l'un sans l'autre.
+"""
+import json, sys, os, re, math, html, copy, statistics as stx
+
+TOB, TAX_PV = 0.0035, 0.10
+POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
+WARN, CHK = [], []
+
+
+def warn(m):
+    if m not in WARN:
+        WARN.append(m)
+
+
+def chk(lib, etat, note=''):
+    CHK.append((lib, etat, note))
+
+
+# ------------------------------------------------------------------ utilitaires
+def V(x):
+    """Valeur compacte : scalaire, ou [valeur, provenance, source, note]."""
+    if isinstance(x, list) and x and not isinstance(x[0], (list, dict)):
+        y = list(x) + ['', '', '']
+        return {'v': y[0], 'prov': y[1], 'src': y[2], 'note': y[3]}
+    if isinstance(x, dict) and 'v' in x:
+        return {'v': x.get('v'), 'prov': x.get('prov', ''), 'src': x.get('source', ''), 'note': x.get('note', '')}
+    return {'v': x, 'prov': '', 'src': '', 'note': ''}
+
+
+def vv(x):
+    return V(x)['v']
+
+
+def G(d, path, default=None):
+    cur = d
+    for k in path.split('.'):
+        if isinstance(cur, dict) and cur.get(k) is not None:
+            cur = cur[k]
+        else:
+            return default
+    return cur
+
+
+def num(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and not (isinstance(x, float) and math.isnan(x))
+
+
+def fr(x, d=1, signe=False):
+    if not num(x):
+        return 'n.d.'
+    s = ('%+.*f' % (d, x)) if signe else ('%.*f' % (d, x))
+    ent, _, dec = s.partition('.')
+    neg = ent.startswith('-') or ent.startswith('+')
+    tete, corps = (ent[0], ent[1:]) if neg else ('', ent)
+    groupes = []
+    while len(corps) > 3:
+        groupes.insert(0, corps[-3:])
+        corps = corps[:-3]
+    groupes.insert(0, corps)
+    out = tete + '\u202f'.join(groupes)
+    return out + (',' + dec if dec else '')
+
+
+def fprix(p):
+    return 'n.d.' if not num(p) else fr(p, 0 if abs(p) >= 100 else 1 if abs(p) >= 10 else 2)
+
+
+# ------------------------------------------------------------------ niveaux
+def cut(x, bornes, niveaux):
+    if not num(x):
+        return 'gris'
+    for b, n in zip(bornes, niveaux):
+        if x < b:
+            return n
+    return niveaux[-1]
+
+
+L_PCT = lambda x: cut(x, [25, 40, 55, 70, 90], [1, 2, 3, 4, 5, 6])
+L_RDT = lambda x: cut(x, [0, 8, 12, 15, 18], [1, 2, 3, 4, 5, 6])
+L_CAP = lambda x: cut(x, [50, 70, 80, 90, 100], [1, 2, 3, 4, 5, 6])
+L_SECT = lambda x: cut(x, [-5, 0, 3, 6, 10], [1, 2, 3, 4, 5, 6])
+L_SPREAD = lambda x: cut(x, [0, 2, 4], [2, 3, 4, 5])
+L_CENT = lambda p: 'gris' if not num(p) else (6 if p <= 25 else 5 if p <= 50 else 4 if p <= 75 else 3 if p <= 90 else 2 if p <= 97 else 1)
+L_PART = lambda p: 'gris' if not num(p) else (2 if p > 50 else 3 if p > 40 else 4 if p > 25 else 5)
+
+
+def L_D(d, gain_etaye=False):
+    """Echelle d du stress -20 % et des canaux de regime (pire borne)."""
+    if not num(d):
+        return 'gris'
+    if d <= -40: return 1
+    if d <= -20: return 2
+    if d <= -5:  return 3
+    if d < -1:   return 4
+    if d <= 1:   return 5
+    return 6 if gain_etaye else 5
+
+
+FAM = {
+    'ia': {'MENAC\u00c9, MOTEUR': 1, 'MOTEUR PRINCIPAL COMPROMIS': 1, 'MESUR\u00c9': 6, 'PLAUSIBLE': 5,
+           'NEUTRE \u00c9TAY\u00c9': 4, 'MENAC\u00c9': 2, 'IND\u00c9TERMIN\u00c9': 'gris'},
+    'capex': {'DIRECT MAT\u00c9RIEL': 2, 'IND\u00c9TERMIN\u00c9': 'gris', 'INDIRECT': 4, 'DIRECT': 3, 'FAIBLE': 5},
+    'prix': {'INT\u00c9GRAL': 6, 'EXCEPTIONNEL': 6, 'FORT': 5, 'INDEX\u00c9': 4, 'LIMIT\u00c9': 3,
+             'SUBI': 2, 'N\u00c9GATIF': 2, 'IND\u00c9TERMIN\u00c9': 'gris', 'PLAUSIBLE NON D\u00c9MONTR\u00c9': 'gris'},
+    'invest': {'SOUS LE CO\u00dbT': 2, 'EN AM\u00c9LIORATION': 5, 'STABLES': 4, 'EN BAISSE': 3, 'INCONNUS': 'gris'},
+    'protection': {'MARCH\u00c9 MA\u00ceTRIS\u00c9': 5, 'EXTENSION': 4, 'NOUVEAU TERRAIN': 3, 'NON DOCUMENT\u00c9': 'gris'},
+    'resultats': {'R\u00c9VISION DURABLE': 6, 'ALERTE MOD\u00c9LIS\u00c9E': 3, 'D\u00c9T\u00c9RIORATION': 2,
+                  'CONFIRMATION': 5, 'INFLEXION': 4, 'VETO': 1, 'IND\u00c9TERMIN\u00c9': 'gris'},
+    'inities': {'VENTES NON CORROBOR\u00c9ES': 3, 'ACHATS SIGNIFICATIFS': 6, 'VENTES CORROBOR\u00c9ES': 2,
+                'ACHATS LIMIT\u00c9S': 5, 'NEUTRE V\u00c9RIFI\u00c9': 4, 'INDISPONIBLE': 'gris'},
+    'actionnariat': {'FONDATEUR ALIGN\u00c9': 6, 'FAMILLE': 6, 'CONTR\u00d4LE SANS ALIGNEMENT': 3,
+                     'INITI\u00c9S SIGNIFICATIFS': 5, 'CAPITAL DISPERS\u00c9': 4, 'EXTRACTION': 2, 'NON DOCUMENT\u00c9': 'gris'},
+    'kpi': {'CROISSANCE SANS CO\u00dbT': 3, 'ALIGN\u00c9 PAR ACTION': 6, 'NON PUBLI\u00c9': 'gris',
+            'D\u00c9SALIGN\u00c9': 2, 'ALIGN\u00c9': 5, 'MIXTE': 4},
+    'achat': {'WATCHLIST \u2014 CONFIRMATION': 3, 'WATCHLIST \u2014 GUIDANCE': 3, 'ACHAT COMPL\u00c9MENTAIRE': 5,
+              'HORS P\u00c9RIM\u00c8TRE': 'doc', 'WATCHLIST PROCHE': 4, 'WATCHLIST LOIN': 3, 'HORS S\u00c9LECTION': 2,
+              '\u00c0 DOCUMENTER': 'doc', 'RENFORCEMENT': 5, 'CONFIRMATION': 3, 'GUIDANCE': 3, 'REJET': 1, 'ACHAT': 6},
+    'suivi': {'SOUS SURVEILLANCE': 4, 'SP\u00c9CULATIVE': 3, 'CONSERVER': 5, 'RETIRER': 2},
+    'fiab': {'A': 6, 'B': 5, 'C': 3, 'D': 1},
+    'momentum': {'FAVORABLE': 5, 'D\u00c9FAVORABLE': 3, 'MIXTE': 4, 'IND\u00c9TERMIN\u00c9': 'gris'},
+    'mult_exige': {'COMPATIBLE': 5, 'EXIGEANT': 3, 'NON \u00c9TAY\u00c9': 2},
+    'resilience': {'ROBUSTE': 5, 'PARI DE R\u00c9GIME': 3, 'SENSIBLE': 4, 'PEU SENSIBLE': 4, 'NON \u00c9VALU\u00c9': 'gris'},
+}
+
+
+def L_LAB(fam, lab):
+    if not lab:
+        return 'gris'
+    u = str(lab).upper()
+    for k in sorted(FAM[fam], key=len, reverse=True):
+        if k in u:
+            return FAM[fam][k]
+    return 'gris'
+
+
+# ------------------------------------------------------------------ qualite
+PIL = [('modele', 'Mod\u00e8le, moat, durabilit\u00e9', 20), ('visibilite', 'Visibilit\u00e9 des flux', 15),
+       ('capital', 'Rendement du capital', 20), ('cash', 'Cash et sinc\u00e9rit\u00e9', 15),
+       ('bilan', 'Bilan et financement', 15), ('direction', 'Direction et allocation', 15)]
+
+
+def calc_qualite(q, wacc_absent):
+    ctr = q.get('controles') or {}
+    num_, den = 0.0, 0.0
+    pil = {}
+    for k, lab, w in PIL:
+        cs = (ctr.get(k) or [])[:3]
+        notes, textes = [], []
+        for i in range(3):
+            c = cs[i] if i < len(cs) else None
+            if isinstance(c, list):
+                notes.append(c[0]); textes.append(c[1] if len(c) > 1 else '')
+            else:
+                notes.append(c); textes.append('')
+        if k == 'capital' and wacc_absent and num(notes[0]) and notes[0] > 0.5:
+            notes[0] = 0.5
+            warn('WACC absent : contr\u00f4le Capital 1 plafonn\u00e9 \u00e0 0,5 par le moteur.')
+        obs = [n for n in notes if num(n)]
+        for n in obs:
+            num_ += w / 3 * n
+            den += w / 3
+        pil[k] = {'lab': lab, 'poids': w, 'obs': len(obs), 'notes': notes, 'textes': textes,
+                  'pct': (100 * sum(obs) / len(obs)) if obs else None}
+    Q = 100 * num_ / den if den else None
+    cov = den
+    partiel = [k for k, p in pil.items() if p['obs'] < 3]
+    provisoire = (cov < 80) or any(p['obs'] < 2 for p in pil.values())
+    m = pil['modele']['notes']
+    porte = (num(Q) and Q >= 70 and cov >= 80 and not provisoire and not q.get('blocage')
+             and num(m[1]) and m[1] >= 0.5 and num(m[2]) and m[2] >= 0.5
+             and all((p['pct'] is not None and p['pct'] >= 50) for k, p in pil.items() if k != 'visibilite'))
+    vis = pil['visibilite']['pct']
+    return {'Q': Q, 'cov': cov, 'pil': pil, 'partiel': partiel, 'provisoire': provisoire,
+            'porte': bool(porte), 'vis': vis, 'niveau': L_PCT(Q)}
+
+
+def roic_badge(serie, wacc):
+    vals = [s[1] for s in (serie or []) if isinstance(s, (list, tuple)) and num(s[1])]
+    out = {'n': len(vals), 'med': None, 'min': None, 'last': None, 'au_dessus': None, 'iqr': None,
+           'vals': vals, 'annees': [s[0] for s in (serie or []) if isinstance(s, (list, tuple)) and num(s[1])],
+           'wacc': wacc}
+    n = len(vals)
+    if n == 0:
+        return dict(out, lab='NON DOCUMENT\u00c9E', lvl='gris')
+    out['med'], out['min'], out['last'] = stx.median(vals), min(vals), vals[-1]
+    if n >= 4:
+        qs = stx.quantiles(vals, n=4, method='inclusive')
+        out['iqr'] = qs[2] - qs[0]
+    if n < 3:
+        return dict(out, lab='HISTORIQUE INSUFFISANT', lvl='gris')
+    if not num(wacc):
+        return dict(out, lab='CO\u00dbT DU CAPITAL NON \u00c9VALU\u00c9', lvl='gris')
+    ab = sum(1 for v in vals if v > wacc)
+    out['au_dessus'] = ab
+    iqr = out['iqr'] if out['iqr'] is not None else 0
+    if n >= 5 and out['med'] <= 0:
+        lab, l = 'DESTRUCTION PERSISTANTE', 1
+    elif out['med'] <= wacc:
+        lab, l = 'SOUS LE CO\u00dbT DU CAPITAL', 2
+    elif ab <= n / 2 or out['last'] <= wacc:
+        lab, l = 'FRAGILE', 3
+    elif ab < n or iqr > 5:
+        lab, l = 'IRR\u00c9GULI\u00c8RE', 4
+    elif n < 5:
+        lab, l = 'HISTORIQUE COURT', 4
+    elif out['min'] >= wacc + 3 and out['med'] >= wacc + 8:
+        lab, l = 'RENTABILIT\u00c9 DURABLE EXCEPTIONNELLE', 6
+    else:
+        lab, l = 'RENTABLE ET STABLE', 5
+    if n < 5 and isinstance(l, int) and l > 4:
+        lab, l = 'HISTORIQUE COURT', 4
+    return dict(out, lab=lab, lvl=l)
+
+
+def barC(x):
+    if not num(x):
+        return None
+    return 100 if x >= 15 else 80 if x >= 10 else 60 if x >= 6 else 35 if x >= 3 else 10 if x >= 0 else 0
+
+
+# ------------------------------------------------------------------ moteur financier
+def bpa_at(sc, base, t, gt):
+    b = [base if num(base) else sc['bpa'][0]] + list(sc['bpa'])
+    if t <= 4:
+        i = int(math.floor(t)); f = t - i
+        if f == 0:
+            return b[i]
+        a, c = b[i], b[i + 1]
+        return a * (c / a) ** f if (a > 0 and c > 0) else a + (c - a) * f
+    return b[4] * (1 + gt / 100.0) ** (t - 4)
+
+
+def dps_at(sc, k, gt):
+    d = sc.get('dps') or [0, 0, 0, 0]
+    return d[k - 1] if k <= 4 else d[3] * (1 + gt / 100.0) ** (k - 4)
+
+
+def fx_at(sc, x0, t):
+    f = sc.get('fx')
+    if not f:
+        return x0
+    return f[min(max(int(math.ceil(t)), 1), 4) - 1]
+
+
+def flux(P, sc, ctx, h=4.0, mult=None, divs=True):
+    x0 = ctx['x0']; B = P * x0
+    I0 = B * (1 + TOB + ctx['fa'])
+    cf = {0.0: -I0}
+    if divs:
+        for k in range(1, int(math.floor(h)) + 1):
+            cf[float(k)] = cf.get(float(k), 0.0) + dps_at(sc, k, ctx['gt']) * fx_at(sc, x0, k) * ctx['net_div']
+    m = sc['multiple'] if mult is None else mult
+    S = max(0.0, bpa_at(sc, ctx['base'], h, ctx['gt']) * m * fx_at(sc, x0, h))
+    vente = S - TAX_PV * max(S - B, 0.0) - S * (TOB + ctx['fv'])
+    cf[float(h)] = cf.get(float(h), 0.0) + vente
+    return sorted(cf.items()), I0
+
+
+def flux_pond(P, scs, ctx, h=4.0, mult_central=None):
+    tot = {}
+    for nom in ('baissier', 'central', 'haussier'):
+        sc = scs[nom]
+        w = sc.get('poids', POIDS_DEF[nom])
+        cfs, _ = flux(P, sc, ctx, h, mult_central if nom == 'central' else None)
+        for t, c in cfs:
+            tot[t] = tot.get(t, 0.0) + w * c
+    return sorted(tot.items())
+
+
+def npv(r, cfs):
+    return sum(c / (1 + r) ** t for t, c in cfs)
+
+
+def tri(cfs):
+    pos = sum(c for t, c in cfs if t > 0 and c > 0)
+    if pos <= 0:
+        return -100.0
+    lo, hi = -0.95, 5.0
+    flo, fhi = npv(lo, cfs), npv(hi, cfs)
+    if flo * fhi > 0:
+        return None
+    for _ in range(160):
+        mid = (lo + hi) / 2
+        if (npv(mid, cfs) > 0) == (flo > 0):
+            lo = mid
+        else:
+            hi = mid
+    return 100 * (lo + hi) / 2
+
+
+def prix_pour(r, fabrique, pmax):
+    f = lambda P: npv(r, fabrique(P))
+    lo, hi = 1e-6, max(pmax, 1.0)
+    if f(lo) <= 0:
+        return None
+    n = 0
+    while f(hi) > 0 and n < 40:
+        hi *= 2; n += 1
+    if f(hi) > 0:
+        return None
+    for _ in range(140):
+        mid = (lo + hi) / 2
+        if f(mid) > 0:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+def cap_preserve(P, sc, ctx):
+    cfs, I0 = flux(P, sc, ctx)
+    return 100 * sum(c for t, c in cfs if t > 0) / I0
+
+
+def calculer(D):
+    R = {'calc': False}
+    meta = D.get('meta') or {}
+    valo = D.get('valo') or {}
+    cours = vv(meta.get('cours')); x0 = meta.get('fx_eur', 1.0) or 1.0
+    rent = D.get('rentabilite') or {}
+    R['rentab'] = roic_badge(rent.get('roic'), vv(rent.get('wacc')))
+    R['q'] = calc_qualite(D.get('qualite') or {}, not num(vv(rent.get('wacc'))))
+
+    scs = valo.get('scenarios') or {}
+    base = vv(valo.get('base_normalisee'))
+    gc = G(D, 'croissance.g_centrale')
+    if not num(gc) and scs.get('central') and num(base) and base > 0 and scs['central']['bpa'][3] > 0:
+        gc = 100 * ((scs['central']['bpa'][3] / base) ** 0.25 - 1)
+    go = G(D, 'croissance.g_organique_hist')
+    R['gc'], R['go'] = gc, go
+    bo, bg = barC(go), barC(gc)
+    R['C'] = None if (bo is None or bg is None) else 0.5 * bo + 0.5 * bg
+
+    if not (num(cours) and all(k in scs for k in ('baissier', 'central', 'haussier'))):
+        chk('Calculs financiers', 'n.a.', 'sc\u00e9narios ou cours absents \u2014 arr\u00eat pr\u00e9coce')
+        return R
+
+    wsum = sum(scs[k].get('poids', POIDS_DEF[k]) for k in ('baissier', 'central', 'haussier'))
+    if abs(wsum - 1) > 1e-6:
+        warn('Somme des poids de sc\u00e9narios = %.2f (attendu 1,00).' % wsum)
+    gt = valo.get('croissance_terminale')
+    der = None
+    c4, c3 = scs['central']['bpa'][3], scs['central']['bpa'][2]
+    if c3 > 0:
+        der = 100 * (c4 / c3 - 1)
+    cands = [x for x in (gt, gc, der) if num(x)]
+    gt = min(cands) if cands else 0.0
+    ctx = {'x0': x0, 'base': base, 'gt': gt,
+           'fa': (valo.get('frais_achat_pct') or 0) / 100.0,
+           'fv': (valo.get('frais_vente_pct') or 0) / 100.0,
+           'net_div': (1 - (valo.get('retenue_etrangere') or 0)) * (1 - (valo.get('precompte', 0.30) or 0))}
+    R['ctx'] = ctx
+    C, Bs = scs['central'], scs['baissier']
+
+    cf_c, I0 = flux(cours, C, ctx)
+    R['tri_central'] = tri(cf_c)
+    R['tri_pondere'] = tri(flux_pond(cours, scs, ctx))
+    dispo = [t for t in (R['tri_central'], R['tri_pondere']) if num(t)]
+    R['retenu'] = min(dispo) if dispo else None
+    R['niv_retenu'] = L_RDT(R['retenu'])
+
+    mact = valo.get('multiple_actuel')
+    R['tri_mult_constant'] = tri(flux(cours, C, ctx, 4, mact)[0]) if num(mact) else None
+    A_ = tri(flux(cours, C, ctx, 4, mact, divs=False)[0]) if num(mact) else None
+    B_ = tri(flux(cours, C, ctx, 4, mact)[0]) if num(mact) else None
+    Cc = R['tri_central']
+    R['decomp'] = {'A': A_, 'B': B_, 'C': Cc,
+                   'div': (B_ - A_) if (num(A_) and num(B_)) else None,
+                   'mult': (Cc - B_) if (num(B_) and num(Cc)) else None}
+    R['part_mult'] = (max(0.0, Cc - B_) / Cc * 100) if (num(B_) and num(Cc) and Cc > 0) else None
+    R['niv_part'] = L_PART(R['part_mult'])
+
+    pmax = cours * 20
+    for r, nom in ((0.12, 'P12'), (0.15, 'P15'), (0.18, 'P18')):
+        pc = prix_pour(r, lambda P: flux(P, C, ctx)[0], pmax)
+        pp = prix_pour(r, lambda P: flux_pond(P, scs, ctx), pmax)
+        c_ = [p for p in (pc, pp) if num(p)]
+        R[nom] = min(c_) if c_ else None
+    R['P15_sans_revalo'] = prix_pour(0.15, lambda P: flux(P, C, ctx, 4, mact)[0], pmax) if num(mact) else None
+    if all(num(R[k]) for k in ('P12', 'P15', 'P18')):
+        ok = R['P18'] <= R['P15'] <= R['P12'] + 1e-9
+        chk('Ordre P18 \u2264 P15 \u2264 P12', 'valid\u00e9' if ok else '\u00e9chec')
+        if not ok:
+            warn('Ordre des prix incoh\u00e9rent : v\u00e9rifier les flux.')
+        res = max(abs(npv(r, flux(R[n], C, ctx)[0])) for r, n in ((0.12, 'P12'), (0.15, 'P15'), (0.18, 'P18')))
+        chk('R\u00e9sidus de VAN aux prix r\u00e9solus', 'valid\u00e9' if res < 1e-4 else '\u00e9chec', 'max %.2e' % res)
+
+    R['cap_cours'] = cap_preserve(cours, Bs, ctx)
+    R['cap_P15'] = cap_preserve(R['P15'], Bs, ctx) if num(R['P15']) else None
+    R['niv_cap'] = L_CAP(R['cap_cours'])
+    R['ecart_P15'] = (cours - R['P15']) / cours * 100 if num(R['P15']) else None
+
+    R['horizons'] = {}
+    for h in (2.5, 4.0, 6.5):
+        R['horizons'][h] = {'avec': tri(flux(cours, C, ctx, h)[0]),
+                            'sans': tri(flux(cours, C, ctx, h, mact)[0]) if num(mact) else None}
+    R['tri_bear_25'] = tri(flux(cours, Bs, ctx, 2.5)[0])
+
+    alt = scs.get('alternatif')
+    if alt:
+        m_alt = alt.get('multiple')
+        if valo.get('mediane_regime') is not None and num(mact):
+            refs = [r_ for r_ in (mact, valo.get('mediane_5ans')) if num(r_)]
+            if refs:
+                m_alt = min(m_alt, min(refs)) if num(m_alt) else min(refs)
+        alt2 = dict(alt); alt2['multiple'] = m_alt
+        R['tri_alternatif'] = tri(flux(cours, alt2, ctx)[0])
+    else:
+        R['tri_alternatif'] = None
+    a, b = R['tri_central'], R['tri_alternatif']
+    if num(a) and num(b):
+        if max(a, b) >= 15 and min(a, b) < 8:
+            R['resilience'] = ('PARI DE R\u00c9GIME', 3)
+        elif abs(a - b) > 4:
+            R['resilience'] = ('SENSIBLE AU R\u00c9GIME', 4)
+        elif min(a, b) >= 8:
+            R['resilience'] = ('ROBUSTE AUX R\u00c9GIMES', 5)
+        else:
+            R['resilience'] = ('PEU SENSIBLE, RENDEMENT FAIBLE', 4)
+    else:
+        R['resilience'] = ('NON \u00c9VALU\u00c9', 'gris')
+
+    # multiple exige par le cours
+    f = lambda m: npv(0.15, flux(cours, C, ctx, 4, m)[0])
+    if f(0.0) >= 0:
+        R['mult_exige'] = 0.0
+    else:
+        lo, hi = 0.0, 5.0
+        n = 0
+        while f(hi) < 0 and n < 40:
+            hi *= 2; n += 1
+        R['mult_exige'] = None if f(hi) < 0 else (lambda: None)()
+        if f(hi) >= 0:
+            for _ in range(120):
+                mid = (lo + hi) / 2
+                if f(mid) < 0:
+                    lo = mid
+                else:
+                    hi = mid
+            R['mult_exige'] = (lo + hi) / 2
+    refs = [r_ for r_ in (mact, valo.get('mediane_5ans'), valo.get('pairs')) if num(r_)]
+    me = R['mult_exige']
+    if not num(me):
+        R['mult_exige_lab'] = 'NON \u00c9TAY\u00c9'
+    elif num(C.get('multiple')) and me <= C['multiple'] + 1e-9:
+        R['mult_exige_lab'] = 'COMPATIBLE'
+    elif refs and me <= max(refs):
+        R['mult_exige_lab'] = 'EXIGEANT'
+    else:
+        R['mult_exige_lab'] = 'NON \u00c9TAY\u00c9'
+
+    # croissance exigee (inversion mecanique, seuil indicatif)
+    R['g_exigee'] = None
+    if num(base) and base > 0:
+        def tri_g(g):
+            s2 = dict(C); s2['bpa'] = [base * (1 + g / 100.0) ** k for k in range(1, 5)]
+            return tri(flux(cours, s2, ctx)[0])
+        lo, hi = -50.0, 60.0
+        flo = tri_g(lo)
+        if num(flo):
+            for _ in range(80):
+                mid = (lo + hi) / 2
+                t_ = tri_g(mid)
+                if not num(t_):
+                    break
+                if t_ < 15:
+                    lo = mid
+                else:
+                    hi = mid
+            R['g_exigee'] = (lo + hi) / 2
+
+    # garde-fous de clause
+    clause = (valo.get('clause') or 'aucune').upper()
+    Rmin = [r_ for r_ in (mact, valo.get('mediane_5ans'), valo.get('mediane_regime')) if num(r_)]
+    R['R_plafond'] = min(Rmin) if Rmin else None
+    R['clause'] = clause
+    if 'AUCUNE' in clause:
+        if num(R['R_plafond']) and num(C.get('multiple')) and C['multiple'] > R['R_plafond'] + 1e-9:
+            warn('Sans clause, le multiple central (%.1f) d\u00e9passe R = %.1f.' % (C['multiple'], R['R_plafond']))
+        chk('Plafond de multiple (R)', 'valid\u00e9' if num(R['R_plafond']) else 'n.d.')
+    else:
+        bf = valo.get('bas_fourchette_5ans')
+        exig = min([v for v in (0.8 * mact if num(mact) else None, bf) if num(v)]) if (num(mact) or num(bf)) else None
+        if num(exig) and num(Bs.get('multiple')) and Bs['multiple'] > exig + 1e-9:
+            warn('Garde-fou 1 : multiple baissier %.1f > %.1f exig\u00e9 (clause active).' % (Bs['multiple'], exig))
+        tri_std = tri(flux(cours, C, ctx, 4, R['R_plafond'])[0]) if num(R['R_plafond']) else None
+        if num(tri_std) and num(Cc) and Cc > 0:
+            sup = (Cc - tri_std) / Cc * 100
+            R['supplement_clause'] = sup
+            if sup > 25:
+                warn('Garde-fou 3 : suppl\u00e9ment de TRI de la clause = %.0f %% (>25 %%). R\u00e9duire le multiple central.' % sup)
+        if num(Cc) and Cc <= 0:
+            warn('Garde-fou 3 : TRI avec clause \u2264 0 \u2014 clause inactive, retour \u00e0 R.')
+        chk('Garde-fous de clause', 'valid\u00e9' if not any('Garde-fou' in w for w in WARN) else '\u00e9chec')
+
+    # momentum, taille, tranches
+    mom = D.get('momentum') or {}
+    p6, mm = mom.get('perf6m_rel'), mom.get('vs_mm200')
+    if num(p6) and num(mm):
+        R['momentum'] = 'FAVORABLE' if (p6 > 0 and mm > 0) else 'D\u00c9FAVORABLE' if (p6 < 0 and mm < 0) else 'MIXTE'
+    else:
+        R['momentum'] = 'IND\u00c9TERMIN\u00c9'
+
+    Q = R['q']['Q']; fiab = (meta.get('fiabilite') or 'B').upper()[:1]
+    pari = R['resilience'][0].startswith('PARI')
+    lim = []
+    if num(Q) and Q >= 70:
+        capQ = 6 if Q >= 90 else 5 if Q >= 85 else 4 if Q >= 80 else 3
+        fac = {'A': 1, 'B': 1, 'C': 0.7, 'D': 0}.get(fiab, 1)
+        if pari:
+            fac = min(fac, 0.7)
+        lim.append(('qualit\u00e9 ajust\u00e9e', capQ * fac))
+    vis = R['q']['vis']
+    if num(vis) and vis < 50:
+        lim.append(('visibilit\u00e9 <50 %', 2))
+    L = max(0.0, 1 - R['cap_cours'] / 100) if num(R['cap_cours']) else None
+    if num(L) and L > 0:
+        lim.append(('budget de perte 1,5 %', 1.5 / L))
+    liq = meta.get('liquidite_max_pct')
+    if num(liq):
+        lim.append(('liquidit\u00e9', liq))
+    R['taille'] = {'limites': lim, 'max': min([v for _, v in lim]) if lim else None,
+                   'contrainte': min(lim, key=lambda t: t[1])[0] if lim else None,
+                   'provisoire': not num(liq)}
+    R['tranches'] = '50 / 25 / 25 %' if (R['momentum'] == 'FAVORABLE' and fiab != 'C' and not pari) else '1/3 \u2013 1/3 \u2013 1/3'
+    R['tranche1'] = 'au P15 sans revalorisation (%s)' % fprix(R['P15_sans_revalo']) if (num(R['part_mult']) and R['part_mult'] > 25) else 'au prix admissible (\u2264 P15)'
+    R['priorite'] = ('ACTIF' if cours <= 1.5 * R['P12'] else 'VEILLE') if num(R['P12']) and R['P12'] > 0 else 'non \u00e9valu\u00e9e'
+    R['porte_prix'] = 'ouverte' if (num(R['P15']) and cours <= R['P15']) else ('PROCHE' if (num(R['P12']) and cours <= R['P12']) else 'LOIN')
+
+    ach = (G(D, 'verdict.achat') or '').upper()
+    if 'ACHAT' in ach and 'BLOQU' not in ach and R['porte_prix'] != 'ouverte':
+        warn('Verdict ACHAT alors que le cours est au-dessus de P15 : incoh\u00e9rent.')
+    if num(R['part_mult']) and R['part_mult'] > 50 and ach.startswith('ACHAT'):
+        warn('Part du multiple >50 % : pari de revalorisation, pas d\'ACHAT standard.')
+    chk('TRI, prix et capital pr\u00e9serv\u00e9 calcul\u00e9s par le moteur', 'valid\u00e9')
+    R['calc'] = True
+    return R
+
+
+# ------------------------------------------------------------------ these
+def compter_these(t):
+    mots = [m for m in re.split(r'\s+', (t or '').strip()) if re.search(r'[0-9A-Za-z\u00c0-\u00ff]', m)]
+    phr = [p for p in re.split(r'[.!?]+', t or '') if p.strip()]
+    return len(mots), len(phr)
+
+
+# ------------------------------------------------------------------ rendu HTML
+def esc(s):
+    return html.escape('' if s is None else str(s), quote=True)
+
+
+def lvc(l):
+    return 'ldoc' if l == 'doc' else ('lgris' if l == 'gris' else 'l%s' % l)
+
+
+def bdg(t, l, extra=''):
+    return '<span class="b %s %s">%s</span>' % (lvc(l), extra, esc(t))
+
+
+def prov(p):
+    return '<sup class="pv">%s</sup>' % esc(p) if p else ''
+
+CSS = """
+:root{--l6:#b9f568;--l5:#84dfa6;--l4:#f5d779;--l3:#ffb070;--l2:#ff8090;--l1:#ff2e63;--gris:#7d9598;
+--bg:#000;--carte:#0b1418;--bord:#17272c;--txt:#edf6f5;--cy:#3ed8cc}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font:15px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+background-image:linear-gradient(rgba(62,216,204,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(62,216,204,.04) 1px,transparent 1px);background-size:28px 28px}
+.wrap{max-width:1180px;margin:0 auto;padding:22px 16px 60px}
+h1{font-size:26px;margin:0 0 4px}h2{font-size:15px;letter-spacing:.06em;color:var(--cy);margin:34px 0 12px;border-bottom:1px solid var(--bord);padding-bottom:6px}
+h3{font-size:13px;margin:0 0 10px;color:var(--cy)}
+p{margin:0 0 10px}
+.c{background:var(--carte);border:1px solid var(--bord);border-radius:10px;padding:14px 16px;margin-bottom:14px}
+.grid{display:grid;gap:14px}
+.g4{grid-template-columns:repeat(4,1fr)}.g3{grid-template-columns:repeat(3,1fr)}.g2{grid-template-columns:repeat(2,1fr)}.g5{grid-template-columns:repeat(5,1fr)}
+.head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;border-left:3px solid var(--cy);padding-left:14px;margin-bottom:18px}
+.cours{font-size:30px;color:var(--cy);font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+.sub{color:var(--gris);font-size:12.5px}
+.big{font-size:27px;font-variant-numeric:tabular-nums;margin:2px 0}
+.lab{color:var(--gris);font-size:11.5px;letter-spacing:.04em}
+.b{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11.5px;color:#04100f;background:var(--gris);white-space:nowrap}
+.b.l6{background:var(--l6)}.b.l5{background:var(--l5)}.b.l4{background:var(--l4)}.b.l3{background:var(--l3)}.b.l2{background:var(--l2)}.b.l1{background:var(--l1);color:#fff}
+.b.lgris{background:var(--gris)}.b.ldoc{background:transparent;color:var(--gris);border:1px solid var(--l3)}
+.b.gros{font-size:14px;padding:5px 14px}
+.t6{color:var(--l6)}.t5{color:var(--l5)}.t4{color:var(--l4)}.t3{color:var(--l3)}.t2{color:var(--l2)}.t1{color:var(--l1)}.tgris,.tdoc{color:var(--gris)}
+table{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--bord);vertical-align:top}
+th{color:var(--gris);font-weight:normal;font-size:11.5px}
+td.n,th.n{text-align:right}
+.scroll{overflow-x:auto}
+.bar{height:9px;background:#122026;border-radius:5px;overflow:hidden;margin-top:4px}
+.bar i{display:block;height:100%}
+.pv{color:var(--cy);font-size:9px;margin-left:2px}
+.rl{position:relative;height:46px;margin:16px 0 30px}
+.rl .seg{position:absolute;top:14px;height:12px;border-radius:2px}
+.rl .cur{position:absolute;top:0;transform:translateX(-50%);color:var(--cy);font-size:12px;white-space:nowrap}
+.rl .tick{position:absolute;top:30px;transform:translateX(-50%);font-size:10.5px;color:var(--gris);white-space:nowrap}
+ul{margin:0;padding-left:18px}li{margin-bottom:5px}
+.plus li{color:var(--l5)}.moins li{color:var(--l2)}
+.concl{border:1px solid var(--cy);border-radius:10px;padding:16px 18px;background:linear-gradient(180deg,rgba(62,216,204,.09),rgba(0,0,0,0))}
+.nico{border:1px dashed var(--cy);border-radius:8px;padding:10px 12px;font-size:12.5px;color:var(--cy);word-break:break-all;background:#04100f}
+details{border-top:1px solid var(--bord);padding-top:8px;margin-top:8px}summary{cursor:pointer;color:var(--gris);font-size:12.5px}
+.chart{display:flex;align-items:flex-end;gap:5px;height:90px;margin-top:8px}
+.chart div{flex:1;background:var(--cy);border-radius:2px 2px 0 0;min-height:1px;position:relative}
+.chart div.e{background:repeating-linear-gradient(45deg,var(--cy),var(--cy) 3px,#0b1418 3px,#0b1418 6px)}
+.xl{display:flex;gap:5px;font-size:9.5px;color:var(--gris);margin-top:3px}.xl span{flex:1;text-align:center}
+:focus-visible{outline:2px solid var(--cy);outline-offset:2px}
+@media(max-width:820px){.g4,.g3,.g5,.g2{grid-template-columns:1fr 1fr}.cours{font-size:22px}}
+@media(max-width:430px){.g4,.g3,.g5,.g2{grid-template-columns:1fr}.head{flex-direction:column}body{font-size:14px}}
+@media print{body{background:#fff;color:#000}.c,.concl{border-color:#999}.b{border:1px solid #333}}
+"""
+
+
+def carte(lab, valeur, lvl, sous=''):
+    return ('<div class="c"><div class="lab">%s</div><div class="big t%s">%s</div>'
+            '<div class="sub">%s</div></div>' % (esc(lab), lvl if lvl != 'gris' else 'gris', valeur, sous))
+
+
+def rendu(D, R):
+    meta = D.get('meta') or {}
+    valo = D.get('valo') or {}
+    cours = vv(meta.get('cours')); dev = meta.get('devise', '')
+    out = []
+    A = out.append
+    A('<!doctype html><html lang="fr"><head><meta charset="utf-8">')
+    A('<meta name="viewport" content="width=device-width,initial-scale=1">')
+    A('<title>Dossier %s \u2014 %s</title><style>%s</style></head><body><div class="wrap">' % (
+        esc(meta.get('societe')), esc(meta.get('ticker')), CSS))
+
+    # -- en-tete
+    cm = meta.get('cadre_m') or {}
+    cm_b = ('CADRE M \u00c0 ACTUALISER' if 'ACTUALISER' in str(cm.get('statut', '')).upper() else 'Cadre M du %s' % cm.get('date', 'n.d.'))
+    cm_l = 'doc' if 'ACTUALISER' in cm_b else 'gris'
+    A('<div class="head"><div><h1>%s</h1><div class="sub">%s \u00b7 %s \u00b7 %s \u00b7 %s</div>'
+      '<div class="sub">Mode %s \u00b7 \u00e9valu\u00e9 le %s \u00b7 V21 \u00b7 fiabilit\u00e9 %s \u00b7 %s</div></div>'
+      '<div><div class="cours">%s %s</div><div class="sub">cours du %s</div></div></div>' % (
+          esc(meta.get('societe')), esc(meta.get('ticker')), esc(meta.get('bourse')), esc(meta.get('secteur')),
+          esc(meta.get('pays')), esc(meta.get('mode', 'nouvelle position')), esc(meta.get('date_eval')),
+          esc(meta.get('fiabilite')), bdg(cm_b, cm_l), fprix(cours), esc(dev), esc(meta.get('date_cours'))))
+
+    # -- verdict
+    v = D.get('verdict') or {}
+    A('<div class="c"><div>%s &nbsp; %s</div><p style="margin-top:10px;font-size:16px">%s</p>'
+      '<div class="sub">%s%s</div></div>' % (
+          bdg(v.get('achat', 'n.d.'), L_LAB('achat', v.get('achat')), 'gros'),
+          bdg(v.get('suivi', 'n.d.'), L_LAB('suivi', v.get('suivi')), 'gros'),
+          esc(v.get('phrase')), esc(v.get('cause')),
+          ' \u00b7 ' + esc(v.get('cause2')) if v.get('cause2') else ''))
+
+    # -- 4 cartes
+    q = R['q']
+    A('<div class="grid g4">')
+    A(carte('Qualit\u00e9 (couverture %s %%)' % fr(q['cov'], 0),
+            '%s %%' % fr(q['Q'], 0), q['niveau'],
+            ('provisoire' if q['provisoire'] else 'porte qualit\u00e9 %s' % ('franchie' if q['porte'] else 'non franchie'))))
+    A(carte('Croissance centrale par action', '%s %%/an' % fr(R['gc'], 1), L_PCT(R['C']) if num(R['C']) else 'gris',
+            'score C %s %% (descriptif)' % fr(R['C'], 0)))
+    A(carte('Rendement net retenu', '%s %%/an' % fr(R.get('retenu'), 1), R.get('niv_retenu', 'gris'),
+            'central %s %% \u00b7 pond\u00e9r\u00e9 %s %%' % (fr(R.get('tri_central'), 1), fr(R.get('tri_pondere'), 1))))
+    A(carte('Capital pr\u00e9serv\u00e9 / 100 \u20ac', fr(R.get('cap_cours'), 0), R.get('niv_cap', 'gris'),
+            'baissier \u00e0 4 ans, au cours \u2014 sc\u00e9nario mod\u00e9lis\u00e9'))
+    A('</div>')
+
+    A('<div class="sub" style="margin:6px 0 14px">Tri rapide : %s. Les scores sont des conventions de s\u00e9lection en %%, pas des probabilit\u00e9s.</div>' % esc(meta.get('tri')))
+
+    # -- ACTE 0
+    a0 = D.get('acte0') or {}
+    th = a0.get('these') or {}
+    nbm, nbp = compter_these(th.get('texte'))
+    rev = ''.join('<tr><td>%s</td><td class="n">%s</td><td class="n">%s</td><td>%s</td></tr>' % (
+        esc(r[0]), esc(r[1]), esc(r[2] if len(r) > 2 else ''), prov(r[3] if len(r) > 3 else '')) for r in (a0.get('revenus') or []))
+    lignes = []
+    lignes.append(('Rendement au cours du jour', '%s %%/an' % fr(R.get('retenu'), 1), R.get('niv_retenu', 'gris')))
+    lignes.append(('Prix d\'achat P15', '%s %s' % (fprix(R.get('P15')), dev), 5))
+    ec = R.get('ecart_P15')
+    lignes.append(('\u00c9cart \u00e0 franchir', '%s %%' % fr(ec, 1, True), 5 if (num(ec) and ec <= 0) else 3))
+    if (valo.get('clause') or 'aucune').lower() != 'aucune':
+        lignes.append(('Rendement central \u00e0 multiple constant', '%s %%/an' % fr(R.get('tri_mult_constant'), 1), L_RDT(R.get('tri_mult_constant'))))
+    if R['resilience'][0].startswith(('PARI', 'SENSIBLE')):
+        lignes.append(('Rendement central en r\u00e9gime alternatif', '%s %%/an' % fr(R.get('tri_alternatif'), 1), L_RDT(R.get('tri_alternatif'))))
+    lh = ''.join('<tr><td>%s</td><td class="n t%s">%s</td></tr>' % (esc(l), n if n != 'gris' else 'gris', vtxt) for l, vtxt, n in lignes)
+    A('<div class="grid g2">')
+    A('<div class="c"><h3>Ce qu\'elle fait</h3>'
+      '<p><b>Activit\u00e9</b> \u2014 %s</p><p><b>Positionnement</b> \u2014 %s</p><p><b>Perspectives</b> \u2014 %s</p>'
+      '<div class="scroll"><table>%s</table></div><div class="sub">%s %s</div></div>' % (
+          esc(a0.get('activite')), esc(a0.get('positionnement')), esc(a0.get('perspectives')), rev,
+          esc(V(a0.get('ratio_echelle'))['v']), prov(V(a0.get('ratio_echelle'))['prov'])))
+    A('<div class="c"><h3>La th\u00e8se en 80 mots</h3><p>%s</p>'
+      '<div class="sub">%s mots \u00b7 %s phrases%s</div><table>%s</table></div>' % (
+          esc(th.get('texte')), nbm, nbp,
+          '' if (nbm <= 80 and 3 <= nbp <= 4) else ' \u2014 <span class="t3">hors format</span>', lh))
+    A('</div>')
+
+    # -- bande compacte
+    sec = D.get('secteur') or {}
+    reg = D.get('regime') or {}
+    rb = R['rentab']
+    st = G(D, 'risques.stress') or {}
+    d_pire = min([x for x in (st.get('d_bas'), st.get('d_haut')) if num(x)] or [None]) if any(num(st.get(k)) for k in ('d_bas', 'd_haut')) else None
+    A('<div class="grid g4">')
+    A('<div class="c"><div class="lab">Vent sectoriel</div><div>%s</div><div class="sub">%s \u00b7 %s %s</div></div>' % (
+        bdg('%s \u00e0 %s %%/an' % (fr(sec.get('s_bas'), 1), fr(sec.get('s_haut'), 1)), L_SECT(sec.get('s_bas'))),
+        esc(sec.get('perimetre')), esc(sec.get('periode')), prov(sec.get('prov'))))
+    A('<div class="c"><div class="lab">Rentabilit\u00e9 \u00e9conomique</div><div>%s</div>'
+      '<div class="sub">m\u00e9diane %s %% \u00b7 min %s %% \u00b7 %s</div></div>' % (
+          bdg(rb['lab'], rb['lvl']), fr(rb['med'], 1), fr(rb['min'], 1),
+          bdg(V(G(D, 'rentabilite.nouveaux_investissements'))['v'] or 'INCONNUS',
+              L_LAB('invest', V(G(D, 'rentabilite.nouveaux_investissements'))['v']))))
+    A('<div class="c"><div class="lab">Stress pouvoir d\'achat \u221220 %%</div><div>%s</div><div class="sub">%s</div></div>' % (
+        bdg('%s \u00e0 %s %% de r\u00e9sultat op. an 4' % (fr(st.get('d_bas'), 0), fr(st.get('d_haut'), 0)), L_D(d_pire)),
+        esc(st.get('mecanisme'))))
+    can = reg.get('canaux') or {}
+    noms = [('taux_financement', 'Tx fin.'), ('taux_valorisation', 'Tx valo'), ('croissance_nominale', 'Croiss.'),
+            ('pouvoir_achat', 'Pouv. achat'), ('energie', '\u00c9nergie')]
+    mini = []
+    for k, lab in noms:
+        c = can.get(k) or {}
+        d = c.get('delta') if k == 'taux_valorisation' else c.get('d')
+        mini.append(bdg('%s %s' % (lab, c.get('sens', '')), L_D(d, c.get('gain_etaye', False))))
+    ial = V(G(D, 'risques.ia'))['v']
+    mini.append(bdg('IA', L_LAB('ia', ial)))
+    A('<div class="c"><div class="lab">R\u00e9gime macro</div><div>%s</div><div style="margin-top:8px">%s</div>'
+      '<div class="sub">%s</div></div>' % (' '.join(mini), bdg(R['resilience'][0], R['resilience'][1], 'gros'),
+                                           esc(reg.get('synthese'))))
+    A('</div>')
+
+    pp = V(G(D, 'qualite.pouvoir_prix'))
+    if pp['v'] and any(s in str(pp['v']).upper() for s in ('FORT', 'INT\u00c9GRAL')):
+        A('<div class="c" style="border-color:var(--l5)"><h3>Pouvoir de prix \u2014 test +10 %%</h3><div>%s</div><p>%s</p></div>' % (
+            bdg(pp['v'], L_LAB('prix', pp['v']), 'gros'), esc(pp['prov'] or pp['src'] or G(D, 'qualite.pouvoir_prix_preuve'))))
+
+    # ---------------- bloc 1
+    A('<h2>Comprendre et rep\u00e9rer les risques</h2>')
+    res = D.get('resultats') or {}
+    rp = res.get('reperes') or {}
+    cells = ''.join('<td class="n">%s %%</td>' % fr(rp.get(k), 1, True) for k in ('ca_n1', 'ca_attentes', 'bpa_n1', 'bpa_attentes'))
+    A('<div class="c"><h3>Derniers r\u00e9sultats et guidance</h3><div>%s</div>'
+      '<div class="scroll"><table><tr><th class="n">CA vs N\u22121</th><th class="n">CA vs attentes</th>'
+      '<th class="n">BPA vs N\u22121</th><th class="n">BPA vs attentes</th></tr><tr>%s</tr></table></div>'
+      '<p>%s</p><div class="sub">Confirmations : %s</div></div>' % (
+          bdg(res.get('verdict', 'IND\u00c9TERMIN\u00c9'), L_LAB('resultats', res.get('verdict'))), cells,
+          esc(res.get('guidance') or res.get('commentaire')), esc(' \u00b7 '.join(res.get('confirmations') or []))))
+    rows = ''.join('<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % (
+        esc(r.get('fait')), esc(r.get('mecanisme')), esc(r.get('gravite')), esc(r.get('indicateur')), esc(r.get('hypothese')))
+        for r in (G(D, 'risques.registre') or []))
+    A('<div class="c"><h3>Registre des risques</h3><div class="scroll"><table>'
+      '<tr><th>Fait</th><th>M\u00e9canisme</th><th>Gravit\u00e9</th><th>Indicateur avanc\u00e9</th><th>Hypoth\u00e8se</th></tr>%s</table></div>'
+      '<div style="margin-top:10px">%s %s</div><div class="sub">%s</div></div>' % (
+          rows, bdg('IA : %s' % (ial or 'IND\u00c9TERMIN\u00c9'), L_LAB('ia', ial)),
+          bdg('Cycle capex IA : %s' % (V(G(D, 'risques.capex_ia'))['v'] or 'IND\u00c9TERMIN\u00c9'),
+              L_LAB('capex', V(G(D, 'risques.capex_ia'))['v'])),
+          esc(V(G(D, 'risques.ia'))['prov'])))
+
+    # ---------------- bloc 2
+    A('<h2>Qualit\u00e9 et croissance</h2>')
+    barres = []
+    for k, lab, w in PIL:
+        p = q['pil'][k]
+        lv = L_PCT(p['pct'])
+        barres.append('<div style="margin-bottom:9px"><div class="sub">%s /%s &nbsp; <b class="t%s">%s</b>%s</div>'
+                      '<div class="bar"><i style="width:%s%%;background:var(--%s)"></i></div></div>' % (
+                          esc(lab), w, lv if lv != 'gris' else 'gris',
+                          ('%s %%' % fr(p['pct'], 0)) if p['pct'] is not None else 'n.d.',
+                          '' if p['obs'] == 3 else ' \u2014 %s/3 contr\u00f4les, PARTIEL' % p['obs'],
+                          max(0, min(100, p['pct'] or 0)), lvc(lv).replace('l', 'l') if lv != 'gris' else 'gris'))
+    inconnus = G(D, 'qualite.inconnus') or []
+    A('<div class="grid g2"><div class="c"><h3>Six piliers</h3>%s<div class="sub">Q = %s %% \u00b7 couverture %s %%%s</div></div>' % (
+        ''.join(barres), fr(q['Q'], 0), fr(q['cov'], 0),
+        ' \u00b7 contr\u00f4les inconnus : ' + esc(', '.join(inconnus)) if inconnus else ''))
+    vals = rb['vals']
+    graph = ''
+    if vals:
+        mx = max(vals + ([rb['wacc']] if num(rb['wacc']) else []))
+        graph = '<div class="chart">%s</div><div class="xl">%s</div>' % (
+            ''.join('<div style="height:%s%%"></div>' % max(2, 100 * v / mx if mx else 0) for v in vals),
+            ''.join('<span>%s</span>' % esc(a) for a in rb['annees']))
+    A('<div class="c"><h3>Rentabilit\u00e9 \u00e9conomique \u2014 niveau et stabilit\u00e9</h3><div>%s</div>%s'
+      '<div class="sub">m\u00e9diane %s %% \u00b7 min %s %% \u00b7 derni\u00e8re %s %% \u00b7 %s/%s ann\u00e9es &gt; WACC %s %% \u00b7 IQR %s pts</div>'
+      '<p class="sub">%s</p></div></div>' % (
+          bdg(rb['lab'], rb['lvl'], 'gros'), graph, fr(rb['med'], 1), fr(rb['min'], 1), fr(rb['last'], 1),
+          rb['au_dessus'] if rb['au_dessus'] is not None else 'n.d.', rb['n'], fr(rb['wacc'], 1),
+          fr(rb['iqr'], 1), esc(G(D, 'rentabilite.definition'))))
+
+    A('<div class="grid g2"><div class="c"><h3>Moat et pouvoir de prix</h3><p>%s</p><div>%s</div></div>'
+      '<div class="c"><h3>Direction, initi\u00e9s et alignement</h3><p>%s</p><div>%s %s %s</div><div class="sub">%s</div></div></div>' % (
+          esc(G(D, 'qualite.moat')), bdg(pp['v'] or 'IND\u00c9TERMIN\u00c9', L_LAB('prix', pp['v'])),
+          esc(G(D, 'qualite.direction_txt')),
+          bdg('Initi\u00e9s : %s' % (V(G(D, 'qualite.inities'))['v'] or 'INFORMATION INDISPONIBLE'),
+              L_LAB('inities', V(G(D, 'qualite.inities'))['v'])),
+          bdg(V(G(D, 'gouvernance.actionnariat'))['v'] or 'NON DOCUMENT\u00c9',
+              L_LAB('actionnariat', V(G(D, 'gouvernance.actionnariat'))['v'])),
+          bdg('KPI : %s' % (V(G(D, 'gouvernance.kpi'))['v'] or 'NON PUBLI\u00c9'),
+              L_LAB('kpi', V(G(D, 'gouvernance.kpi'))['v'])),
+          esc(G(D, 'gouvernance.synthese'))))
+
+    tb = G(D, 'croissance.tableau') or {}
+    if tb.get('annees'):
+        ne = tb.get('n_estime', 0)
+        thh = ''.join('<th class="n">%s</th>' % esc(a) for a in tb['annees'])
+        trs = ''
+        for nom, serie in (tb.get('lignes') or []):
+            trs += '<tr><td>%s</td>%s</tr>' % (esc(nom), ''.join(
+                '<td class="n%s">%s</td>' % (' tgris' if (ne and i >= len(tb['annees']) - ne) else '', fr(x, 1) if num(x) else 'n.d.')
+                for i, x in enumerate(serie)))
+        A('<div class="c"><h3>Trajectoire</h3><div class="scroll"><table><tr><th></th>%s</tr>%s</table></div>'
+          '<p>%s</p><p class="sub">%s</p><div>%s</div></div>' % (
+              thh, trs, esc(G(D, 'croissance.moteurs')), esc(G(D, 'croissance.convergence')),
+              bdg('Protection : %s' % (V(G(D, 'croissance.protection'))['v'] or 'non document\u00e9e'),
+                  L_LAB('protection', V(G(D, 'croissance.protection'))['v']))))
+
+    # ---------------- bloc 3
+    A('<h2>Prix et sc\u00e9nario d\u00e9favorable</h2>')
+    rows = ''
+    for k, lab in noms:
+        c = can.get(k) or {}
+        d = c.get('delta') if k == 'taux_valorisation' else c.get('d')
+        rows += '<tr><td>%s</td><td>%s</td><td>%s</td><td class="n">%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % (
+            esc(lab), esc(c.get('fait')), esc(c.get('mecanisme')),
+            bdg('%s %%' % fr(d, 1), L_D(d, c.get('gain_etaye', False))), esc(c.get('sens', '')),
+            esc(c.get('hypothese')), prov(c.get('prov', '')))
+    spread = None
+    if num(valo.get('multiple_actuel')) and valo['multiple_actuel'] > 0 and num(reg.get('souverain')):
+        spread = 100.0 / valo['multiple_actuel'] - reg['souverain']
+    A('<div class="c"><h3>R\u00e9gime macro \u2014 canaux mesur\u00e9s sur la soci\u00e9t\u00e9</h3><div class="scroll"><table>'
+      '<tr><th>Canal</th><th>Fait</th><th>M\u00e9canisme</th><th class="n">Effet an 4</th><th>Sens</th><th>Hypoth\u00e8se</th><th></th></tr>%s</table></div>'
+      '<div class="sub">Hypoth\u00e8ses du cadre M : %s</div>'
+      '<div class="sub">M\u00e9diane de r\u00e9gime %s \u00b7 m\u00e9diane 5 ans %s \u00b7 \u00e9cart rendement b\u00e9n\u00e9ficiaire \u2212 souverain %s</div>' % (
+          rows, esc(reg.get('hypotheses_m')), fr(valo.get('mediane_regime'), 1), fr(valo.get('mediane_5ans'), 1),
+          bdg('%s pts' % fr(spread, 1), L_SPREAD(spread)) if num(spread) else 'n.d.'))
+    A('<div class="grid g3" style="margin-top:10px">%s%s%s</div><div class="sub">%s</div></div>' % (
+        carte('Rendement retenu', '%s %%/an' % fr(R.get('retenu'), 1), R.get('niv_retenu', 'gris'), ''),
+        carte('Central en r\u00e9gime alternatif', '%s %%/an' % fr(R.get('tri_alternatif'), 1), L_RDT(R.get('tri_alternatif')), ''),
+        carte('Baissier \u00e0 2,5 ans', '%s %%/an' % fr(R.get('tri_bear_25'), 1), L_RDT(R.get('tri_bear_25')), ''),
+        esc(reg.get('regime_porteur'))))
+
+    # reglette
+    P18, P15, P12 = R.get('P18'), R.get('P15'), R.get('P12')
+    if all(num(x) for x in (P18, P15, P12)):
+        hi = max(P12 * 1.25, cours * 1.15)
+        pc = lambda p: max(0.0, min(100.0, 100 * p / hi))
+        segs = [(0, pc(P18), 'l6'), (pc(P18), pc(P15), 'l5'), (pc(P15), pc(P12), 'l4'), (pc(P12), 100, 'l3')]
+        sg = ''.join('<div class="seg" style="left:%s%%;width:%s%%;background:var(--%s)"></div>' % (a, max(0.4, b - a), c) for a, b, c in segs)
+        tk = ''.join('<div class="tick" style="left:%s%%">%s %s</div>' % (pc(p), lab, fprix(p))
+                     for p, lab in ((P18, 'P18'), (P15, 'P15'), (P12, 'P12')))
+        A('<div class="c"><h3>R\u00e9glette de prix (%s)</h3><div class="rl">%s%s'
+          '<div class="cur" style="left:%s%%">\u25b2 cours %s \u2192 %s %%/an</div></div>'
+          '<div class="sub">Porte prix : %s \u00b7 P15 sans revalorisation %s</div></div>' % (
+              esc(dev), sg, tk, pc(cours), fprix(cours), fr(R.get('retenu'), 1), esc(R.get('porte_prix')),
+              fprix(R.get('P15_sans_revalo'))))
+
+    srows = ''
+    for nom in ('baissier', 'central', 'haussier'):
+        sc = (valo.get('scenarios') or {})[nom]
+        t_ = tri(flux(cours, sc, R['ctx'])[0])
+        pt = sc['bpa'][3] * sc['multiple']
+        srows += '<tr><td>%s</td><td class="n">%s %%</td><td class="n">%s</td><td class="n">%s\u00d7</td><td class="n">%s</td>' \
+                 '<td class="n t%s">%s %%/an</td><td>%s</td></tr>' % (
+                     nom.capitalize(), fr(100 * sc.get('poids', POIDS_DEF[nom]), 0), fr(sc['bpa'][3], 2),
+                     fr(sc['multiple'], 1), fprix(pt), L_RDT(t_) if L_RDT(t_) != 'gris' else 'gris', fr(t_, 1), esc(sc.get('txt', '')))
+    hz = R.get('horizons') or {}
+    hrows = ''.join('<tr><td>%s ans</td><td class="n">%s %%</td><td class="n">%s %%</td></tr>' % (
+        fr(h, 1), fr(hz[h]['avec'], 1), fr(hz[h]['sans'], 1)) for h in sorted(hz))
+    dc = R.get('decomp') or {}
+    A('<div class="grid g2"><div class="c"><h3>Trois sc\u00e9narios \u00e0 quatre ans</h3><div class="scroll"><table>'
+      '<tr><th>Sc\u00e9nario</th><th class="n">Poids</th><th class="n">BPA an 4</th><th class="n">Multiple</th>'
+      '<th class="n">Prix terminal</th><th class="n">TRI</th><th></th></tr>%s</table></div>'
+      '<div class="sub">Base publi\u00e9e %s \u2192 base normalis\u00e9e %s \u00b7 %s</div></div>' % (
+          srows, fr(vv(valo.get('base_publiee')), 2), fr(vv(valo.get('base_normalisee')), 2), esc(valo.get('effet'))))
+    A('<div class="c"><h3>Robustesse du rendement</h3><div class="scroll"><table>'
+      '<tr><th>Horizon</th><th class="n">avec revalorisation</th><th class="n">sans</th></tr>%s</table></div>'
+      '<div class="sub">D\u00e9composition du TRI central : op\u00e9rations %s %% \u00b7 dividendes %s pts \u00b7 multiple %s pts</div>'
+      '<div style="margin-top:8px">%s %s</div>'
+      '<div class="sub">Croissance exig\u00e9e pour 15 %% nets : %s %%/an (inversion m\u00e9canique, seuil indicatif) \u00b7 multiple exig\u00e9 par le cours : %s\u00d7</div>'
+      '<div class="sub">Seconde m\u00e9thode : %s</div></div></div>' % (
+          hrows, fr(dc.get('A'), 1), fr(dc.get('div'), 1), fr(dc.get('mult'), 1),
+          bdg('Part du multiple %s %%' % fr(R.get('part_mult'), 0), R.get('niv_part', 'gris')),
+          bdg('Multiple exig\u00e9 : %s' % R.get('mult_exige_lab', 'n.d.'), L_LAB('mult_exige', R.get('mult_exige_lab'))),
+          fr(R.get('g_exigee'), 1), fr(R.get('mult_exige'), 1), esc(valo.get('seconde_methode'))))
+
+    # ---------------- bloc 4
+    A('<h2>D\u00e9cision et suivi</h2>')
+    tl = R.get('taille') or {}
+    A('<div class="grid g2"><div class="c"><h3>Taille, tranches et rythme</h3>'
+      '<p>Taille maximale : <b>%s %%</b> du portefeuille%s \u2014 contrainte active : %s.</p>'
+      '<p>Tranches %s \u00b7 tranche 1 %s</p><div>%s</div><div class="sub">Capital pr\u00e9serv\u00e9 au P15 : %s /100 \u00b7 priorit\u00e9 de suivi : %s</div></div>' % (
+          fr(tl.get('max'), 1), ' (provisoire : volume inconnu)' if tl.get('provisoire') else '', esc(tl.get('contrainte')),
+          esc(R.get('tranches')), esc(R.get('tranche1')),
+          bdg('Momentum : %s' % R.get('momentum'), L_LAB('momentum', R.get('momentum'))),
+          fr(R.get('cap_P15'), 0), esc(R.get('priorite'))))
+    lec = D.get('lecture') or {}
+    A('<div class="c"><h3>Points forts et points faibles</h3><div class="grid g2">'
+      '<ul class="plus">%s</ul><ul class="moins">%s</ul></div></div></div>' % (
+          ''.join('<li>%s</li>' % esc(x) for x in (lec.get('forces') or [])),
+          ''.join('<li>%s</li>' % esc(x) for x in (lec.get('faiblesses') or []))))
+    pd = lec.get('point_decisif') or {}
+    A('<div class="concl"><h3>Conclusion</h3><p>%s</p>'
+      '<p><b>Point d\u00e9cisif</b><br>Raison du prix : %s<br>Fondement du d\u00e9saccord : %s<br>'
+      'Ce qui nous donnerait tort : %s<br>R\u00e9gime : %s</p>'
+      '<p>Action : %s</p><p>Invalidation : %s</p><p class="sub">Prochain catalyseur : %s</p>'
+      '<p>%s \u2014 %s <span class="sub">(\u00e9ch\u00e9ance %s ; non remplie \u2192 \u274c sans nouvelle analyse)</span></p></div>' % (
+          esc(lec.get('these_2p')), esc(pd.get('raison_prix')), esc(pd.get('desaccord')), esc(pd.get('tort')),
+          esc(pd.get('regime') or R['resilience'][0]), esc(lec.get('action')), esc(lec.get('invalidation')),
+          esc(lec.get('catalyseur')), bdg(v.get('suivi', 'n.d.'), L_LAB('suivi', v.get('suivi')), 'gros'),
+          esc(v.get('suivi_condition')), esc(v.get('suivi_date'))))
+
+    # ligne NICO + annexes
+    A('<h2>Ligne NICO</h2><div class="nico">%s</div>' % esc(R['nico']))
+    src = ''.join('<li>%s%s %s</li>' % (
+        esc(s[0]), (' \u2014 <a href="%s" style="color:var(--cy)">lien</a>' % esc(s[1])) if (len(s) > 1 and str(s[1]).startswith(('http://', 'https://'))) else '',
+        esc(s[2] if len(s) > 2 else '')) for s in (D.get('sources') or []))
+    ctr = ''.join('<tr><td>%s</td><td>%s</td><td>%s</td></tr>' % (esc(c[0]), esc(c[1]), esc(c[2] if len(c) > 2 else ''))
+                  for c in (D.get('controles') or []) + [list(x) for x in CHK])
+    A('<details><summary>Sources, contr\u00f4les et hypoth\u00e8ses</summary><ul>%s</ul>'
+      '<div class="scroll"><table><tr><th>Contr\u00f4le</th><th>\u00c9tat</th><th>Note</th></tr>%s</table></div>'
+      '<p class="sub">Fiscalit\u00e9 : net selon les hypoth\u00e8ses indiqu\u00e9es \u2014 plus-value 10 %%, TOB 0,35 %% \u00e0 l\'achat et \u00e0 la vente, '
+      'pr\u00e9compte 30 %%, retenue \u00e9trang\u00e8re %s %%. %s</p><p class="sub">%s</p></details>' % (
+          src, ctr, fr(100 * (valo.get('retenue_etrangere') or 0), 0), esc(valo.get('fiscalite_note')),
+          esc(' \u00b7 '.join(WARN))))
+    A('</div></body></html>')
+    return ''.join(out)
+
+
+# ------------------------------------------------------------------ ligne NICO
+def ligne_nico(D, R):
+    meta = D.get('meta') or {}
+    v = D.get('verdict') or {}
+    s = (v.get('suivi') or '').upper()
+    ach = (v.get('achat') or '').upper()
+    if meta.get('detenue'):
+        st = 'PF'
+    elif 'CONSERVER' in s:
+        st = 'WL'
+    elif 'SURVEILLANCE' in s:
+        st = 'SURV'
+    elif 'SP\u00c9CULATIVE' in s:
+        st = 'SPEC'
+    elif 'RETIRER' in s or 'REJET' in ach or 'P\u00c9RIM\u00c8TRE' in ach:
+        st = 'OUT'
+    else:
+        st = 'TODO'
+    note = (v.get('nico_note') or v.get('suivi_condition') or '').replace('|', '/')
+    ch = ['NICO', meta.get('ticker', ''), meta.get('societe', ''), meta.get('devise', ''), st,
+          fprix(R.get('P15')), fprix(vv(meta.get('cours'))), '15', fr(R.get('retenu'), 1),
+          fr(R.get('cap_cours'), 0), fr(R['q']['Q'], 0), v.get('suivi_date', ''), meta.get('date_eval', ''),
+          meta.get('secteur', ''), meta.get('pays', ''), note]
+    return ' | '.join(str(c).replace('\u202f', '') for c in ch)
+
+
+def resume(D, R):
+    meta = D.get('meta') or {}; v = D.get('verdict') or {}
+    L = ['\U0001f4c4 %s (%s) \u2014 %s' % (meta.get('societe'), meta.get('ticker'), meta.get('date_eval')),
+         'Verdict : %s \u2014 %s' % (v.get('achat'), v.get('phrase')),
+         'Q %s %% (couverture %s %%) \u00b7 C %s %% \u00b7 croissance centrale %s %%/an' % (
+             fr(R['q']['Q'], 0), fr(R['q']['cov'], 0), fr(R.get('C'), 0), fr(R.get('gc'), 1)),
+         'Rendement retenu %s %%/an \u00b7 P15 %s \u00b7 P18 %s \u00b7 capital pr\u00e9serv\u00e9 %s/100' % (
+             fr(R.get('retenu'), 1), fprix(R.get('P15')), fprix(R.get('P18')), fr(R.get('cap_cours'), 0)),
+         'R\u00e9silience : %s \u00b7 taille max %s %% \u00b7 tranches %s' % (
+             R['resilience'][0], fr((R.get('taille') or {}).get('max'), 1), R.get('tranches')),
+         'Suivi : %s \u2014 %s (%s) \u00b7 priorit\u00e9 %s' % (v.get('suivi'), v.get('suivi_condition'),
+                                                               v.get('suivi_date'), R.get('priorite'))]
+    if WARN:
+        L.append('\u26a0\ufe0f ' + ' \u00b7 '.join(WARN))
+    L.append(R['nico'])
+    return '\n'.join(L)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__); sys.exit(1)
+    src = sys.argv[1]
+    out_dir = sys.argv[3] if len(sys.argv) > 3 and sys.argv[2] == '-o' else os.path.dirname(os.path.abspath(src))
+    with open(src, encoding='utf-8') as f:
+        D = json.load(f)
+    R = calculer(D)
+    nbm, nbp = compter_these(G(D, 'acte0.these.texte'))
+    if nbm > 80 or not (3 <= nbp <= 4):
+        warn('Th\u00e8se : %s mots / %s phrases \u2014 format 3 \u00e0 4 phrases, 80 mots au plus.' % (nbm, nbp))
+    R['nico'] = ligne_nico(D, R)
+    base = os.path.splitext(os.path.basename(src))[0]
+    hp = os.path.join(out_dir, base + '.html')
+    with open(hp, 'w', encoding='utf-8') as f:
+        f.write(rendu(D, R))
+    with open(os.path.join(out_dir, base + '.calc.json'), 'w', encoding='utf-8') as f:
+        json.dump({k: val for k, val in R.items() if k not in ('ctx',)}, f, ensure_ascii=False, indent=1, default=str)
+    print(resume(D, R))
+    print('\nHTML : ' + hp)
+
+
+if __name__ == '__main__':
+    main()
