@@ -153,6 +153,87 @@ PIL = [('modele', 'Mod\u00e8le, moat, durabilit\u00e9', 20), ('visibilite', 'Vis
        ('bilan', 'Bilan et financement', 15), ('direction', 'Direction et allocation', 15)]
 
 
+TX_BASE, TX_MIN, TX_MAX = 15.0, 12.0, 21.0
+DROITS = {'SOLIDES': 0.0, 'STANDARD': 0.0, 'FRAGILES': 2.0,
+          'TRES FRAGILES': 3.0, 'TR\u00c8S FRAGILES': 3.0,
+          'NON DOCUMENTE': 1.0, 'NON DOCUMENT\u00c9': 1.0}
+
+
+def L_RDT_TX(x, tx):
+    """Couleur du rendement RELATIVE au taux exige de la ligne (grille 4 bandes)."""
+    if not (num(x) and num(tx)):
+        return 'gris'
+    return 5 if x >= tx else 4 if x >= tx - 5 else 3 if x >= tx - 10 else 2
+
+
+def calc_taux_exige(D, R):
+    """Taux exige = 15 % + modificateurs ecrits, borne 12-21 %.
+    Ne facture QUE le risque non modelisable dans les flux (R3)."""
+    meta = D.get('meta') or {}
+    q = R.get('q') or {}
+    rb = R.get('rentab') or {}
+    tx_in = D.get('taux_exige') or {}
+    mods = []
+
+    Q, vis = q.get('Q'), q.get('vis')
+    iqr, ab, nn = rb.get('iqr'), rb.get('au_dessus'), rb.get('n')
+    if (num(Q) and Q >= 85 and num(vis) and vis >= 70 and num(iqr) and iqr <= 5
+            and num(ab) and num(nn) and nn >= 5 and ab >= 5):
+        mods.append(('qualit\u00e9 prouv\u00e9e (Q\u226585, visibilit\u00e9\u226570 %, IQR ROIC\u22645 pts, 5 ans ROIC>WACC)', -2.0))
+
+    vn = ((q.get('pil') or {}).get('visibilite') or {}).get('notes') or []
+    if vn and num(vn[0]) and vn[0] >= 1:
+        mods.append(('base contract\u00e9e ou r\u00e9currente prouv\u00e9e (Visibilit\u00e9 1 = 1)', -1.0))
+
+    capm = vv(meta.get('capitalisation_meur'))
+    if num(capm):
+        if capm < 150:
+            mods.append(('capitalisation <150 M\u20ac', 2.0))
+        elif capm < 500:
+            mods.append(('capitalisation <500 M\u20ac', 1.0))
+    else:
+        warn('Capitalisation absente de meta : prime de taille non appliqu\u00e9e au taux exig\u00e9.')
+
+    dr = tx_in.get('droits_actionnaire')
+    lab = (dr[0] if isinstance(dr, list) and dr else dr) or ''
+    key = str(lab).strip().upper()
+    if key in DROITS:
+        if DROITS[key]:
+            mods.append(('droits de l\'actionnaire : %s' % key.lower(), DROITS[key]))
+    elif key:
+        warn('Libell\u00e9 de droits de l\'actionnaire non reconnu (%s) : prime non appliqu\u00e9e.' % key)
+    else:
+        warn('Droits de l\'actionnaire non renseign\u00e9s : prime juridictionnelle non appliqu\u00e9e au taux exig\u00e9.')
+
+    fiab = (meta.get('fiabilite') or 'B').upper()[:1]
+    if fiab == 'C':
+        mods.append(('fiabilit\u00e9 C (incertitude mat\u00e9rielle born\u00e9e)', 1.0))
+
+    bn = (((D.get('qualite') or {}).get('controles') or {}).get('bilan') or [])
+    b0 = bn[0][0] if (bn and isinstance(bn[0], list)) else (bn[0] if bn else None)
+    cyc = tx_in.get('cyclicite')
+    cyc_on = bool(cyc) and str(cyc).strip().lower() not in ('0', 'false', 'non', 'n.d.', '')
+    if cyc_on or (num(b0) and b0 == 0):
+        mods.append(('cyclicit\u00e9 forte ou dette nette/EBITDA >3', 1.0))
+
+    aj, mot = tx_in.get('ajustement'), tx_in.get('motif')
+    if num(aj) and aj:
+        if mot:
+            a = max(-2.0, min(2.0, float(aj)))
+            mods.append(('ajustement motiv\u00e9 : %s' % mot, a))
+        else:
+            warn('Ajustement manuel du taux exig\u00e9 ignor\u00e9 : motif absent.')
+
+    brut = TX_BASE + sum(m[1] for m in mods)
+    tx = max(TX_MIN, min(TX_MAX, round(brut * 2) / 2))
+    R['tx'] = tx
+    R['tx_mods'] = mods
+    R['tx_borne'] = abs(brut - tx) > 1e-9
+    chk('Taux exig\u00e9 calcul\u00e9 par le moteur', 'valid\u00e9',
+        '%.1f %% (base 15 %%, %d modificateur(s)%s)' % (tx, len(mods), ', born\u00e9' if R['tx_borne'] else ''))
+    return tx
+
+
 def calc_qualite(q, wacc_absent):
     ctr = q.get('controles') or {}
     num_, den = 0.0, 0.0
@@ -334,6 +415,7 @@ def calculer(D):
     rent = D.get('rentabilite') or {}
     R['rentab'] = roic_badge(rent.get('roic'), vv(rent.get('wacc')))
     R['q'] = calc_qualite(D.get('qualite') or {}, not num(vv(rent.get('wacc'))))
+    calc_taux_exige(D, R)
 
     scs = valo.get('scenarios') or {}
     base = vv(valo.get('base_normalisee'))
@@ -371,7 +453,7 @@ def calculer(D):
     R['tri_pondere'] = tri(flux_pond(cours, scs, ctx))
     dispo = [t for t in (R['tri_central'], R['tri_pondere']) if num(t)]
     R['retenu'] = min(dispo) if dispo else None
-    R['niv_retenu'] = L_RDT(R['retenu'])
+    R['niv_retenu'] = L_RDT_TX(R['retenu'], R.get('tx'))
 
     mact = valo.get('multiple_actuel')
     R['tri_mult_constant'] = tri(flux(cours, C, ctx, 4, mact)[0]) if num(mact) else None
@@ -385,12 +467,28 @@ def calculer(D):
     R['niv_part'] = L_PART(R['part_mult'])
 
     pmax = cours * 20
-    for r, nom in ((0.12, 'P12'), (0.15, 'P15'), (0.18, 'P18')):
+
+    def _prix(r):
         pc = prix_pour(r, lambda P: flux(P, C, ctx)[0], pmax)
         pp = prix_pour(r, lambda P: flux_pond(P, scs, ctx), pmax)
         c_ = [p for p in (pc, pp) if num(p)]
-        R[nom] = min(c_) if c_ else None
+        return min(c_) if c_ else None
+
+    for r, nom in ((0.12, 'P12'), (0.15, 'P15'), (0.18, 'P18')):
+        R[nom] = _prix(r)
+    tx = R.get('tx') or 15.0
+    R['tx_bandes'] = (tx, max(5.0, tx - 5), max(4.0, tx - 10))
+    R['PA'] = _prix(tx / 100.0)
+    R['PJ'] = _prix(R['tx_bandes'][1] / 100.0)
+    R['PO'] = _prix(R['tx_bandes'][2] / 100.0)
+    R['PR'] = _prix(min(0.30, (tx + 3) / 100.0))
+    R['PA_sans_revalo'] = prix_pour(tx / 100.0, lambda P: flux(P, C, ctx, 4, mact)[0], pmax) if num(mact) else None
     R['P15_sans_revalo'] = prix_pour(0.15, lambda P: flux(P, C, ctx, 4, mact)[0], pmax) if num(mact) else None
+    if all(num(R[k]) for k in ('PA', 'PJ', 'PO')):
+        okb = R['PA'] <= R['PJ'] <= R['PO'] + 1e-9
+        chk('Ordre des bandes de prix (achat \u2264 \u22125 pts \u2264 \u221210 pts)', 'valid\u00e9' if okb else '\u00e9chec')
+        if not okb:
+            warn('Ordre des bandes de prix incoh\u00e9rent : v\u00e9rifier les flux.')
     if all(num(R[k]) for k in ('P12', 'P15', 'P18')):
         ok = R['P18'] <= R['P15'] <= R['P12'] + 1e-9
         chk('Ordre P18 \u2264 P15 \u2264 P12', 'valid\u00e9' if ok else '\u00e9chec')
@@ -401,8 +499,10 @@ def calculer(D):
 
     R['cap_cours'] = cap_preserve(cours, Bs, ctx)
     R['cap_P15'] = cap_preserve(R['P15'], Bs, ctx) if num(R['P15']) else None
+    R['cap_PA'] = cap_preserve(R['PA'], Bs, ctx) if num(R['PA']) else None
     R['niv_cap'] = L_CAP(R['cap_cours'])
     R['ecart_P15'] = (cours - R['P15']) / cours * 100 if num(R['P15']) else None
+    R['ecart_PA'] = (cours - R['PA']) / cours * 100 if num(R['PA']) else None
 
     R['horizons'] = {}
     for h in (2.5, 4.0, 6.5):
@@ -537,13 +637,13 @@ def calculer(D):
                    'contrainte': min(lim, key=lambda t: t[1])[0] if lim else None,
                    'provisoire': not num(liq)}
     R['tranches'] = '50 / 25 / 25 %' if (R['momentum'] == 'FAVORABLE' and fiab != 'C' and not pari) else '1/3 \u2013 1/3 \u2013 1/3'
-    R['tranche1'] = 'au P15 sans revalorisation (%s)' % fprix(R['P15_sans_revalo']) if (num(R['part_mult']) and R['part_mult'] > 25) else 'au prix admissible (\u2264 P15)'
-    R['priorite'] = ('ACTIF' if cours <= 1.5 * R['P12'] else 'VEILLE') if num(R['P12']) and R['P12'] > 0 else 'non \u00e9valu\u00e9e'
-    R['porte_prix'] = 'ouverte' if (num(R['P15']) and cours <= R['P15']) else ('PROCHE' if (num(R['P12']) and cours <= R['P12']) else 'LOIN')
+    R['tranche1'] = ('au prix d\'achat sans revalorisation (%s)' % fprix(R['PA_sans_revalo'])) if (num(R['part_mult']) and R['part_mult'] > 25) else 'au prix admissible (\u2264 prix d\'achat)'
+    R['priorite'] = ('ACTIF' if cours <= R['PJ'] else 'VEILLE') if num(R.get('PJ')) and R['PJ'] > 0 else 'non \u00e9valu\u00e9e'
+    R['porte_prix'] = 'ouverte' if (num(R.get('PA')) and cours <= R['PA']) else ('PROCHE' if (num(R.get('PJ')) and cours <= R['PJ']) else 'LOIN')
 
     ach = (G(D, 'verdict.achat') or '').upper()
     if 'ACHAT' in ach and 'BLOQU' not in ach and R['porte_prix'] != 'ouverte':
-        warn('Verdict ACHAT alors que le cours est au-dessus de P15 : incoh\u00e9rent.')
+        warn('Verdict ACHAT alors que le cours est au-dessus du prix d\'achat (taux exig\u00e9 %s %%) : incoh\u00e9rent.' % fr(R.get('tx'), 1))
     if num(R['part_mult']) and R['part_mult'] > 50 and ach.startswith('ACHAT'):
         warn('Part du multiple >50 % : pari de revalorisation, pas d\'ACHAT standard.')
     chk('TRI, prix et capital pr\u00e9serv\u00e9 calcul\u00e9s par le moteur', 'valid\u00e9')
@@ -669,11 +769,24 @@ def rendu(D, R):
             ('provisoire' if q['provisoire'] else 'porte qualit\u00e9 %s' % ('franchie' if q['porte'] else 'non franchie'))))
     A(carte('Croissance centrale par action', '%s %%/an' % fr(R['gc'], 1), L_PCT(R['C']) if num(R['C']) else 'gris',
             'score C %s %% (descriptif)' % fr(R['C'], 0)))
-    A(carte('Rendement net retenu', '%s %%/an' % fr(R.get('retenu'), 1), R.get('niv_retenu', 'gris'),
+    A(carte('Rendement net retenu (seuil %s %%)' % fr(R.get('tx'), 1), '%s %%/an' % fr(R.get('retenu'), 1),
+            R.get('niv_retenu', 'gris'),
             'central %s %% \u00b7 pond\u00e9r\u00e9 %s %%' % (fr(R.get('tri_central'), 1), fr(R.get('tri_pondere'), 1))))
     A(carte('Capital pr\u00e9serv\u00e9 / 100 \u20ac', fr(R.get('cap_cours'), 0), R.get('niv_cap', 'gris'),
             'baissier \u00e0 4 ans, au cours \u2014 sc\u00e9nario mod\u00e9lis\u00e9'))
     A('</div>')
+
+    mr = ''.join('<tr><td>%s</td><td class="n t%s">%s pt</td></tr>' % (
+        esc(lab), 5 if d < 0 else 3, fr(d, 1, True)) for lab, d in (R.get('tx_mods') or []))
+    if not mr:
+        mr = '<tr><td>aucun modificateur retenu</td><td class="n">0 pt</td></tr>'
+    A('<div class="c"><h3>Taux exig\u00e9 de la ligne \u2014 %s %%/an</h3>'
+      '<div class="sub">Base 15 %%, born\u00e9 12\u201321 %%. Ce taux ne facture que le risque '
+      '<b>non mod\u00e9lisable dans les flux</b> (juridiction, liquidit\u00e9, perte irr\u00e9versible) : '
+      'ce qui est d\u00e9j\u00e0 chiffr\u00e9 dans le sc\u00e9nario baissier ou dans le multiple terminal n\'y figure pas (R3).</div>'
+      '<div class="scroll"><table>%s<tr><td><b>Taux exig\u00e9 retenu</b></td><td class="n"><b>%s %%</b></td></tr></table></div>%s</div>' % (
+          fr(R.get('tx'), 1), mr, fr(R.get('tx'), 1),
+          '<div class="sub">Valeur born\u00e9e \u00e0 l\'intervalle 12\u201321 %.</div>' if R.get('tx_borne') else ''))
 
     A('<div class="sub" style="margin:6px 0 14px">Tri rapide : %s. Les scores sont des conventions de s\u00e9lection en %%, pas des probabilit\u00e9s.</div>' % esc(meta.get('tri')))
 
@@ -685,8 +798,8 @@ def rendu(D, R):
         esc(r[0]), esc(r[1]), esc(r[2] if len(r) > 2 else ''), prov(r[3] if len(r) > 3 else '')) for r in (a0.get('revenus') or []))
     lignes = []
     lignes.append(('Rendement au cours du jour', '%s %%/an' % fr(R.get('retenu'), 1), R.get('niv_retenu', 'gris')))
-    lignes.append(('Prix d\'achat P15', '%s %s' % (fprix(R.get('P15')), dev), 5))
-    ec = R.get('ecart_P15')
+    lignes.append(('Prix d\'achat (taux exig\u00e9 %s %%)' % fr(R.get('tx'), 1), '%s %s' % (fprix(R.get('PA')), dev), 5))
+    ec = R.get('ecart_PA')
     lignes.append(('\u00c9cart \u00e0 franchir', '%s %%' % fr(ec, 1, True), 5 if (num(ec) and ec <= 0) else 3))
     if (valo.get('clause') or 'aucune').lower() != 'aucune':
         lignes.append(('Rendement central \u00e0 multiple constant', '%s %%/an' % fr(R.get('tri_mult_constant'), 1), L_RDT(R.get('tri_mult_constant'))))
@@ -848,19 +961,22 @@ def rendu(D, R):
         esc(reg.get('regime_porteur'))))
 
     # reglette
-    P18, P15, P12 = R.get('P18'), R.get('P15'), R.get('P12')
-    if all(num(x) for x in (P18, P15, P12)):
-        hi = max(P12 * 1.25, cours * 1.15)
+    PA, PJ, PO = R.get('PA'), R.get('PJ'), R.get('PO')
+    bd = R.get('tx_bandes') or (15.0, 10.0, 5.0)
+    if all(num(x) for x in (PA, PJ, PO)):
+        hi = max(PO * 1.15, cours * 1.15)
         pc = lambda p: max(0.0, min(100.0, 100 * p / hi))
-        segs = [(0, pc(P18), 'l6'), (pc(P18), pc(P15), 'l5'), (pc(P15), pc(P12), 'l4'), (pc(P12), 100, 'l3')]
+        segs = [(0, pc(PA), 'l5'), (pc(PA), pc(PJ), 'l4'), (pc(PJ), pc(PO), 'l3'), (pc(PO), 100, 'l2')]
         sg = ''.join('<div class="seg" style="left:%s%%;width:%s%%;background:var(--%s)"></div>' % (a, max(0.4, b - a), c) for a, b, c in segs)
-        tk = ''.join('<div class="tick" style="left:%s%%">%s %s</div>' % (pc(p), lab, fprix(p))
-                     for p, lab in ((P18, 'P18'), (P15, 'P15'), (P12, 'P12')))
-        A('<div class="c"><h3>R\u00e9glette de prix (%s)</h3><div class="rl">%s%s'
+        tk = ''.join('<div class="tick" style="left:%s%%">%s %% %s</div>' % (pc(p), fr(t, 0), fprix(p))
+                     for p, t in ((PA, bd[0]), (PJ, bd[1]), (PO, bd[2])))
+        A('<div class="c"><h3>R\u00e9glette de prix (%s) \u2014 seuil d\'achat %s %%/an</h3><div class="rl">%s%s'
           '<div class="cur" style="left:%s%%">\u25b2 cours %s \u2192 %s %%/an</div></div>'
-          '<div class="sub">Porte prix : %s \u00b7 P15 sans revalorisation %s</div></div>' % (
-              esc(dev), sg, tk, pc(cours), fprix(cours), fr(R.get('retenu'), 1), esc(R.get('porte_prix')),
-              fprix(R.get('P15_sans_revalo'))))
+          '<div class="sub">Bandes : \u2265%s %% achat \u00b7 %s\u2013%s %% \u00b7 %s\u2013%s %% \u00b7 sous %s %%. '
+          'Porte prix : %s \u00b7 prix d\'achat sans revalorisation %s \u00b7 prix de renforcement (+3 pts) %s</div></div>' % (
+              esc(dev), fr(bd[0], 1), sg, tk, pc(cours), fprix(cours), fr(R.get('retenu'), 1),
+              fr(bd[0], 0), fr(bd[1], 0), fr(bd[0], 0), fr(bd[2], 0), fr(bd[1], 0), fr(bd[2], 0),
+              esc(R.get('porte_prix')), fprix(R.get('PA_sans_revalo')), fprix(R.get('PR'))))
 
     srows = ''
     for nom in ('baissier', 'central', 'haussier'):
@@ -896,11 +1012,11 @@ def rendu(D, R):
     tl = R.get('taille') or {}
     A('<div class="grid g2"><div class="c"><h3>Taille, tranches et rythme</h3>'
       '<p>Taille maximale : <b>%s %%</b> du portefeuille%s \u2014 contrainte active : %s.</p>'
-      '<p>Tranches %s \u00b7 tranche 1 %s</p><div>%s</div><div class="sub">Capital pr\u00e9serv\u00e9 au P15 : %s /100 \u00b7 priorit\u00e9 de suivi : %s</div></div>' % (
+      '<p>Tranches %s \u00b7 tranche 1 %s</p><div>%s</div><div class="sub">Capital pr\u00e9serv\u00e9 au prix d\'achat : %s /100 \u00b7 priorit\u00e9 de suivi : %s</div></div>' % (
           fr(tl.get('max'), 1), ' (provisoire : volume inconnu)' if tl.get('provisoire') else '', esc(tl.get('contrainte')),
           esc(R.get('tranches')), esc(R.get('tranche1')),
           bdg('Momentum : %s' % R.get('momentum'), L_LAB('momentum', R.get('momentum'))),
-          fr(R.get('cap_P15'), 0), esc(R.get('priorite'))))
+          fr(R.get('cap_PA'), 0), esc(R.get('priorite'))))
     lec = D.get('lecture') or {}
     A('<div class="c"><h3>Points forts et points faibles</h3><div class="grid g2">'
       '<ul class="plus">%s</ul><ul class="moins">%s</ul></div></div></div>' % (
@@ -954,7 +1070,7 @@ def ligne_nico(D, R):
         st = 'TODO'
     note = (v.get('nico_note') or v.get('suivi_condition') or '').replace('|', '/')
     ch = ['NICO', meta.get('ticker', ''), meta.get('societe', ''), meta.get('devise', ''), st,
-          fprix(R.get('P15')), fprix(vv(meta.get('cours'))), '15', fr(R.get('retenu'), 1),
+          fprix(R.get('PA')), fprix(vv(meta.get('cours'))), fr(R.get('tx'), 1), fr(R.get('retenu'), 1),
           fr(R.get('cap_cours'), 0), fr(R['q']['Q'], 0), v.get('suivi_date', ''), meta.get('date_eval', ''),
           meta.get('secteur', ''), meta.get('pays', ''), note]
     return ' | '.join(str(c).replace('\u202f', '') for c in ch)
@@ -966,8 +1082,8 @@ def resume(D, R):
          'Verdict : %s \u2014 %s' % (v.get('achat'), v.get('phrase')),
          'Q %s %% (couverture %s %%) \u00b7 C %s %% \u00b7 croissance centrale %s %%/an' % (
              fr(R['q']['Q'], 0), fr(R['q']['cov'], 0), fr(R.get('C'), 0), fr(R.get('gc'), 1)),
-         'Rendement retenu %s %%/an \u00b7 P15 %s \u00b7 P18 %s \u00b7 capital pr\u00e9serv\u00e9 %s/100' % (
-             fr(R.get('retenu'), 1), fprix(R.get('P15')), fprix(R.get('P18')), fr(R.get('cap_cours'), 0)),
+         'Taux exig\u00e9 %s %%/an \u00b7 rendement retenu %s %%/an \u00b7 prix d\'achat %s \u00b7 capital pr\u00e9serv\u00e9 %s/100' % (
+             fr(R.get('tx'), 1), fr(R.get('retenu'), 1), fprix(R.get('PA')), fr(R.get('cap_cours'), 0)),
          'R\u00e9silience : %s \u00b7 taille max %s %% \u00b7 tranches %s' % (
              R['resilience'][0], fr((R.get('taille') or {}).get('max'), 1), R.get('tranches')),
          'Suivi : %s \u2014 %s (%s) \u00b7 priorit\u00e9 %s' % (v.get('suivi'), v.get('suivi_condition'),
