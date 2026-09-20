@@ -18,7 +18,7 @@ import json, sys, os, re, math, html, copy, statistics as stx
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V22.2"
+VERSION = "V22.3"
 VERSION_DATE = "20/09/2026"
 WARN, CHK = [], []
 
@@ -793,6 +793,10 @@ summary{cursor:pointer;color:var(--txt2);font-size:15px}
 .chart div{flex:1;background:var(--cy);border-radius:3px 3px 0 0;min-height:1px;position:relative}
 .chart div.e{background:repeating-linear-gradient(45deg,var(--cy2),var(--cy2) 4px,#0c1113 4px,#0c1113 8px)}
 .xl{display:flex;gap:6px;font-size:13px;color:var(--gris);margin-top:6px}.xl span{flex:1;text-align:center}
+.capital-box{border-color:var(--cy2)}.margin-box{border-color:#547547}
+.capital-box h3{color:var(--cy)}.margin-box h3{color:var(--l5)}
+.capital-box th,.margin-box th{color:var(--txt2);width:32%}
+.capital-box .b,.margin-box .b{white-space:normal}
 :focus-visible{outline:2px solid var(--cy);outline-offset:2px}
 @media(max-width:820px){.g4,.g3,.g5,.g2{grid-template-columns:1fr 1fr}h1{font-size:32px}.cours{font-size:34px}}
 @media(max-width:480px){.g4,.g3,.g5,.g2{grid-template-columns:1fr}.head{flex-direction:column}
@@ -804,6 +808,63 @@ body{font-size:17px}.cours{text-align:left}}
 def carte(lab, valeur, lvl, sous=''):
     return ('<div class="c"><div class="lab">%s</div><div class="big t%s">%s</div>'
             '<div class="sub">%s</div></div>' % (esc(lab), lvl if lvl != 'gris' else 'gris', valeur, sous))
+
+
+# Encadrés de lecture uniquement : aucun effet sur calculs, scores ou portes.
+def qual_texte(value):
+    v = V(value)
+    return esc(v['v'] if v['v'] not in (None, '') else 'n.d.') + (
+        '<div class="sub">%s</div>' % esc(' · '.join(str(v[k]) for k in ('prov', 'src', 'note') if v[k]))
+        if any(v[k] for k in ('prov', 'src', 'note')) else '')
+
+
+def qual_badge(value):
+    lab = vv(value) or 'INCONNUE'
+    levels = {'STABLE': 5, 'STABLES': 5, 'EN HAUSSE': 5, 'EN AMÉLIORATION': 5,
+              'EN BAISSE': 3, 'ÉROSION': 3, 'VOLATILE': 4,
+              'SOUS LE COÛT DU CAPITAL': 2, 'NON PERTINENTE': 'gris'}
+    return bdg(lab, levels.get(lab, 'gris'))
+
+
+def qual_serie(serie):
+    # Ne pas inventer de points ni convertir une absence en zéro.
+    rows = []
+    for item in (serie or []):
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        val = vv(item[1])
+        if not num(val) or not math.isfinite(val):
+            val = None
+        rows.append('<tr><td>%s</td><td class="n">%s</td><td>%s</td></tr>' % (
+            esc(item[0]), fr(val) + ' %' if val is not None else 'n.d.',
+            esc(' · '.join(str(x) for x in item[2:] if x is not None))))
+    return ('<div class="scroll"><table><tr><th>Exercice</th><th class="n">Valeur</th>'
+            '<th>Provenance / source</th></tr>%s</table></div>' % ''.join(rows)) if rows else '<p class="sub">Historique non documenté.</p>'
+
+
+def encadres_qualite(D, R):
+    rent = D.get('rentabilite') or {}
+    mg = G(D, 'qualite.marge_brute') or {}
+    rb = R['rentab']
+    rows = [
+        ('Combien rapporte la machine ?', 'Dernier ROIC : %s %% · médiane : %s %% · coût du capital : %s %%' % (fr(rb['last']), fr(rb['med']), fr(rb['wacc']))),
+        ('Est-elle durable ?', qual_badge(rent.get('tendance')) + qual_texte(rent.get('tendance_preuve'))),
+        ('Les nouveaux euros travaillent-ils aussi bien ?', qual_badge(rent.get('nouveaux_investissements')) + qual_texte(rent.get('rendement_incremental'))),
+        ('Peut-elle grossir ?', qual_texte(rent.get('reinvestissement'))),
+        ('Le chiffre est-il trompeur ?', qual_texte(rent.get('vigilance_comptable'))),
+    ]
+    a = '<section class="c capital-box"><h3>La machine à créer du profit</h3><p class="sub">Chaque euro supplémentaire investi crée-t-il suffisamment de profit après impôt, et combien peut-on encore investir ainsi ?</p><table>'
+    a += ''.join('<tr><th>%s</th><td>%s</td></tr>' % (esc(k), v) for k, v in rows)
+    a += '</table><details><summary>Historique du ROIC et sources</summary>' + qual_serie(rent.get('roic')) + qual_texte(rent.get('source')) + '</details><p class="sub">ROIC après impôt ; AT ROCE comparable seulement à définition cohérente. Rentabilité économique ≠ rendement boursier.</p></section>'
+    a += '<section class="c margin-box"><h3>Marge brute — maîtrise de son environnement</h3>'
+    a += qual_badge(mg.get('tendance')) + '<p class="sub">La marge est un indice de pouvoir de prix, pas une preuve suffisante de domination.</p>'
+    a += qual_serie(mg.get('serie'))
+    a += '<table>' + ''.join('<tr><th>%s</th><td>%s</td></tr>' % (label, qual_texte(mg.get(key))) for label, key in [
+        ('Définition et comparabilité', 'definition'), ('Prix, coûts, volumes et mix', 'explication'),
+        ('Pouvoir de prix : preuves et limites', 'pouvoir_prix_preuve'),
+        ('Position concurrentielle', 'conclusion'), ('À surveiller', 'surveillance')]) + '</table>'
+    a += '<p class="sub">Une baisse modérée appelle une explication, sans veto automatique. Aucun score supplémentaire ; faits rattachés aux piliers existants.</p></section>'
+    return a
 
 
 def rendu(D, R):
@@ -972,6 +1033,8 @@ def rendu(D, R):
           bdg(rb['lab'], rb['lvl'], 'gros'), graph, fr(rb['med'], 1), fr(rb['min'], 1), fr(rb['last'], 1),
           rb['au_dessus'] if rb['au_dessus'] is not None else 'n.d.', rb['n'], fr(rb['wacc'], 1),
           fr(rb['iqr'], 1), esc(G(D, 'rentabilite.definition'))))
+
+    A(encadres_qualite(D, R))
 
     A('<div class="grid g2"><div class="c"><h3>Moat et pouvoir de prix</h3><p>%s</p><div>%s</div></div>'
       '<div class="c"><h3>Direction, initi\u00e9s et alignement</h3><p>%s</p><div>%s %s %s</div><div class="sub">%s</div></div></div>' % (
