@@ -18,7 +18,7 @@ import json, sys, os, re, math, html, copy, statistics as stx
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V22"
+VERSION = "V22.1"
 VERSION_DATE = "20/09/2026"
 WARN, CHK = [], []
 
@@ -96,6 +96,7 @@ L_RDT = lambda x: cut(x, [0, 8, 12, 15, 18], [1, 2, 3, 4, 5, 6])
 L_CAP = lambda x: cut(x, [50, 70, 80, 90, 100], [1, 2, 3, 4, 5, 6])
 L_SECT = lambda x: cut(x, [-5, 0, 3, 6, 10], [1, 2, 3, 4, 5, 6])
 L_SPREAD = lambda x: cut(x, [0, 2, 4], [2, 3, 4, 5])
+L_ECART = lambda x: cut(x, [0, 3, 6], [5, 4, 3, 2])
 L_CENT = lambda p: 'gris' if not num(p) else (6 if p <= 25 else 5 if p <= 50 else 4 if p <= 75 else 3 if p <= 90 else 2 if p <= 97 else 1)
 L_PART = lambda p: 'gris' if not num(p) else (2 if p > 50 else 3 if p > 40 else 4 if p > 25 else 5)
 
@@ -203,7 +204,9 @@ def calc_taux_exige(D, R):
         if DROITS[key]:
             mods.append(('droits de l\'actionnaire : %s' % key.lower(), DROITS[key]))
     elif key:
-        warn('Libell\u00e9 de droits de l\'actionnaire non reconnu (%s) : prime non appliqu\u00e9e.' % key)
+        mods.append(('droits de l\'actionnaire : libell\u00e9 invalide, trait\u00e9 comme NON DOCUMENT\u00c9', 1.0))
+        warn('Libell\u00e9 de droits de l\'actionnaire non reconnu (%s) : trait\u00e9 comme NON DOCUMENT\u00c9, +1 pt.' % key)
+        chk('Droits de l\'actionnaire document\u00e9s', '\u00e9chec', 'libell\u00e9 invalide : %s' % key)
     else:
         mods.append(('droits de l\'actionnaire non renseign\u00e9s (trait\u00e9s comme NON DOCUMENT\u00c9)', 1.0))
         warn('Droits de l\'actionnaire non renseign\u00e9s : prime de +1 pt appliqu\u00e9e d\'office, champ \u00e0 documenter.')
@@ -270,7 +273,8 @@ def calc_qualite(q, wacc_absent):
     m = pil['modele']['notes']
     porte = (num(Q) and Q >= 70 and cov >= 80 and not provisoire and not q.get('blocage')
              and num(m[1]) and m[1] >= 0.5 and num(m[2]) and m[2] >= 0.5
-             and all((p['pct'] is not None and p['pct'] >= 50) for k, p in pil.items() if k != 'visibilite'))
+             and all((p['pct'] is not None and p['pct'] >= 50) for k, p in pil.items() if k != 'visibilite')
+             and pil['visibilite']['pct'] is not None and pil['visibilite']['pct'] >= 30)
     vis = pil['visibilite']['pct']
     return {'Q': Q, 'cov': cov, 'pil': pil, 'partiel': partiel, 'provisoire': provisoire,
             'porte': bool(porte), 'vis': vis, 'niveau': L_PCT(Q)}
@@ -484,7 +488,7 @@ def calculer(D):
     for r, nom in ((0.12, 'P12'), (0.15, 'P15'), (0.18, 'P18')):
         R[nom] = _prix(r)
     tx = R.get('tx') or 15.0
-    R['tx_bandes'] = (tx, max(5.0, tx - 5), max(4.0, tx - 10))
+    R['tx_bandes'] = (tx, max(2.0, tx - 5), max(2.0, tx - 10))
     R['PA'] = _prix(tx / 100.0)
     R['PJ'] = _prix(R['tx_bandes'][1] / 100.0)
     R['PO'] = _prix(R['tx_bandes'][2] / 100.0)
@@ -501,8 +505,11 @@ def calculer(D):
         chk('Ordre P18 \u2264 P15 \u2264 P12', 'valid\u00e9' if ok else '\u00e9chec')
         if not ok:
             warn('Ordre des prix incoh\u00e9rent : v\u00e9rifier les flux.')
-        res = max(abs(npv(r, flux(R[n], C, ctx)[0])) for r, n in ((0.12, 'P12'), (0.15, 'P15'), (0.18, 'P18')))
-        chk('R\u00e9sidus de VAN aux prix r\u00e9solus', 'valid\u00e9' if res < 1e-4 else '\u00e9chec', 'max %.2e' % res)
+        res = max(min(abs(npv(r, flux(R[n], C, ctx)[0])), abs(npv(r, flux_pond(R[n], scs, ctx))))
+                  for r, n in ((0.12, 'P12'), (0.15, 'P15'), (0.18, 'P18')))
+        lim = 'central' if abs(npv(0.15, flux(R['P15'], C, ctx)[0])) < 1e-4 else 'flux pond\u00e9r\u00e9s'
+        chk('R\u00e9sidus de VAN aux prix r\u00e9solus', 'valid\u00e9' if res < 1e-4 else '\u00e9chec',
+            'max %.2e \u00b7 prix limit\u00e9 par les %s' % (res, lim))
 
     R['cap_cours'] = cap_preserve(cours, Bs, ctx)
     R['cap_P15'] = cap_preserve(R['P15'], Bs, ctx) if num(R['P15']) else None
@@ -537,6 +544,7 @@ def calculer(D):
                     hi = mid
             R['tolerance'] = (1 - (lo + hi) / 2) * 100
     R['tolerance_plancher'] = plancher
+    R['ecart_hist'] = (gc - go) if (num(gc) and num(go)) else None
 
     # multiple exige par le cours
     txf = (R.get('tx') or 15.0) / 100.0
@@ -649,6 +657,29 @@ def calculer(D):
     R['porte_prix'] = 'ouverte' if (num(R.get('PA')) and cours <= R['PA']) else ('PROCHE' if (num(R.get('PJ')) and cours <= R['PJ']) else 'LOIN')
 
     ach = (G(D, 'verdict.achat') or '').upper()
+    # --- verdict final : le moteur neutralise un ACHAT que les controles interdisent
+    vf, motifs = (G(D, 'verdict.achat') or 'n.d.'), []
+    veut_acheter = ('ACHAT' in ach or 'RENFORCEMENT' in ach) and 'BLOQU' not in ach
+    if q_bloc := (D.get('qualite') or {}).get('blocage'):
+        vf, _ = 'REJET \u2014 STRUCTURE', motifs.append('blocage structurel d\u00e9clar\u00e9')
+    elif fiab == 'D':
+        vf, _ = '\u00c0 DOCUMENTER \u2014 ACHAT BLOQU\u00c9', motifs.append('fiabilit\u00e9 D')
+    elif veut_acheter and not R['q']['porte']:
+        vf, _ = 'HORS S\u00c9LECTION', motifs.append('porte qualit\u00e9 non franchie')
+    elif veut_acheter and R['porte_prix'] != 'ouverte':
+        vf = 'WATCHLIST %s \u2014 PRIX' % ('PROCHE' if R['porte_prix'] == 'PROCHE' else 'LOIN')
+        motifs.append('cours au-dessus du prix d\'achat')
+    elif veut_acheter and num(R.get('part_mult')) and R['part_mult'] > 50:
+        vf, _ = 'WATCHLIST \u2014 CONFIRMATION', motifs.append('part du multiple >50 %')
+    elif veut_acheter and num(R.get('tx_brut')) and R['tx_brut'] > TX_MAX + 1e-9:
+        vf, _ = 'HORS S\u00c9LECTION', motifs.append('risque au-del\u00e0 de 21 %')
+    R['verdict_final'] = vf
+    R['verdict_motifs'] = motifs
+    R['verdict_modifie'] = (str(vf).upper() != ach)
+    if R['verdict_modifie']:
+        warn('Verdict %s remplac\u00e9 par %s : %s.' % (G(D, 'verdict.achat'), vf, ' ; '.join(motifs)))
+    chk('Verdict final contr\u00f4l\u00e9 par le moteur', 'valid\u00e9',
+        'inchang\u00e9' if not R['verdict_modifie'] else 'corrig\u00e9 \u2014 %s' % ' ; '.join(motifs))
     if 'ACHAT' in ach and 'BLOQU' not in ach and R['porte_prix'] != 'ouverte':
         warn('Verdict ACHAT alors que le cours est au-dessus du prix d\'achat (taux exig\u00e9 %s %%) : incoh\u00e9rent.' % fr(R.get('tx'), 1))
         chk('Coh\u00e9rence verdict / porte prix', '\u00e9chec', 'ACHAT au-dessus du prix d\'achat')
@@ -787,10 +818,14 @@ def rendu(D, R):
     v = D.get('verdict') or {}
     A('<div class="c"><div>%s &nbsp; %s</div><p style="margin-top:10px;font-size:16px">%s</p>'
       '<div class="sub">%s%s</div></div>' % (
-          bdg(v.get('achat', 'n.d.'), L_LAB('achat', v.get('achat')), 'gros'),
+          bdg(R.get('verdict_final') or v.get('achat', 'n.d.'), L_LAB('achat', R.get('verdict_final')), 'gros'),
           bdg(v.get('suivi', 'n.d.'), L_LAB('suivi', v.get('suivi')), 'gros'),
           esc(v.get('phrase')), esc(v.get('cause')),
           ' \u00b7 ' + esc(v.get('cause2')) if v.get('cause2') else ''))
+    if R.get('verdict_modifie'):
+        A('<div class="c" style="border-color:var(--l3)"><b>Verdict corrig\u00e9 par le moteur.</b> '
+          'Le dossier proposait \u00ab %s \u00bb ; les contr\u00f4les l\'interdisent : %s.</div>' % (
+              esc(v.get('achat')), esc(' ; '.join(R.get('verdict_motifs') or []))))
 
     # -- 4 cartes
     q = R['q']
@@ -960,10 +995,10 @@ def rendu(D, R):
     A('<div class="grid g3">%s%s%s</div>' % (
         carte('Rendement au cours du jour', '%s %%/an' % fr(R.get('retenu'), 1), R.get('niv_retenu', 'gris'),
               'seuil de la ligne : %s %%/an' % fr(R.get('tx'), 1)),
-        carte('Marge d\'erreur au prix d\'achat',
-              ('\u2212%s %%' % fr(tol, 0)) if num(tol) else 'n.d.',
-              L_PCT(tol * 2.5) if num(tol) else 'gris',
-              'le b\u00e9n\u00e9fice peut manquer d\'autant et je fais encore %s %%/an' % fr(R.get('tolerance_plancher'), 0)),
+        carte('Central contre rythme historique',
+              ('%s pts' % fr(R.get('ecart_hist'), 1, True)) if num(R.get('ecart_hist')) else 'n.d.',
+              L_ECART(R.get('ecart_hist')),
+              'croissance centrale par action moins croissance organique pass\u00e9e'),
         carte('Si le mauvais sc\u00e9nario arrive t\u00f4t', '%s %%/an' % fr(R.get('tri_bear_25'), 1),
               L_RDT(R.get('tri_bear_25')), 'revente forc\u00e9e au bout de 2 ans et demi')))
 
@@ -1032,11 +1067,11 @@ def rendu(D, R):
     pd = lec.get('point_decisif') or {}
     A('<div class="concl"><h3>Conclusion</h3><p>%s</p>'
       '<p><b>Point d\u00e9cisif</b><br>Raison du prix : %s<br>Fondement du d\u00e9saccord : %s<br>'
-      'Ce qui nous donnerait tort : %s<br>R\u00e9gime : %s</p>'
+      'Ce qui nous donnerait tort : %s<br>Marge d\'erreur : %s</p>'
       '<p>Action : %s</p><p>Invalidation : %s</p><p class="sub">Prochain catalyseur : %s</p>'
       '<p>%s \u2014 %s <span class="sub">(\u00e9ch\u00e9ance %s ; non remplie \u2192 \u274c sans nouvelle analyse)</span></p></div>' % (
           esc(lec.get('these_2p')), esc(pd.get('raison_prix')), esc(pd.get('desaccord')), esc(pd.get('tort')),
-          esc(pd.get('regime') or ''), esc(lec.get('action')), esc(lec.get('invalidation')),
+          esc(pd.get('marge_erreur') or ''), esc(lec.get('action')), esc(lec.get('invalidation')),
           esc(lec.get('catalyseur')), bdg(v.get('suivi', 'n.d.'), L_LAB('suivi', v.get('suivi')), 'gros'),
           esc(v.get('suivi_condition')), esc(v.get('suivi_date'))))
 
@@ -1062,7 +1097,7 @@ def ligne_nico(D, R):
     meta = D.get('meta') or {}
     v = D.get('verdict') or {}
     s = (v.get('suivi') or '').upper()
-    ach = (v.get('achat') or '').upper()
+    ach = (R.get('verdict_final') or v.get('achat') or '').upper()
     if meta.get('detenue'):
         st = 'PF'
     elif 'CONSERVER' in s:
@@ -1086,13 +1121,14 @@ def ligne_nico(D, R):
 def resume(D, R):
     meta = D.get('meta') or {}; v = D.get('verdict') or {}
     L = ['\U0001f4c4 %s (%s) \u2014 %s' % (meta.get('societe'), meta.get('ticker'), meta.get('date_eval')),
-         'Verdict : %s \u2014 %s' % (v.get('achat'), v.get('phrase')),
+         'Verdict : %s \u2014 %s' % (R.get('verdict_final') or v.get('achat'), v.get('phrase')),
          'Q %s %% (couverture %s %%) \u00b7 C %s %% \u00b7 croissance centrale %s %%/an' % (
              fr(R['q']['Q'], 0), fr(R['q']['cov'], 0), fr(R.get('C'), 0), fr(R.get('gc'), 1)),
          'Taux exig\u00e9 %s %%/an \u00b7 rendement retenu %s %%/an \u00b7 prix d\'achat %s \u00b7 capital pr\u00e9serv\u00e9 %s/100' % (
              fr(R.get('tx'), 1), fr(R.get('retenu'), 1), fprix(R.get('PA')), fr(R.get('cap_cours'), 0)),
-         'Marge d\'erreur au prix d\'achat : \u2212%s %% sur le b\u00e9n\u00e9fice \u00b7 taille max %s %% \u00b7 tranches %s' % (
-             fr(R.get('tolerance'), 0), fr((R.get('taille') or {}).get('max'), 1), R.get('tranches')),
+         'Central vs historique %s pts \u00b7 sensibilit\u00e9 du prix \u2212%s %% \u00b7 taille max %s %% \u00b7 tranches %s' % (
+             fr(R.get('ecart_hist'), 1, True), fr(R.get('tolerance'), 0),
+             fr((R.get('taille') or {}).get('max'), 1), R.get('tranches')),
          'Suivi : %s \u2014 %s (%s) \u00b7 priorit\u00e9 %s' % (v.get('suivi'), v.get('suivi_condition'),
                                                                v.get('suivi_date'), R.get('priorite'))]
     if WARN:
