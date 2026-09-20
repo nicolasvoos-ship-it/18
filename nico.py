@@ -725,7 +725,7 @@ body{margin:0;background:var(--bg);color:var(--txt);
 font-family:"Iowan Old Style","Charter",Georgia,serif;font-size:18px;line-height:1.62;
 background-image:linear-gradient(var(--bord2) 1px,transparent 1px),linear-gradient(90deg,var(--bord2) 1px,transparent 1px);
 background-size:64px 64px;background-position:-1px -1px}
-.wrap{max-width:960px;margin:0 auto;padding:34px 20px 80px}
+.wrap{max-width:1220px;margin:0 auto;padding:34px 24px 80px}
 h1{font-size:40px;line-height:1.12;margin:0 0 6px;font-weight:600;letter-spacing:-.015em}
 h2{font-size:15px;margin:52px 0 16px;font-weight:600;color:var(--cy);
 font-family:ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.02em}
@@ -767,8 +767,11 @@ tbody tr:last-child td{border-bottom:none}
 white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .rl .tick{position:absolute;top:70px;transform:translateX(-50%);font-size:14px;color:var(--txt2);
 white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+tr.scn td{border-bottom:2px solid var(--bord2);padding:0 12px 18px;font-size:15px;line-height:1.6;color:var(--txt2)}
+tr.scn+tr td{padding-top:18px}
+table.sc td,table.sc th{padding:14px 14px}
 ul{margin:0;padding:0;list-style:none}
-li{position:relative;padding-left:28px;margin-bottom:14px;font-size:17px;line-height:1.56;max-width:62ch}
+li{position:relative;padding-left:28px;margin-bottom:16px;font-size:16.5px;line-height:1.6;max-width:70ch}
 li::before{position:absolute;left:0;top:0;font-weight:700;font-size:18px}
 .plus li::before{content:"+";color:var(--l5)}.moins li::before{content:"\u2013";color:var(--l2)}
 .concl{border:1px solid var(--cy2);border-radius:14px;padding:30px 32px;
@@ -1025,17 +1028,17 @@ def rendu(D, R):
         sc = (valo.get('scenarios') or {})[nom]
         t_ = tri(flux(cours, sc, R['ctx'])[0])
         pt = sc['bpa'][3] * sc['multiple']
-        srows += '<tr><td>%s</td><td class="n">%s %%</td><td class="n">%s</td><td class="n">%s\u00d7</td><td class="n">%s</td>' \
-                 '<td class="n t%s">%s %%/an</td><td>%s</td></tr>' % (
+        srows += ('<tr><td><b>%s</b></td><td class="n">%s %%</td><td class="n">%s</td><td class="n">%s\u00d7</td><td class="n">%s</td>'
+                  '<td class="n t%s">%s %%/an</td></tr><tr class="scn"><td colspan="6">%s</td></tr>') % (
                      nom.capitalize(), fr(100 * sc.get('poids', POIDS_DEF[nom]), 0), fr(sc['bpa'][3], 2),
                      fr(sc['multiple'], 1), fprix(pt), L_RDT(t_) if L_RDT(t_) != 'gris' else 'gris', fr(t_, 1), esc(sc.get('txt', '')))
     hz = R.get('horizons') or {}
     hrows = ''.join('<tr><td>%s ans</td><td class="n">%s %%</td><td class="n">%s %%</td></tr>' % (
         fr(h, 1), fr(hz[h]['avec'], 1), fr(hz[h]['sans'], 1)) for h in sorted(hz))
     dc = R.get('decomp') or {}
-    A('<div class="grid g2"><div class="c"><h3>Trois sc\u00e9narios \u00e0 quatre ans</h3><div class="scroll"><table>'
+    A('<div class="c"><h3>Trois sc\u00e9narios \u00e0 quatre ans</h3><div class="scroll"><table class="sc">'
       '<tr><th>Sc\u00e9nario</th><th class="n">Poids</th><th class="n">BPA an 4</th><th class="n">Multiple</th>'
-      '<th class="n">Prix terminal</th><th class="n">TRI</th><th></th></tr>%s</table></div>'
+      '<th class="n">Prix terminal</th><th class="n">TRI</th></tr>%s</table></div>'
       '<div class="sub">Base publi\u00e9e %s \u2192 base normalis\u00e9e %s \u00b7 %s</div></div>' % (
           srows, fr(vv(valo.get('base_publiee')), 2), fr(vv(valo.get('base_normalisee')), 2), esc(valo.get('effet'))))
     A('<div class="c"><h3>Robustesse du rendement</h3><div class="scroll"><table>'
@@ -1043,7 +1046,7 @@ def rendu(D, R):
       '<div class="sub">D\u00e9composition du TRI central : op\u00e9rations %s %% \u00b7 dividendes %s pts \u00b7 multiple %s pts</div>'
       '<div style="margin-top:8px">%s %s</div>'
       '<div class="sub">Croissance exig\u00e9e pour %s %%/an nets : %s %%/an (inversion m\u00e9canique, seuil indicatif) \u00b7 multiple exig\u00e9 par le cours : %s\u00d7</div>'
-      '<div class="sub">Seconde m\u00e9thode : %s</div></div></div>' % (
+      '<div class="sub">Seconde m\u00e9thode : %s</div></div>' % (
           hrows, fr(dc.get('A'), 1), fr(dc.get('div'), 1), fr(dc.get('mult'), 1),
           bdg('Part du multiple %s %%' % fr(R.get('part_mult'), 0), R.get('niv_part', 'gris')),
           bdg('Multiple exig\u00e9 : %s' % R.get('mult_exige_lab', 'n.d.'), L_LAB('mult_exige', R.get('mult_exige_lab'))),
@@ -1052,7 +1055,7 @@ def rendu(D, R):
     # ---------------- bloc 4
     A('<h2>Combien en acheter, et quoi surveiller</h2>')
     tl = R.get('taille') or {}
-    A('<div class="grid g2"><div class="c"><h3>Taille, tranches et rythme</h3>'
+    A('<div class="c"><h3>Taille, tranches et rythme</h3>'
       '<p>Taille maximale : <b>%s %%</b> du portefeuille%s \u2014 contrainte active : %s.</p>'
       '<p>Tranches %s \u00b7 tranche 1 %s</p><div>%s</div><div class="sub">Capital pr\u00e9serv\u00e9 au prix d\'achat : %s /100 \u00b7 priorit\u00e9 de suivi : %s</div></div>' % (
           fr(tl.get('max'), 1), ' (provisoire : volume inconnu)' if tl.get('provisoire') else '', esc(tl.get('contrainte')),
@@ -1061,7 +1064,7 @@ def rendu(D, R):
           fr(R.get('cap_PA'), 0), esc(R.get('priorite'))))
     lec = D.get('lecture') or {}
     A('<div class="c"><h3>Points forts et points faibles</h3><div class="grid g2">'
-      '<ul class="plus">%s</ul><ul class="moins">%s</ul></div></div></div>' % (
+      '<ul class="plus">%s</ul><ul class="moins">%s</ul></div></div>' % (
           ''.join('<li>%s</li>' % esc(x) for x in (lec.get('forces') or [])),
           ''.join('<li>%s</li>' % esc(x) for x in (lec.get('faiblesses') or []))))
     pd = lec.get('point_decisif') or {}
