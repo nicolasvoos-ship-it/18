@@ -18,7 +18,7 @@ import json, sys, os, re, math, html, copy, statistics as stx
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V22.1"
+VERSION = "V22.2"
 VERSION_DATE = "20/09/2026"
 WARN, CHK = [], []
 
@@ -493,6 +493,8 @@ def calculer(D):
     R['PJ'] = _prix(R['tx_bandes'][1] / 100.0)
     R['PO'] = _prix(R['tx_bandes'][2] / 100.0)
     R['PR'] = _prix(min(0.30, (tx + 3) / 100.0))
+    R['PS'] = _prix(min(0.30, (tx + 6) / 100.0))
+    R['tx_action'] = (tx, min(30.0, tx + 3), min(30.0, tx + 6))
     R['PA_sans_revalo'] = prix_pour(tx / 100.0, lambda P: flux(P, C, ctx, 4, mact)[0], pmax) if num(mact) else None
     R['P15_sans_revalo'] = prix_pour(0.15, lambda P: flux(P, C, ctx, 4, mact)[0], pmax) if num(mact) else None
     if all(num(R[k]) for k in ('PA', 'PJ', 'PO')):
@@ -500,6 +502,12 @@ def calculer(D):
         chk('Ordre des bandes de prix (achat \u2264 \u22125 pts \u2264 \u221210 pts)', 'valid\u00e9' if okb else '\u00e9chec')
         if not okb:
             warn('Ordre des bandes de prix incoh\u00e9rent : v\u00e9rifier les flux.')
+    if all(num(R[k]) for k in ('PA', 'PR', 'PS')):
+        oka = R['PS'] <= R['PR'] <= R['PA'] + 1e-9
+        chk('Ordre des prix actionnables (+6 pts \u2264 +3 pts \u2264 objectif)',
+            'valid\u00e9' if oka else '\u00e9chec')
+        if not oka:
+            warn('Ordre des prix actionnables incoh\u00e9rent : v\u00e9rifier les flux.')
     if all(num(R[k]) for k in ('P12', 'P15', 'P18')):
         ok = R['P18'] <= R['P15'] <= R['P12'] + 1e-9
         chk('Ordre P18 \u2264 P15 \u2264 P12', 'valid\u00e9' if ok else '\u00e9chec')
@@ -760,7 +768,7 @@ tbody tr:last-child td{border-bottom:none}
 .bar{height:11px;background:#16211f;border-radius:6px;overflow:hidden;margin-top:6px}
 .bar i{display:block;height:100%;border-radius:6px}
 .pv{color:var(--cy);font-size:11px;margin-left:3px}
-.rl{position:relative;height:80px;margin:44px 0 22px}
+.rl{position:relative;height:140px;margin:44px 0 22px}
 .rl .seg{position:absolute;top:34px;height:30px}
 .rl .seg:first-of-type{border-radius:8px 0 0 8px}.rl .seg:last-of-type{border-radius:0 8px 8px 0}
 .rl .cur{position:absolute;top:0;transform:translateX(-50%);color:var(--cy);font-size:16px;font-weight:600;
@@ -1005,23 +1013,26 @@ def rendu(D, R):
         carte('Si le mauvais sc\u00e9nario arrive t\u00f4t', '%s %%/an' % fr(R.get('tri_bear_25'), 1),
               L_RDT(R.get('tri_bear_25')), 'revente forc\u00e9e au bout de 2 ans et demi')))
 
-    # reglette
-    PA, PJ, PO = R.get('PA'), R.get('PJ'), R.get('PO')
-    bd = R.get('tx_bandes') or (15.0, 10.0, 5.0)
-    if all(num(x) for x in (PA, PJ, PO)):
-        hi = max(PO * 1.15, cours * 1.15)
+    # barrette decisionnelle : seulement les niveaux actionnables au-dessus de l'objectif
+    PA, PR, PS = R.get('PA'), R.get('PR'), R.get('PS')
+    ta = R.get('tx_action') or (15.0, 18.0, 21.0)
+    if all(num(x) for x in (PA, PR, PS)):
+        hi = max(PA * 1.15, cours * 1.15)
         pc = lambda p: max(0.0, min(100.0, 100 * p / hi))
-        segs = [(0, pc(PA), 'l5'), (pc(PA), pc(PJ), 'l4'), (pc(PJ), pc(PO), 'l3'), (pc(PO), 100, 'l2')]
-        sg = ''.join('<div class="seg" style="left:%s%%;width:%s%%;background:var(--%s)"></div>' % (a, max(0.4, b - a), c) for a, b, c in segs)
-        tk = ''.join('<div class="tick" style="left:%s%%">%s %% %s</div>' % (pc(p), fr(t, 0), fprix(p))
-                     for p, t in ((PA, bd[0]), (PJ, bd[1]), (PO, bd[2])))
-        A('<div class="c"><h3>R\u00e9glette de prix (%s) \u2014 seuil d\'achat %s %%/an</h3><div class="rl">%s%s'
+        segs = [(0, pc(PS), '#2dc7c9'), (pc(PS), pc(PR), '#4ede9a'),
+                (pc(PR), pc(PA), '#9edb6b'), (pc(PA), 100, '#f0605f')]
+        sg = ''.join('<div class="seg" style="left:%s%%;width:%s%%;background:%s"></div>' % (a, max(0.4, b - a), c) for a, b, c in segs)
+        tk = ''.join('<div class="tick" style="left:%s%%;top:%spx">%s \u00b7 %s %% \u00b7 %s</div>' %
+                     (pc(p), top, lib, fr(t, 0), fprix(p)) for p, t, lib, top in
+                     ((PS, ta[2], 'Forte marge', 70), (PR, ta[1], 'Renfort', 92),
+                      (PA, ta[0], 'Objectif', 114)))
+        A('<div class="c"><h3>Barrette de prix (%s) \u2014 uniquement les niveaux actionnables</h3><div class="rl">%s%s'
           '<div class="cur" style="left:%s%%">\u25b2 cours %s \u2192 %s %%/an</div></div>'
-          '<div class="sub">Bandes : \u2265%s %% achat \u00b7 %s\u2013%s %% \u00b7 %s\u2013%s %% \u00b7 sous %s %%. '
-          'Porte prix : %s \u00b7 prix d\'achat sans revalorisation %s \u00b7 prix de renforcement (+3 pts) %s</div></div>' % (
-              esc(dev), fr(bd[0], 1), sg, tk, pc(cours), fprix(cours), fr(R.get('retenu'), 1),
-              fr(bd[0], 0), fr(bd[1], 0), fr(bd[0], 0), fr(bd[2], 0), fr(bd[1], 0), fr(bd[2], 0),
-              esc(R.get('porte_prix')), fprix(R.get('PA_sans_revalo')), fprix(R.get('PR'))))
+          '<div class="sub">Objectif %s %% : %s \u00b7 renfort %s %% : %s \u00b7 forte marge %s %% : %s. '
+          'Cours du jour : %s \u2192 %s %%/an. Aucun palier sous l\'objectif n\'est affich\u00e9.</div></div>' % (
+              esc(dev), sg, tk, pc(cours), fprix(cours), fr(R.get('retenu'), 1),
+              fr(ta[0], 0), fprix(PA), fr(ta[1], 0), fprix(PR), fr(ta[2], 0), fprix(PS),
+              fprix(cours), fr(R.get('retenu'), 1)))
 
     srows = ''
     for nom in ('baissier', 'central', 'haussier'):
