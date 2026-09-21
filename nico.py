@@ -18,7 +18,7 @@ import json, sys, os, re, math, html, copy, hashlib, statistics as stx
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V22.4.1"
+VERSION = "V22.4.2"
 VERSION_DATE = "21/09/2026"
 WARN, CHK = [], []
 
@@ -418,9 +418,123 @@ def cap_preserve(P, sc, ctx):
     return 100 * sum(c for t, c in cfs if t > 0) / I0
 
 
+# ------------------------------------------------------------------ V22.4.2 : normalisation des entrees
+# Tout champ lu comme nombre (ou libelle) par le calcul accepte indifferemment une valeur nue ou le format
+# compact [valeur, provenance, source, note]. Les champs deja lus via vv() gardent leur provenance a l'affichage.
+CHAMPS_NUM = [
+    'meta.fx_eur', 'meta.liquidite_max_pct',
+    'taux_exige.ajustement',
+    'croissance.g_centrale', 'croissance.g_organique_hist',
+    'valo.frais_achat_pct', 'valo.frais_vente_pct', 'valo.retenue_etrangere', 'valo.precompte',
+    'valo.croissance_terminale', 'valo.multiple_actuel', 'valo.mediane_5ans', 'valo.pairs',
+    'valo.bas_fourchette_5ans', 'valo.ancrage_terminal.plafond',
+    'momentum.perf6m_rel', 'momentum.vs_mm200',
+    'risques.stress.d_bas', 'risques.stress.d_haut',
+    'secteur.s_bas', 'secteur.s_haut',
+    'resultats.reperes.ca_n1', 'resultats.reperes.ca_attentes',
+    'resultats.reperes.bpa_n1', 'resultats.reperes.bpa_attentes',
+]
+CHAMPS_NUM_VV = ['meta.cours', 'meta.capitalisation_meur', 'valo.base_normalisee', 'valo.base_publiee',
+                 'rentabilite.wacc']  # lus via vv() : seule la valeur interne est controlee
+CHAMPS_TXT = ['meta.fiabilite', 'valo.clause', 'taux_exige.motif']
+
+
+def _en_nombre(x):
+    """Nombre, None, ou chaine numerique ('0,30', '15 %') convertie ; sinon leve ValueError."""
+    if x is None or num(x):
+        return x
+    if isinstance(x, bool):
+        raise ValueError(x)
+    if isinstance(x, str):
+        t = x.strip().replace('\u00a0', '').replace(' ', '').replace('%', '').replace(',', '.')
+        if t in ('', 'n.d.', 'nd', 'null', 'None'):
+            return None
+        return float(t)
+    raise ValueError(x)
+
+
+def _chemin(D, path):
+    *tete, cle = path.split('.')
+    cur = D
+    for k in tete:
+        if not isinstance(cur, dict) or not isinstance(cur.get(k), dict):
+            return None, None
+        cur = cur[k]
+    return (cur, cle) if isinstance(cur, dict) and cle in cur else (None, None)
+
+
+def normaliser_entrees(D):
+    """Deballe les formats compacts la ou le calcul attend un scalaire ; ne plante jamais."""
+    prov = D.setdefault('_prov_deballee', {})
+    notes = []
+
+    def fixe(path, garder_liste=False):
+        parent, cle = _chemin(D, path)
+        if parent is None:
+            return
+        brut = parent[cle]
+        val = brut
+        if isinstance(brut, dict) and 'v' in brut:
+            val = brut.get('v')
+        elif isinstance(brut, list) and brut and not isinstance(brut[0], (list, dict)):
+            val = brut[0]
+        try:
+            n = _en_nombre(val)
+        except (ValueError, TypeError):
+            notes.append('%s illisible (%r) \u2014 trait\u00e9 comme n.d.' % (path, val))
+            n = None
+        if garder_liste and isinstance(brut, list):
+            brut = list(brut); brut[0] = n; parent[cle] = brut
+        elif garder_liste and isinstance(brut, dict):
+            brut = dict(brut); brut['v'] = n; parent[cle] = brut
+        else:
+            if val is not brut:
+                prov[path] = V(brut)
+            parent[cle] = n
+
+    for p in CHAMPS_NUM:
+        fixe(p)
+    for p in CHAMPS_NUM_VV:
+        fixe(p, garder_liste=True)
+    for p in CHAMPS_TXT:
+        parent, cle = _chemin(D, p)
+        if parent is not None and isinstance(parent[cle], (list, dict)):
+            prov[p] = V(parent[cle]); parent[cle] = str(V(parent[cle])['v'] or '')
+
+    scs = G(D, 'valo.scenarios') or {}
+    for nom, sc in (scs.items() if isinstance(scs, dict) else []):
+        if not isinstance(sc, dict):
+            continue
+        for k in ('multiple', 'poids'):
+            if k in sc:
+                x = sc[k]
+                if isinstance(x, list) and x and not isinstance(x[0], (list, dict)):
+                    x = x[0]
+                try:
+                    sc[k] = _en_nombre(x)
+                except (ValueError, TypeError):
+                    notes.append('sc\u00e9nario %s.%s illisible \u2014 n.d.' % (nom, k)); sc[k] = None
+        if sc.get('poids') is None and nom in POIDS_DEF:
+            sc['poids'] = POIDS_DEF[nom]
+        for k in ('bpa', 'dps'):
+            if isinstance(sc.get(k), list):
+                propre = []
+                for x in sc[k]:
+                    if isinstance(x, list) and x and not isinstance(x[0], (list, dict)):
+                        x = x[0]
+                    try:
+                        propre.append(_en_nombre(x))
+                    except (ValueError, TypeError):
+                        notes.append('sc\u00e9nario %s.%s illisible \u2014 n.d.' % (nom, k)); propre.append(None)
+                sc[k] = propre
+    return notes
+
+
 def calculer(D):
     WARN.clear()
     CHK.clear()
+    for n_ in normaliser_entrees(D):
+        warn(n_)
     R = {'calc': False}
     meta = D.get('meta') or {}
     valo = D.get('valo') or {}
