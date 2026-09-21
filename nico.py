@@ -18,8 +18,8 @@ import json, sys, os, re, math, html, copy, hashlib, statistics as stx
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V22.4"
-VERSION_DATE = "20/09/2026"
+VERSION = "V22.4.1"
+VERSION_DATE = "21/09/2026"
 WARN, CHK = [], []
 
 
@@ -440,7 +440,10 @@ def calculer(D):
     bo, bg = barC(go), barC(gc)
     R['C'] = None if (bo is None or bg is None) else 0.5 * bo + 0.5 * bg
 
-    if not (num(cours) and all(k in scs for k in ('baissier', 'central', 'haussier'))):
+    def _sc_ok(sc):  # V22.4.1 : un scenario incomplet vaut arret precoce, jamais un plantage
+        return (isinstance(sc, dict) and isinstance(sc.get('bpa'), list) and len(sc['bpa']) == 4
+                and all(num(x) for x in sc['bpa']) and num(sc.get('multiple')))
+    if not (num(cours) and all(_sc_ok(scs.get(k)) for k in ('baissier', 'central', 'haussier'))):
         chk('Calculs financiers', 'n.a.', 'sc\u00e9narios ou cours absents \u2014 arr\u00eat pr\u00e9coce')
         return R
 
@@ -1115,7 +1118,9 @@ def rendu(D, R):
 
     srows = ''
     for nom in ('baissier', 'central', 'haussier'):
-        sc = (valo.get('scenarios') or {})[nom]
+        sc = (valo.get('scenarios') or {}).get(nom)
+        if not sc or 'ctx' not in R:  # arret precoce : pas de scenarios chiffres
+            continue
         t_ = tri(flux(cours, sc, R['ctx'])[0])
         pt = sc['bpa'][3] * sc['multiple']
         srows += ('<tr><td><b>%s</b></td><td class="n">%s %%</td><td class="n">%s</td><td class="n">%s\u00d7</td><td class="n">%s</td>'
@@ -1149,9 +1154,9 @@ def rendu(D, R):
       '<p>Taille maximale : <b>%s %%</b> du portefeuille%s \u2014 contrainte active : %s.</p>'
       '<p>Tranches %s \u00b7 tranche 1 %s</p><div>%s</div><div class="sub">Capital pr\u00e9serv\u00e9 au prix d\'achat : %s /100 \u00b7 priorit\u00e9 de suivi : %s</div></div>' % (
           fr(tl.get('max'), 1), ' (provisoire : volume inconnu)' if tl.get('provisoire') else '', esc(tl.get('contrainte')),
-          esc(R.get('tranches')), esc(R.get('tranche1')),
-          bdg('Momentum : %s' % R.get('momentum'), L_LAB('momentum', R.get('momentum'))),
-          fr(R.get('cap_PA'), 0), esc(R.get('priorite'))))
+          esc(R.get('tranches') or 'n.d.'), esc(R.get('tranche1') or 'n.d.'),
+          bdg('Momentum : %s' % (R.get('momentum') or 'n.d.'), L_LAB('momentum', R.get('momentum'))),
+          fr(R.get('cap_PA'), 0), esc(R.get('priorite') or 'n.d.')))
     lec = D.get('lecture') or {}
     A('<div class="c"><h3>Points forts et points faibles</h3><div class="grid g2">'
       '<ul class="plus">%s</ul><ul class="moins">%s</ul></div></div>' % (
@@ -1221,9 +1226,9 @@ def resume(D, R):
              fr(R.get('tx'), 1), fr(R.get('retenu'), 1), fprix(R.get('PA')), fr(R.get('cap_cours'), 0)),
          'Central vs historique %s pts \u00b7 sensibilit\u00e9 du prix \u2212%s %% \u00b7 taille max %s %% \u00b7 tranches %s' % (
              fr(R.get('ecart_hist'), 1, True), fr(R.get('tolerance'), 0),
-             fr((R.get('taille') or {}).get('max'), 1), R.get('tranches')),
+             fr((R.get('taille') or {}).get('max'), 1), R.get('tranches') or 'n.d.'),
          'Suivi : %s \u2014 %s (%s) \u00b7 priorit\u00e9 %s' % (v.get('suivi'), v.get('suivi_condition'),
-                                                               v.get('suivi_date'), R.get('priorite'))]
+                                                               v.get('suivi_date'), R.get('priorite') or 'n.d.')]
     if WARN:
         L.append('\u26a0\ufe0f ' + ' \u00b7 '.join(WARN))
     L.append(R['nico'])
