@@ -14,11 +14,11 @@ Fait tout ce qui est mecanique, pour que le modele n'ecrive que des faits et des
 
 Aucun appel reseau. Les seuils sont ici ET dans le fichier A : ne jamais modifier l'un sans l'autre.
 """
-import json, sys, os, re, math, html, copy, statistics as stx
+import json, sys, os, re, math, html, copy, hashlib, statistics as stx
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V22.3"
+VERSION = "V22.4"
 VERSION_DATE = "20/09/2026"
 WARN, CHK = [], []
 
@@ -419,6 +419,8 @@ def cap_preserve(P, sc, ctx):
 
 
 def calculer(D):
+    WARN.clear()
+    CHK.clear()
     R = {'calc': False}
     meta = D.get('meta') or {}
     valo = D.get('valo') or {}
@@ -604,31 +606,27 @@ def calculer(D):
                     hi = mid
             R['g_exigee'] = (lo + hi) / 2
 
-    # garde-fous de clause
+    # V22.4 : ancrage terminal indépendant du cours. Aucun repli sur mact.
+    ancrage = valo.get('ancrage_terminal') or {}
+    plafond = ancrage.get('plafond')
+    valide = (num(plafond) and plafond > 0 and bool(ancrage.get('date'))
+              and bool(ancrage.get('justification')))
+    R['R_plafond'] = plafond if valide else None
+    R['ancrage_valide'] = bool(valide)
     clause = (valo.get('clause') or 'aucune').upper()
-    Rmin = [r_ for r_ in (mact, valo.get('mediane_5ans')) if num(r_)]
-    R['R_plafond'] = min(Rmin) if Rmin else None
     R['clause'] = clause
-    if 'AUCUNE' in clause:
-        if num(R['R_plafond']) and num(C.get('multiple')) and C['multiple'] > R['R_plafond'] + 1e-9:
-            warn('Sans clause, le multiple central (%.1f) d\u00e9passe R = %.1f.' % (C['multiple'], R['R_plafond']))
-            R['R_depasse'] = True
-        chk('Plafond de multiple (R)', 'n.d.' if not num(R['R_plafond'])
-            else ('\u00e9chec' if R.get('R_depasse') else 'valid\u00e9'))
-    else:
-        bf = valo.get('bas_fourchette_5ans')
-        exig = min([v for v in (0.8 * mact if num(mact) else None, bf) if num(v)]) if (num(mact) or num(bf)) else None
-        if num(exig) and num(Bs.get('multiple')) and Bs['multiple'] > exig + 1e-9:
-            warn('Garde-fou 1 : multiple baissier %.1f > %.1f exig\u00e9 (clause active).' % (Bs['multiple'], exig))
-        tri_std = tri(flux(cours, C, ctx, 4, R['R_plafond'])[0]) if num(R['R_plafond']) else None
-        if num(tri_std) and num(Cc) and Cc > 0:
-            sup = (Cc - tri_std) / Cc * 100
-            R['supplement_clause'] = sup
-            if sup > 25:
-                warn('Garde-fou 3 : suppl\u00e9ment de TRI de la clause = %.0f %% (>25 %%). R\u00e9duire le multiple central.' % sup)
-        if num(Cc) and Cc <= 0:
-            warn('Garde-fou 3 : TRI avec clause \u2264 0 \u2014 clause inactive, retour \u00e0 R.')
-        chk('Garde-fous de clause', 'valid\u00e9' if not any('Garde-fou' in w for w in WARN) else '\u00e9chec')
+    R['R_depasse'] = bool(valide and C['multiple'] > plafond + 1e-9)
+    R['valorisation_valide'] = bool(valide and not R['R_depasse'] and clause == 'AUCUNE')
+    if not R['valorisation_valide']:
+        warn('Prix indicatif : ancrage terminal absent/invalide, plafond dépassé ou ancienne clause à migrer en V22.4.')
+    chk('Ancrage terminal indépendant du cours', 'validé' if R['valorisation_valide'] else 'échec',
+        str(ancrage.get('justification') or 'Renseigner valo.ancrage_terminal : plafond, date, justification.'))
+    # Empreinte reproductible des hypothèses, hors cours et diagnostics de marché.
+    empreinte = {'base': base, 'scenarios': scs, 'contexte': ctx, 'taux': R['tx'],
+                 'ancrage': ancrage, 'tob': TOB, 'tax_pv': TAX_PV,
+                 'date_eval': meta.get('date_eval'), 'version': VERSION}
+    R['empreinte_hypotheses'] = hashlib.sha256(json.dumps(empreinte, sort_keys=True,
+        ensure_ascii=False).encode()).hexdigest()[:16]
 
     # momentum, taille, tranches
     mom = D.get('momentum') or {}
@@ -660,7 +658,7 @@ def calculer(D):
                    'contrainte': min(lim, key=lambda t: t[1])[0] if lim else None,
                    'provisoire': not num(liq)}
     R['tranches'] = '50 / 25 / 25 %' if (R['momentum'] == 'FAVORABLE' and fiab != 'C' and not pari) else '1/3 \u2013 1/3 \u2013 1/3'
-    R['tranche1'] = ('au prix d\'achat sans revalorisation (%s)' % fprix(R['PA_sans_revalo'])) if (num(R['part_mult']) and R['part_mult'] > 25) else 'au prix admissible (\u2264 prix d\'achat)'
+    R['tranche1'] = 'au prix admissible (≤ prix d’achat) ; exposition au multiple à examiner séparément'
     R['priorite'] = ('ACTIF' if cours <= R['PJ'] else 'VEILLE') if num(R.get('PJ')) and R['PJ'] > 0 else 'non \u00e9valu\u00e9e'
     R['porte_prix'] = 'ouverte' if (num(R.get('PA')) and cours <= R['PA']) else ('PROCHE' if (num(R.get('PJ')) and cours <= R['PJ']) else 'LOIN')
 
@@ -672,6 +670,8 @@ def calculer(D):
         vf, _ = 'REJET \u2014 STRUCTURE', motifs.append('blocage structurel d\u00e9clar\u00e9')
     elif fiab == 'D':
         vf, _ = '\u00c0 DOCUMENTER \u2014 ACHAT BLOQU\u00c9', motifs.append('fiabilit\u00e9 D')
+    elif not R['valorisation_valide']:
+        vf, _ = 'À DOCUMENTER — ACHAT BLOQUÉ', motifs.append('ancrage terminal non validé')
     elif veut_acheter and not R['q']['porte']:
         vf, _ = 'HORS S\u00c9LECTION', motifs.append('porte qualit\u00e9 non franchie')
     elif veut_acheter and R['porte_prix'] != 'ouverte':
@@ -886,6 +886,22 @@ def rendu(D, R):
           esc(meta.get('pays')), esc(meta.get('mode', 'nouvelle position')), esc(meta.get('date_eval')), VERSION,
           esc(meta.get('fiabilite')), fr(R.get('tx'), 1), fprix(cours), esc(dev), esc(meta.get('date_cours'))))
 
+    # -- audit de revision : textes et tableaux fournis avec l'instantane.
+    audit = D.get('audit_valorisation') or {}
+    if audit:
+        A('<div class="c"><h3 style="color:var(--cy)">Valorisation corrigée · hypothèses explicites</h3>')
+        A('<p>%s</p>' % esc(audit.get('resume')))
+        for titre, lignes in (audit.get('tableaux') or {}).items():
+            A('<h3 style="color:var(--l4)">%s</h3><div class="scroll"><table>' % esc(titre))
+            for i, ligne in enumerate(lignes):
+                balise = 'th' if i == 0 else 'td'
+                A('<tr>' + ''.join('<%s>%s</%s>' % (balise, esc(c), balise) for c in ligne) + '</tr>')
+            A('</table></div>')
+        for note in audit.get('notes') or []:
+            A('<p class="sub">%s</p>' % esc(note))
+        A('<p class="sub">Empreinte des hypothèses : %s. Un autre cours ne modifie pas cette empreinte.</p></div>' % esc(R.get('empreinte_hypotheses')))
+    if R.get('calc') and not R.get('valorisation_valide'):
+        A('<div class="c" style="border-color:var(--l2)">Prix indicatifs uniquement : ancrage terminal à corriger avant toute décision.</div>')
     # -- verdict
     v = D.get('verdict') or {}
     A('<div class="c"><div>%s &nbsp; %s</div><p style="margin-top:10px;font-size:16px">%s</p>'
