@@ -18,8 +18,8 @@ import json, sys, os, re, math, html, copy, hashlib, statistics as stx
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V22.4.2"
-VERSION_DATE = "21/09/2026"
+VERSION = "V22.5"
+VERSION_DATE = "23/09/2026"
 WARN, CHK = [], []
 
 
@@ -132,6 +132,8 @@ FAM = {
     'achat': {'WATCHLIST \u2014 CONFIRMATION': 3, 'WATCHLIST \u2014 GUIDANCE': 3, 'ACHAT COMPL\u00c9MENTAIRE': 5,
               'HORS P\u00c9RIM\u00c8TRE': 'doc', 'WATCHLIST PROCHE': 4, 'WATCHLIST LOIN': 3, 'HORS S\u00c9LECTION': 2,
               '\u00c0 DOCUMENTER': 'doc', 'RENFORCEMENT': 5, 'CONFIRMATION': 3, 'GUIDANCE': 3, 'REJET': 1, 'ACHAT': 6},
+    'pm': {'CATALYSEUR DAT\u00c9': 5, 'CATALYSEUR PROBABLE': 4, 'RENDEMENT PAR LES FLUX': 5,
+           'PARI DE REVALORISATION': 3, 'NON DOCUMENT\u00c9': 'gris'},
     'suivi': {'SOUS SURVEILLANCE': 4, 'SP\u00c9CULATIVE': 3, 'CONSERVER': 5, 'RETIRER': 2},
     'fiab': {'A': 6, 'B': 5, 'C': 3, 'D': 1},
     'momentum': {'FAVORABLE': 5, 'D\u00c9FAVORABLE': 3, 'MIXTE': 4, 'IND\u00c9TERMIN\u00c9': 'gris'},
@@ -179,10 +181,11 @@ def calc_taux_exige(D, R):
     mods = []
 
     Q, vis = q.get('Q'), q.get('vis')
-    iqr, ab, nn = rb.get('iqr'), rb.get('au_dessus'), rb.get('n')
+    iqr, ab, nn = rb.get('iqr_eff'), rb.get('au_dessus'), rb.get('n')
     if (num(Q) and Q >= 85 and num(vis) and vis >= 70 and num(iqr) and iqr <= 5
-            and num(ab) and num(nn) and nn >= 5 and ab >= 5):
-        mods.append(('qualit\u00e9 prouv\u00e9e (Q\u226585, visibilit\u00e9\u226570 %, IQR ROIC\u22645 pts, 5 ans ROIC>WACC)', -2.0))
+            and num(ab) and num(nn) and nn >= 5 and ab >= 5
+            and rb.get('tend') != 'EN BAISSE' and rb.get('metrique_ok', True)):
+        mods.append(('qualit\u00e9 prouv\u00e9e (Q\u226585, visibilit\u00e9\u226570 %%, stabilit\u00e9 %s \u22645 pts, 5 ans > co\u00fbt du capital, tendance non baissi\u00e8re)' % rb.get('metrique', 'ROIC'), -2.0))
 
     vn = ((q.get('pil') or {}).get('visibilite') or {}).get('notes') or []
     if vn and num(vn[0]) and vn[0] >= 1:
@@ -244,7 +247,8 @@ def calc_taux_exige(D, R):
     return tx
 
 
-def calc_qualite(q, wacc_absent):
+def calc_qualite(q, wacc_absent, rb=None, rent=None):
+    rb = rb or {}; rent = rent or {}
     ctr = q.get('controles') or {}
     num_, den = 0.0, 0.0
     pil = {}
@@ -260,6 +264,8 @@ def calc_qualite(q, wacc_absent):
         if k == 'capital' and wacc_absent and num(notes[0]) and notes[0] > 0.5:
             notes[0] = 0.5
             warn('WACC absent : contr\u00f4le Capital 1 plafonn\u00e9 \u00e0 0,5 par le moteur.')
+        if k == 'capital' and num(notes[0]):
+            notes[0] = plafond_capital1(notes[0], rb, rent)
         obs = [n for n in notes if num(n)]
         for n in obs:
             num_ += w / 3 * n
@@ -292,13 +298,15 @@ def roic_badge(serie, wacc):
     if n >= 4:
         qs = stx.quantiles(vals, n=4, method='inclusive')
         out['iqr'] = qs[2] - qs[0]
+    out['tend'], out['pente'], out['iqr_res'] = tendance_roic(vals)
+    out['iqr_eff'] = out['iqr_res'] if out['tend'] == 'EN HAUSSE' else out['iqr']
     if n < 3:
         return dict(out, lab='HISTORIQUE INSUFFISANT', lvl='gris')
     if not num(wacc):
         return dict(out, lab='CO\u00dbT DU CAPITAL NON \u00c9VALU\u00c9', lvl='gris')
     ab = sum(1 for v in vals if v > wacc)
     out['au_dessus'] = ab
-    iqr = out['iqr'] if out['iqr'] is not None else 0
+    iqr = out['iqr_eff'] if out['iqr_eff'] is not None else 0
     if n >= 5 and out['med'] <= 0:
         lab, l = 'DESTRUCTION PERSISTANTE', 1
     elif out['med'] <= wacc:
@@ -315,7 +323,80 @@ def roic_badge(serie, wacc):
         lab, l = 'RENTABLE ET STABLE', 5
     if n < 5 and isinstance(l, int) and l > 4:
         lab, l = 'HISTORIQUE COURT', 4
+    if isinstance(l, int) and l >= 5 and out['tend'] == 'EN HAUSSE' and lab != 'RENTABILIT\u00c9 DURABLE EXCEPTIONNELLE':
+        lab = 'RENTABILIT\u00c9 EN PROGRESSION'
+    elif isinstance(l, int) and l >= 5 and out['tend'] == 'EN BAISSE':
+        lab, l = 'RENTABLE MAIS EN BAISSE', 4
     return dict(out, lab=lab, lvl=l)
+
+
+METRIQUES = {'ROIC': 'ROIC', 'ROCE APR\u00c8S IMP\u00d4T': 'ROCE apr\u00e8s imp\u00f4t', 'ROCE APRES IMPOT': 'ROCE apr\u00e8s imp\u00f4t',
+             'ROE': 'ROE', 'ROE (SECTEUR FINANCIER)': 'ROE', 'ROTE (SECTEUR FINANCIER)': 'ROTE'}
+
+
+def tendance_roic(vals):
+    """Tendance mesuree par regression lineaire : pente (pts/an) et dispersion
+    des residus. Une progression reguliere n'est pas une instabilite (V22.5)."""
+    n = len(vals)
+    if n < 4:
+        return None, None, None
+    mx, my = (n - 1) / 2.0, sum(vals) / n
+    pente = sum((i - mx) * (v - my) for i, v in enumerate(vals)) / sum((i - mx) ** 2 for i in range(n))
+    res = [v - (my + pente * (i - mx)) for i, v in enumerate(vals)]
+    qs = stx.quantiles(res, n=4, method='inclusive')
+    iqr_res = qs[2] - qs[0]
+    iqr = stx.quantiles(vals, n=4, method='inclusive')
+    iqr = iqr[2] - iqr[0]
+    if pente >= 1 and vals[-1] >= vals[0] + 2 and iqr_res <= 5:
+        t = 'EN HAUSSE'
+    elif pente <= -1 and vals[-1] <= vals[0] - 2:
+        t = 'EN BAISSE'
+    elif iqr <= 5:
+        t = 'STABLE'
+    else:
+        t = 'VOLATILE'
+    return t, pente, iqr_res
+
+
+def completer_rentab(rb, rent):
+    """Ajoute tendance, stabilite effective et metrique au badge de rentabilite."""
+    lab = str(vv(rent.get('metrique')) or 'ROIC').strip().upper()
+    rb['metrique'] = METRIQUES.get(lab, 'ROIC')
+    rb['finance'] = 'SECTEUR FINANCIER' in lab
+    if lab not in METRIQUES:
+        warn('M\u00e9trique de rentabilit\u00e9 non reconnue (%s) : trait\u00e9e comme ROIC.' % lab)
+    lev = vv(rent.get('levier'))
+    rb['levier'] = lev
+    rb['metrique_ok'] = True
+    if rb['metrique'] == 'ROE' and not rb['finance']:
+        rb['metrique_ok'] = False
+        warn('Rentabilit\u00e9 mesur\u00e9e par le ROE hors secteur financier : comparabilit\u00e9 r\u00e9duite, '
+             'bonus de qualit\u00e9 prouv\u00e9e du taux exig\u00e9 non applicable.')
+    return rb
+
+
+def plafond_capital1(note, rb, rent):
+    """Capital 1 ne peut valoir 1 que si les conditions mesurables sont reunies (V22.5)."""
+    motifs = []
+    wacc, med, n, ab = rb.get('wacc'), rb.get('med'), rb.get('n') or 0, rb.get('au_dessus')
+    if num(wacc) and num(med) and n >= 5:
+        if med < wacc + 3: motifs.append('m\u00e9diane < co\u00fbt du capital + 3 pts')
+        if num(ab) and ab < n: motifs.append('au moins une ann\u00e9e sous le co\u00fbt du capital')
+        if num(rb.get('iqr_eff')) and rb['iqr_eff'] > 5: motifs.append('stabilit\u00e9 > 5 pts (tendance comprise)')
+    elif n < 5:
+        motifs.append('historique < 5 ans')
+    if rb.get('tend') == 'EN BAISSE' and not (rent.get('baisse_expliquee') and rent.get('tendance_preuve')):
+        motifs.append('rentabilit\u00e9 en baisse sans mont\u00e9e en puissance document\u00e9e')
+    lev = rb.get('levier')
+    if rb.get('metrique') == 'ROE' and not rb.get('finance') and (not num(lev) or lev > 0.5):
+        motifs.append('ROE hors finance avec levier %s' % ('non renseign\u00e9' if not num(lev) else '> 0,5'))
+    if note > 0.5 and motifs:
+        warn('Capital 1 plafonn\u00e9 \u00e0 0,5 par le moteur : ' + ' ; '.join(motifs) + '.')
+        return 0.5
+    if note == 0.5 and not motifs and rb.get('tend') == 'EN HAUSSE' and num(med) and num(wacc) and n >= 5:
+        warn('Capital 1 not\u00e9 0,5 alors que la progression r\u00e9guli\u00e8re remplit les conditions de 1 : '
+             'v\u00e9rifier la notation (ancien test IQR p\u00e9nalisant une hausse).')
+    return note
 
 
 def barC(x):
@@ -540,8 +621,11 @@ def calculer(D):
     valo = D.get('valo') or {}
     cours = vv(meta.get('cours')); x0 = meta.get('fx_eur', 1.0) or 1.0
     rent = D.get('rentabilite') or {}
-    R['rentab'] = roic_badge(rent.get('roic'), vv(rent.get('wacc')))
-    R['q'] = calc_qualite(D.get('qualite') or {}, not num(vv(rent.get('wacc'))))
+    R['rentab'] = completer_rentab(roic_badge(rent.get('roic'), vv(rent.get('wacc'))), rent)
+    R['q'] = calc_qualite(D.get('qualite') or {}, not num(vv(rent.get('wacc'))), R['rentab'], rent)
+    decl = str(vv(rent.get('tendance')) or '').upper()
+    if R['rentab'].get('tend') and decl in ('STABLE', 'EN HAUSSE', 'EN BAISSE', 'VOLATILE') and decl != R['rentab']['tend']:
+        warn('Tendance de rentabilit\u00e9 d\u00e9clar\u00e9e %s, mesur\u00e9e %s : expliquer l\u2019\u00e9cart dans tendance_preuve.' % (decl, R['rentab']['tend']))
     calc_taux_exige(D, R)
 
     scs = valo.get('scenarios') or {}
@@ -964,8 +1048,8 @@ def encadres_qualite(D, R):
     mg = G(D, 'qualite.marge_brute') or {}
     rb = R['rentab']
     rows = [
-        ('Combien rapporte la machine ?', 'Dernier ROIC : %s %% · médiane : %s %% · coût du capital : %s %%' % (fr(rb['last']), fr(rb['med']), fr(rb['wacc']))),
-        ('Est-elle durable ?', qual_badge(rent.get('tendance')) + qual_texte(rent.get('tendance_preuve'))),
+        ('Combien rapporte la machine ?', 'Dernier %s : %s %% · médiane : %s %% · coût du capital : %s %%' % (esc(rb.get('metrique', 'ROIC')), fr(rb['last']), fr(rb['med']), fr(rb['wacc']))),
+        ('Est-elle durable ?', 'Mesurée : ' + qual_badge(rb.get('tend') or 'INCONNUE') + (' pente %s pts/an' % fr(rb.get('pente'), 1, True) if num(rb.get('pente')) else '') + ' · déclarée : ' + qual_badge(rent.get('tendance')) + qual_texte(rent.get('tendance_preuve'))),
         ('Les nouveaux euros travaillent-ils aussi bien ?', qual_badge(rent.get('nouveaux_investissements')) + qual_texte(rent.get('rendement_incremental'))),
         ('Peut-elle grossir ?', qual_texte(rent.get('reinvestissement'))),
         ('Le chiffre est-il trompeur ?', qual_texte(rent.get('vigilance_comptable'))),
@@ -1161,11 +1245,12 @@ def rendu(D, R):
             ''.join('<div style="height:%s%%"></div>' % max(2, 100 * v / mx if mx else 0) for v in vals),
             ''.join('<span>%s</span>' % esc(a) for a in rb['annees']))
     A('<div class="c"><h3>Rentabilit\u00e9 \u00e9conomique \u2014 niveau et stabilit\u00e9</h3><div>%s</div>%s'
-      '<div class="sub">m\u00e9diane %s %% \u00b7 min %s %% \u00b7 derni\u00e8re %s %% \u00b7 %s/%s ann\u00e9es &gt; WACC %s %% \u00b7 IQR %s pts</div>'
+      '<div class="sub">%s \u00b7 m\u00e9diane %s %% \u00b7 min %s %% \u00b7 derni\u00e8re %s %% \u00b7 %s/%s ann\u00e9es &gt; co\u00fbt du capital %s %% \u00b7 IQR %s pts \u00b7 tendance %s (pente %s pts/an, dispersion autour de la tendance %s pts)</div>'
       '<p class="sub">%s</p></div></div>' % (
-          bdg(rb['lab'], rb['lvl'], 'gros'), graph, fr(rb['med'], 1), fr(rb['min'], 1), fr(rb['last'], 1),
+          bdg(rb['lab'], rb['lvl'], 'gros'), graph, esc(rb.get('metrique', 'ROIC')), fr(rb['med'], 1), fr(rb['min'], 1), fr(rb['last'], 1),
           rb['au_dessus'] if rb['au_dessus'] is not None else 'n.d.', rb['n'], fr(rb['wacc'], 1),
-          fr(rb['iqr'], 1), esc(G(D, 'rentabilite.definition'))))
+          fr(rb['iqr'], 1), esc(rb.get('tend') or 'n.d.'), fr(rb.get('pente'), 1, True), fr(rb.get('iqr_res'), 1),
+          esc(G(D, 'rentabilite.definition'))))
 
     A(encadres_qualite(D, R))
 
@@ -1279,11 +1364,11 @@ def rendu(D, R):
     pd = lec.get('point_decisif') or {}
     A('<div class="concl"><h3>Conclusion</h3><p>%s</p>'
       '<p><b>Point d\u00e9cisif</b><br>Raison du prix : %s<br>Fondement du d\u00e9saccord : %s<br>'
-      'Ce qui nous donnerait tort : %s<br>Marge d\'erreur : %s</p>'
+      'Ce qui nous donnerait tort : %s<br>Marge d\'erreur : %s<br>Pourquoi maintenant : %s</p>'
       '<p>Action : %s</p><p>Invalidation : %s</p><p class="sub">Prochain catalyseur : %s</p>'
       '<p>%s \u2014 %s <span class="sub">(\u00e9ch\u00e9ance %s ; non remplie \u2192 \u274c sans nouvelle analyse)</span></p></div>' % (
           esc(lec.get('these_2p')), esc(pd.get('raison_prix')), esc(pd.get('desaccord')), esc(pd.get('tort')),
-          esc(pd.get('marge_erreur') or ''), esc(lec.get('action')), esc(lec.get('invalidation')),
+          esc(pd.get('marge_erreur') or ''), pm_html(R), esc(lec.get('action')), esc(lec.get('invalidation')),
           esc(lec.get('catalyseur')), bdg(v.get('suivi', 'n.d.'), L_LAB('suivi', v.get('suivi')), 'gros'),
           esc(v.get('suivi_condition')), esc(v.get('suivi_date'))))
 
@@ -1330,6 +1415,42 @@ def ligne_nico(D, R):
     return ' | '.join(str(c).replace('\u202f', '') for c in ch)
 
 
+def calc_pourquoi(D, R):
+    """Pourquoi maintenant (V22.5) : l'analyste fournit le catalyseur ; le moteur
+    qualifie l'absence d'apres la part du multiple. Aucun point, aucun veto, aucun
+    effet sur le prix (R3) : seul le rythme des tranches change."""
+    pm = G(D, 'lecture.pourquoi_maintenant')
+    y = (list(pm) + ['', '', ''])[:3] if isinstance(pm, list) else [pm or '', '', '']
+    lab, fait, date = str(y[0] or '').strip().upper(), str(y[1] or '').strip(), str(y[2] or '').strip()
+    part = R.get('part_mult')
+    if 'DAT' in lab and 'CATALYSEUR' in lab:
+        eff = 'CATALYSEUR DAT\u00c9' if (fait and date) else 'CATALYSEUR PROBABLE'
+        if eff != 'CATALYSEUR DAT\u00c9':
+            warn('Catalyseur d\u00e9clar\u00e9 dat\u00e9 sans fait ou sans date : ramen\u00e9 \u00e0 CATALYSEUR PROBABLE.')
+    elif 'PROBABLE' in lab:
+        eff = 'CATALYSEUR PROBABLE'
+    elif pm is None:
+        eff = 'NON DOCUMENT\u00c9'
+    elif num(part):
+        eff = 'AUCUN \u2014 PARI DE REVALORISATION' if part > 25 else 'AUCUN \u2014 RENDEMENT PAR LES FLUX'
+    else:
+        eff = 'NON DOCUMENT\u00c9'
+    R['pm'] = {'lab': eff, 'fait': fait, 'date': date, 'lvl': L_LAB('pm', eff)}
+    if num(part) and part > 25 and eff != 'CATALYSEUR DAT\u00c9' and R.get('tranches'):
+        R['tranches'] = '25 / 25 / 50 %'
+        R['tranche1'] = ('part du multiple %s %% sans catalyseur dat\u00e9 : la derni\u00e8re moiti\u00e9 attend le catalyseur '
+                         'ou un cours au prix de renforcement' % fr(part, 0))
+    chk('Pourquoi maintenant', 'valid\u00e9' if eff != 'NON DOCUMENT\u00c9' else 'n.d.', eff)
+
+
+def pm_html(R):
+    pm = R.get('pm') or {}
+    if not pm:
+        return 'n.d.'
+    return bdg(pm['lab'], pm['lvl']) + (' ' + esc(pm['fait']) if pm.get('fait') else '') + \
+        (' (%s)' % esc(pm['date']) if pm.get('date') else '')
+
+
 def resume(D, R):
     meta = D.get('meta') or {}; v = D.get('verdict') or {}
     L = ['\U0001f4c4 %s (%s) \u2014 %s' % (meta.get('societe'), meta.get('ticker'), meta.get('date_eval')),
@@ -1341,8 +1462,11 @@ def resume(D, R):
          'Central vs historique %s pts \u00b7 sensibilit\u00e9 du prix \u2212%s %% \u00b7 taille max %s %% \u00b7 tranches %s' % (
              fr(R.get('ecart_hist'), 1, True), fr(R.get('tolerance'), 0),
              fr((R.get('taille') or {}).get('max'), 1), R.get('tranches') or 'n.d.'),
-         'Suivi : %s \u2014 %s (%s) \u00b7 priorit\u00e9 %s' % (v.get('suivi'), v.get('suivi_condition'),
-                                                               v.get('suivi_date'), R.get('priorite') or 'n.d.')]
+         'Rentabilit\u00e9 : %s %s \u00b7 pourquoi maintenant : %s' % ((R.get('rentab') or {}).get('lab'),
+             '(tendance %s)' % (R.get('rentab') or {}).get('tend') if (R.get('rentab') or {}).get('tend') else '',
+             (R.get('pm') or {}).get('lab', 'n.d.')),
+         'Suivi : %s \u2014 %s (%s) \u00b7 priorit\u00e9 %s' % (v.get('suivi') or 'n.d.', v.get('suivi_condition') or 'n.d.',
+                                                               v.get('suivi_date') or 'n.d.', R.get('priorite') or 'n.d.')]
     if WARN:
         L.append('\u26a0\ufe0f ' + ' \u00b7 '.join(WARN))
     L.append(R['nico'])
@@ -1357,6 +1481,7 @@ def main():
     with open(src, encoding='utf-8') as f:
         D = json.load(f)
     R = calculer(D)
+    calc_pourquoi(D, R)
     nbm, nbp = compter_these(G(D, 'acte0.these.texte'))
     if nbm > 80 or not (3 <= nbp <= 4):
         warn('Th\u00e8se : %s mots / %s phrases \u2014 format 3 \u00e0 4 phrases, 80 mots au plus.' % (nbm, nbp))
