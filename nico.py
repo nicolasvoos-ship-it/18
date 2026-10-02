@@ -14,12 +14,12 @@ Fait tout ce qui est mecanique, pour que le modele n'ecrive que des faits et des
 
 Aucun appel reseau. Les seuils sont ici ET dans le fichier A : ne jamais modifier l'un sans l'autre.
 """
-import json, sys, os, re, math, html, copy, hashlib, statistics as stx
+import json, sys, os, re, math, html, copy, hashlib, datetime, statistics as stx
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V22.5"
-VERSION_DATE = "23/09/2026"
+VERSION = "V22.6"
+VERSION_DATE = "02/10/2026"
 WARN, CHK = [], []
 
 
@@ -184,7 +184,9 @@ def calc_taux_exige(D, R):
     iqr, ab, nn = rb.get('iqr_eff'), rb.get('au_dessus'), rb.get('n')
     if (num(Q) and Q >= 85 and num(vis) and vis >= 70 and num(iqr) and iqr <= 5
             and num(ab) and num(nn) and nn >= 5 and ab >= 5
-            and rb.get('tend') != 'EN BAISSE' and rb.get('metrique_ok', True)):
+            and rb.get('tend') != 'EN BAISSE' and rb.get('metrique_ok', True)
+            and not rb.get('serie_estimee')
+            and all(((q.get('pil') or {}).get(k) or {}).get('obs') == 3 for k in ('capital', 'visibilite'))):
         mods.append(('qualit\u00e9 prouv\u00e9e (Q\u226585, visibilit\u00e9\u226570 %%, stabilit\u00e9 %s \u22645 pts, 5 ans > co\u00fbt du capital, tendance non baissi\u00e8re)' % rb.get('metrique', 'ROIC'), -2.0))
 
     vn = ((q.get('pil') or {}).get('visibilite') or {}).get('notes') or []
@@ -206,6 +208,12 @@ def calc_taux_exige(D, R):
     if key in DROITS:
         if DROITS[key]:
             mods.append(('droits de l\'actionnaire : %s' % key.lower(), DROITS[key]))
+    if (num(Q) and Q >= 85 and not any(m[1] == -2.0 for m in mods)
+            and (rb.get('serie_estimee') or not all(((q.get('pil') or {}).get(k) or {}).get('obs') == 3
+                                                     for k in ('capital', 'visibilite')))):
+        warn('Bonus \u00ab qualit\u00e9 prouv\u00e9e \u00bb refus\u00e9 : s\u00e9rie de rentabilit\u00e9 estim\u00e9e ou contr\u00f4le Capital/Visibilit\u00e9 non observ\u00e9.')
+    if key in DROITS:
+        pass
     elif key:
         mods.append(('droits de l\'actionnaire : libell\u00e9 invalide, trait\u00e9 comme NON DOCUMENT\u00c9', 1.0))
         warn('Libell\u00e9 de droits de l\'actionnaire non reconnu (%s) : trait\u00e9 comme NON DOCUMENT\u00c9, +1 pt.' % key)
@@ -237,11 +245,11 @@ def calc_taux_exige(D, R):
     R['tx_brut'] = brut
     R['tx_borne'] = abs(brut - tx) > 1e-9
     if brut > TX_MAX + 1e-9:
-        warn('Taux exig\u00e9 brut %.1f %% > %.0f %% : le risque d\u00e9passe ce qu\'un prix peut compenser. '
-             'Aucun ACHAT sans justification \u00e9crite \u2014 orientation HORS S\u00c9LECTION.' % (brut, TX_MAX))
+        warn('Taux exig\u00e9 brut %s %% > %.0f %% : le risque d\u00e9passe ce qu\'un prix peut compenser. '
+             'Tout ACHAT est neutralis\u00e9 par le moteur \u2014 orientation HORS S\u00c9LECTION.' % (fr(brut, 1), TX_MAX))
         chk('Taux exig\u00e9 dans la plage 12\u201321 %%', '\u00e9chec', 'brut %.1f %%' % brut)
     elif brut < TX_MIN - 1e-9:
-        warn('Taux exig\u00e9 brut %.1f %% < %.0f %% : plancher appliqu\u00e9.' % (brut, TX_MIN))
+        warn('Taux exig\u00e9 brut %s %% < %.0f %% : plancher appliqu\u00e9.' % (fr(brut, 1), TX_MIN))
     chk('Taux exig\u00e9 calcul\u00e9 par le moteur', 'valid\u00e9',
         '%.1f %% (base 15 %%, %d modificateur(s)%s)' % (tx, len(mods), ', born\u00e9' if R['tx_borne'] else ''))
     return tx
@@ -367,6 +375,9 @@ def completer_rentab(rb, rent):
         warn('M\u00e9trique de rentabilit\u00e9 non reconnue (%s) : trait\u00e9e comme ROIC.' % lab)
     lev = vv(rent.get('levier'))
     rb['levier'] = lev
+    serie = rent.get('roic') or []
+    rb['serie_estimee'] = (str(vv(rent.get('prov')) or '').strip().upper().startswith('E') or any(
+        isinstance(x, (list, tuple)) and len(x) > 2 and str(x[2]).strip().upper().startswith('E') for x in serie))
     rb['metrique_ok'] = True
     if rb['metrique'] == 'ROE' and not rb['finance']:
         rb['metrique_ok'] = False
@@ -406,15 +417,27 @@ def barC(x):
 
 
 # ------------------------------------------------------------------ moteur financier
-def bpa_at(sc, base, t, gt):
+TK_DEF = [0.0, 1.0, 2.0, 3.0, 4.0]
+
+
+def bpa_at(sc, base, t, gt, tk=None):
+    """BPA des 12 mois glissants a la date t (annees depuis l'evaluation). tk = dates des clotures
+    [base, ex.1 .. ex.4] ; interpolation geometrique entre deux clotures, extrapolation prudente au-dela (V22.6)."""
+    tk = tk or TK_DEF
     b = [base if num(base) else sc['bpa'][0]] + list(sc['bpa'])
-    if t <= 4:
-        i = int(math.floor(t)); f = t - i
-        if f == 0:
-            return b[i]
-        a, c = b[i], b[i + 1]
-        return a * (c / a) ** f if (a > 0 and c > 0) else a + (c - a) * f
-    return b[4] * (1 + gt / 100.0) ** (t - 4)
+    if t <= tk[0]:
+        return b[0]
+    if t <= tk[4] + 1e-12:
+        for i in range(4):
+            if tk[i] - 1e-12 <= t <= tk[i + 1] + 1e-12:
+                f = (t - tk[i]) / (tk[i + 1] - tk[i])
+                a, c = b[i], b[i + 1]
+                if f <= 1e-12:
+                    return a
+                if f >= 1 - 1e-12:
+                    return c
+                return a * (c / a) ** f if (a > 0 and c > 0) else a + (c - a) * f
+    return b[4] * (1 + gt / 100.0) ** (t - tk[4])
 
 
 def dps_at(sc, k, gt):
@@ -434,10 +457,18 @@ def flux(P, sc, ctx, h=4.0, mult=None, divs=True):
     I0 = B * (1 + TOB + ctx['fa'])
     cf = {0.0: -I0}
     if divs:
-        for k in range(1, int(math.floor(h)) + 1):
-            cf[float(k)] = cf.get(float(k), 0.0) + dps_at(sc, k, ctx['gt']) * fx_at(sc, x0, k) * ctx['net_div']
+        tk, dl = ctx.get('tk') or TK_DEF, ctx.get('delai', 0.0)
+        k = 1
+        while True:
+            tp = (tk[k] if k <= 4 else tk[4] + (k - 4)) + dl
+            if tp > h + 1e-9:
+                break
+            if tp > 1e-9:  # dividende deja paye a la date d'evaluation : exclu
+                tq = round(tp, 6)
+                cf[tq] = cf.get(tq, 0.0) + dps_at(sc, k, ctx['gt']) * fx_at(sc, x0, tp) * ctx['net_div']
+            k += 1
     m = sc['multiple'] if mult is None else mult
-    S = max(0.0, bpa_at(sc, ctx['base'], h, ctx['gt']) * m * fx_at(sc, x0, h))
+    S = max(0.0, bpa_at(sc, ctx['base'], h, ctx['gt'], ctx.get('tk')) * m * fx_at(sc, x0, h))
     vente = S - TAX_PV * max(S - B, 0.0) - S * (TOB + ctx['fv'])
     cf[float(h)] = cf.get(float(h), 0.0) + vente
     return sorted(cf.items()), I0
@@ -582,6 +613,9 @@ def normaliser_entrees(D):
         if parent is not None and isinstance(parent[cle], (list, dict)):
             prov[p] = V(parent[cle]); parent[cle] = str(V(parent[cle])['v'] or '')
 
+    if isinstance(D.get('valo'), dict) and 'scenarios' in D['valo'] and not isinstance(D['valo']['scenarios'], dict):
+        notes.append('valo.scenarios illisible (pas un objet) \u2014 trait\u00e9 comme absent, arr\u00eat pr\u00e9coce.')
+        D['valo']['scenarios'] = {}
     scs = G(D, 'valo.scenarios') or {}
     for nom, sc in (scs.items() if isinstance(scs, dict) else []):
         if not isinstance(sc, dict):
@@ -611,6 +645,66 @@ def normaliser_entrees(D):
     return notes
 
 
+def _date(x):
+    x = str(vv(x) or '').strip()
+    for f in ('%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%d.%m.%Y'):
+        try:
+            return datetime.datetime.strptime(x, f).date()
+        except ValueError:
+            pass
+    if re.fullmatch(r'\d{4}', x):
+        return datetime.date(int(x), 12, 31)
+    return None
+
+
+def _plus_ans(d, n):
+    try:
+        return d.replace(year=d.year + n)
+    except ValueError:
+        return d.replace(year=d.year + n, day=28)
+
+
+def aligner_exercices(D, R):
+    """V22.6 : place les clotures des exercices projetes sur l'axe du temps de l'evaluation.
+    Convention : la base normalisee est celle du dernier exercice clos avant le premier exercice projete ;
+    le BPA de sortie est celui des 12 mois glissants a la date d'evaluation + 4 ans ; le dividende de
+    l'exercice k est verse a sa cloture + delai (4 mois par defaut)."""
+    meta = D.get('meta') or {}; valo = D.get('valo') or {}
+    ev = _date(meta.get('date_eval')) or _date(meta.get('date_cours'))
+    c1 = _date(valo.get('premier_exercice'))
+    R['alignement'] = None
+    if not (ev and c1):
+        warn('Exercices non align\u00e9s : renseigner valo.premier_exercice (date de cl\u00f4ture du premier exercice projet\u00e9). '
+             'Convention par d\u00e9faut : exercices r\u00e9put\u00e9s clos aux anniversaires de l\u2019\u00e9valuation.')
+        chk('Alignement des exercices sur la date de sortie', '\u00e9chec' if ev else 'n.d.',
+            'premier_exercice absent' if ev else 'date d\u2019\u00e9valuation illisible')
+        return TK_DEF, 0.0
+    tk = [(_plus_ans(c1, k - 1) - ev).days / 365.25 for k in range(0, 5)]
+    dm = valo.get('delai_dividende_mois')
+    dm = vv(dm) if num(vv(dm)) else 4
+    sortie = _plus_ans(ev, 4)
+    R['alignement'] = {'clotures': [_plus_ans(c1, k - 1).strftime('%d/%m/%Y') for k in range(0, 5)],
+                       'sortie': sortie.strftime('%d/%m/%Y'), 'tk': tk, 'delai_mois': dm}
+    ok = True
+    if tk[1] > 1.05:
+        ok = False
+        warn('Premier exercice projet\u00e9 clos %s mois apr\u00e8s l\u2019\u00e9valuation : l\u2019exercice en cours manque.' % fr(tk[1] * 12, 0))
+    if tk[1] < -0.5:
+        ok = False
+        warn('Premier exercice projet\u00e9 d\u00e9j\u00e0 clos depuis plus de six mois : il appartient \u00e0 l\u2019historique, d\u00e9caler d\u2019un an.')
+    ext = 4 - tk[4]
+    R['alignement']['extrapolation_mois'] = max(0.0, ext * 12)
+    if ext > 1.0 + 1e-9:
+        warn('Sortie %s mois apr\u00e8s la derni\u00e8re cl\u00f4ture projet\u00e9e : BPA extrapol\u00e9 \u00e0 la croissance terminale prudente. '
+             'Projeter plut\u00f4t un exercice plus loin.' % fr(ext * 12, 0))
+    chk('Alignement des exercices sur la date de sortie', 'valid\u00e9' if ok else '\u00e9chec',
+        'cl\u00f4tures %s \u2192 %s ; sortie le %s ; BPA de sortie = 12 mois glissants%s ; dividendes vers\u00e9s \u00e0 cl\u00f4ture + %s mois'
+        % (R['alignement']['clotures'][1], R['alignement']['clotures'][4], R['alignement']['sortie'],
+           (' (dont %s mois prolong\u00e9s au rythme prudent de la derni\u00e8re ann\u00e9e)' % fr(ext * 12, 0)) if ext > 0.02 else ' interpol\u00e9s',
+           fr(dm, 0)))
+    return tk, dm / 12.0
+
+
 def calculer(D):
     WARN.clear()
     CHK.clear()
@@ -631,8 +725,26 @@ def calculer(D):
     scs = valo.get('scenarios') or {}
     base = vv(valo.get('base_normalisee'))
     gc = G(D, 'croissance.g_centrale')
-    if not num(gc) and scs.get('central') and num(base) and base > 0 and scs['central']['bpa'][3] > 0:
-        gc = 100 * ((scs['central']['bpa'][3] / base) ** 0.25 - 1)
+    if not isinstance(scs, dict):
+        scs = {}
+    _c = scs.get('central')
+    gc_calc = None
+    if (isinstance(_c, dict) and isinstance(_c.get('bpa'), list) and len(_c['bpa']) == 4
+            and num(_c['bpa'][3]) and num(base) and base > 0 and _c['bpa'][3] > 0):
+        gc_calc = 100 * ((_c['bpa'][3] / base) ** 0.25 - 1)
+    R['gc_declaree'] = gc
+    if num(gc_calc):
+        if num(gc) and abs(gc - gc_calc) > 1 + 1e-9:
+            warn('Croissance centrale d\u00e9clar\u00e9e %s %%/an, calcul\u00e9e depuis les sc\u00e9narios %s %%/an : '
+                 'le moteur retient la valeur calcul\u00e9e.' % (fr(gc, 1), fr(gc_calc, 1)))
+            chk('Croissance centrale coh\u00e9rente avec les sc\u00e9narios', '\u00e9chec',
+                '\u00e9cart %s pt' % fr(gc - gc_calc, 1, True))
+        else:
+            chk('Croissance centrale coh\u00e9rente avec les sc\u00e9narios', 'valid\u00e9',
+                'BPA de la base au 4e exercice : %s %%/an' % fr(gc_calc, 1))
+        gc = gc_calc
+    elif num(gc):
+        warn('Croissance centrale non recalculable (base n\u00e9gative, nulle ou absente) : valeur d\u00e9clar\u00e9e utilis\u00e9e.')
     go = G(D, 'croissance.g_organique_hist')
     R['gc'], R['go'] = gc, go
     bo, bg = barC(go), barC(gc)
@@ -643,6 +755,8 @@ def calculer(D):
                 and all(num(x) for x in sc['bpa']) and num(sc.get('multiple')))
     if not (num(cours) and all(_sc_ok(scs.get(k)) for k in ('baissier', 'central', 'haussier'))):
         chk('Calculs financiers', 'n.a.', 'sc\u00e9narios ou cours absents \u2014 arr\u00eat pr\u00e9coce')
+        lire_preuves(D, R)
+        verdict_final(D, R)
         return R
 
     wsum = sum(scs[k].get('poids', POIDS_DEF[k]) for k in ('baissier', 'central', 'haussier'))
@@ -655,7 +769,8 @@ def calculer(D):
         der = 100 * (c4 / c3 - 1)
     cands = [x for x in (gt, gc, der) if num(x)]
     gt = min(cands) if cands else 0.0
-    ctx = {'x0': x0, 'base': base, 'gt': gt,
+    tk, delai = aligner_exercices(D, R)
+    ctx = {'x0': x0, 'base': base, 'gt': gt, 'tk': tk, 'delai': delai,
            'fa': (valo.get('frais_achat_pct') or 0) / 100.0,
            'fv': (valo.get('frais_vente_pct') or 0) / 100.0,
            'net_div': (1 - (valo.get('retenue_etrangere') or 0)) * (1 - (valo.get('precompte', 0.30) or 0))}
@@ -823,7 +938,10 @@ def calculer(D):
     chk('Ancrage terminal indépendant du cours', 'validé' if R['valorisation_valide'] else 'échec',
         str(ancrage.get('justification') or 'Renseigner valo.ancrage_terminal : plafond, date, justification.'))
     # Empreinte reproductible des hypothèses, hors cours et diagnostics de marché.
-    empreinte = {'base': base, 'scenarios': scs, 'contexte': ctx, 'taux': R['tx'],
+    ctx_e = dict(ctx)
+    if not any(isinstance(scs[k], dict) and scs[k].get('fx') for k in scs):
+        ctx_e.pop('x0', None)  # V22.5.1 : le prix limite en devise de cotation ne depend pas du change du jour
+    empreinte = {'base': base, 'scenarios': scs, 'contexte': ctx_e, 'taux': R['tx'],
                  'ancrage': ancrage, 'tob': TOB, 'tax_pv': TAX_PV,
                  'date_eval': meta.get('date_eval'), 'version': VERSION}
     R['empreinte_hypotheses'] = hashlib.sha256(json.dumps(empreinte, sort_keys=True,
@@ -863,42 +981,181 @@ def calculer(D):
     R['priorite'] = ('ACTIF' if cours <= R['PJ'] else 'VEILLE') if num(R.get('PJ')) and R['PJ'] > 0 else 'non \u00e9valu\u00e9e'
     R['porte_prix'] = 'ouverte' if (num(R.get('PA')) and cours <= R['PA']) else ('PROCHE' if (num(R.get('PJ')) and cours <= R['PJ']) else 'LOIN')
 
+    R['calc'] = True
+    lire_preuves(D, R)
+    controle_unites(D, R)
+    verdict_final(D, R)
     ach = (G(D, 'verdict.achat') or '').upper()
-    # --- verdict final : le moteur neutralise un ACHAT que les controles interdisent
-    vf, motifs = (G(D, 'verdict.achat') or 'n.d.'), []
-    veut_acheter = ('ACHAT' in ach or 'RENFORCEMENT' in ach) and 'BLOQU' not in ach
-    if q_bloc := (D.get('qualite') or {}).get('blocage'):
-        vf, _ = 'REJET \u2014 STRUCTURE', motifs.append('blocage structurel d\u00e9clar\u00e9')
-    elif fiab == 'D':
-        vf, _ = '\u00c0 DOCUMENTER \u2014 ACHAT BLOQU\u00c9', motifs.append('fiabilit\u00e9 D')
-    elif not R['valorisation_valide']:
-        vf, _ = 'À DOCUMENTER — ACHAT BLOQUÉ', motifs.append('ancrage terminal non validé')
-    elif veut_acheter and not R['q']['porte']:
-        vf, _ = 'HORS S\u00c9LECTION', motifs.append('porte qualit\u00e9 non franchie')
-    elif veut_acheter and R['porte_prix'] != 'ouverte':
-        vf = 'WATCHLIST %s \u2014 PRIX' % ('PROCHE' if R['porte_prix'] == 'PROCHE' else 'LOIN')
-        motifs.append('cours au-dessus du prix d\'achat')
-    elif veut_acheter and num(R.get('part_mult')) and R['part_mult'] > 50:
-        vf, _ = 'WATCHLIST \u2014 CONFIRMATION', motifs.append('part du multiple >50 %')
-    elif veut_acheter and num(R.get('tx_brut')) and R['tx_brut'] > TX_MAX + 1e-9:
-        vf, _ = 'HORS S\u00c9LECTION', motifs.append('risque au-del\u00e0 de 21 %')
-    R['verdict_final'] = vf
-    R['verdict_motifs'] = motifs
-    R['verdict_modifie'] = (str(vf).upper() != ach)
-    if R['verdict_modifie']:
-        warn('Verdict %s remplac\u00e9 par %s : %s.' % (G(D, 'verdict.achat'), vf, ' ; '.join(motifs)))
-    chk('Verdict final contr\u00f4l\u00e9 par le moteur', 'valid\u00e9',
-        'inchang\u00e9' if not R['verdict_modifie'] else 'corrig\u00e9 \u2014 %s' % ' ; '.join(motifs))
     if 'ACHAT' in ach and 'BLOQU' not in ach and R['porte_prix'] != 'ouverte':
-        warn('Verdict ACHAT alors que le cours est au-dessus du prix d\'achat (taux exig\u00e9 %s %%) : incoh\u00e9rent.' % fr(R.get('tx'), 1))
         chk('Coh\u00e9rence verdict / porte prix', '\u00e9chec', 'ACHAT au-dessus du prix d\'achat')
     else:
         chk('Coh\u00e9rence verdict / porte prix', 'valid\u00e9')
     if num(R['part_mult']) and R['part_mult'] > 50 and ach.startswith('ACHAT'):
         warn('Part du multiple >50 % : pari de revalorisation, pas d\'ACHAT standard.')
+    # 7. taille : actionnable seulement si l'achat est admissible
+    vfu = R['verdict_final'].upper()
+    if any(k in vfu for k in ('REJET', 'HORS S\u00c9LECTION', 'HORS P\u00c9RIM\u00c8TRE', '\u00c0 DOCUMENTER', 'GUIDANCE')):
+        R['taille']['statut'] = 'sans objet'
+    elif 'WATCHLIST' in vfu:
+        R['taille']['statut'] = 'conditionnel'
+    else:
+        R['taille']['statut'] = 'actionnable'
     chk('TRI, prix et capital pr\u00e9serv\u00e9 calcul\u00e9s par le moteur', 'valid\u00e9')
     R['calc'] = True
     return R
+
+
+# ------------------------------------------------------------------ V22.6 : preuves, guidance, unites, portes
+TYPES_CONF = {'OP\u00c9RATIONNEL': 'OP', 'OPERATIONNEL': 'OP', 'CHIFFRES': 'OP', 'PERSISTANCE': 'PE'}
+
+
+def lire_preuves(D, R):
+    res = D.get('resultats') or {}
+    if 'confirmations' not in res:
+        R['preuves_ok'], R['preuves_motif'] = None, 'confirmations non renseign\u00e9es'
+        chk('Deux confirmations ind\u00e9pendantes', 'n.d.', R['preuves_motif'])
+        g = ' '.join(str(vv(res.get(k)) or '') for k in ('guidance_cas', 'verdict')).upper()
+        R['guidance_cas'] = ('IMPACT NON BORNABLE' if 'NON BORNABLE' in g else 'VETO ACTIF' if 'VETO' in g
+                             else 'ALERTE MOD\u00c9LIS\u00c9E' if 'ALERTE' in g else None)
+        return
+    cf = [c for c in (res.get('confirmations') or []) if c]
+    types, non_typees = set(), 0
+    for c in cf:
+        if isinstance(c, list) and c:
+            t = str(c[0]).strip().upper()
+            hit = [v for k, v in TYPES_CONF.items() if k in t]
+            if hit:
+                types.add(hit[0])
+            else:
+                non_typees += 1
+        else:
+            non_typees += 1
+    if len(cf) < 2:
+        R['preuves_ok'], R['preuves_motif'] = False, 'moins de deux confirmations'
+    elif types >= {'OP', 'PE'}:
+        R['preuves_ok'], R['preuves_motif'] = True, ''
+    elif non_typees == len(cf):
+        R['preuves_ok'], R['preuves_motif'] = True, ''
+        warn('Confirmations non typ\u00e9es : \u00e9crire [OP\u00c9RATIONNEL ou PERSISTANCE, fait, date] pour que le moteur v\u00e9rifie '
+             'qu\u2019il s\u2019agit de deux preuves de nature diff\u00e9rente.')
+    else:
+        R['preuves_ok'] = False
+        R['preuves_motif'] = 'deux confirmations de m\u00eame nature (il faut une preuve op\u00e9rationnelle et une preuve de persistance)'
+    chk('Deux confirmations ind\u00e9pendantes', 'valid\u00e9' if R['preuves_ok'] else '\u00e9chec', R['preuves_motif'])
+    g = ' '.join(str(vv(res.get(k)) or '') for k in ('guidance_cas', 'verdict')).upper()
+    R['guidance_cas'] = ('IMPACT NON BORNABLE' if 'NON BORNABLE' in g else 'VETO ACTIF' if 'VETO' in g
+                         else 'ALERTE MOD\u00c9LIS\u00c9E' if 'ALERTE' in g else None)
+
+
+def controle_unites(D, R):
+    """Detecte les erreurs grossieres d'unite (pence/livres, milliers, devise) : ecart d'un facteur >=20."""
+    meta = D.get('meta') or {}; valo = D.get('valo') or {}
+    cours, base, mact = vv(meta.get('cours')), vv(valo.get('base_normalisee')), valo.get('multiple_actuel')
+    sc = (valo.get('scenarios') or {}).get('central') or {}
+    motifs = []
+    if num(cours) and cours > 0 and num(base) and base > 0 and num(mact) and mact > 0:
+        r = (cours / base) / mact
+        if r >= 20 or r <= 0.05:
+            motifs.append('cours/BPA = %s contre multiple actuel %s' % (fr(cours / base, 1), fr(mact, 1)))
+    if num(cours) and cours > 0 and isinstance(sc.get('bpa'), list) and len(sc['bpa']) == 4 and num(sc['bpa'][3]) \
+            and num(sc.get('multiple')) and sc['bpa'][3] > 0:
+        r = sc['bpa'][3] * sc['multiple'] / cours
+        if r >= 20 or r <= 0.05:
+            motifs.append('valeur centrale \u00e0 4 ans = %s \u00d7 le cours' % fr(r, 2))
+    dev = str(meta.get('devise') or '')
+    if dev in ('GBX', 'GBp', 'GBp.', 'pence', 'ZAc', 'ILA'):
+        motifs.append('cours en sous-unit\u00e9 (%s) : v\u00e9rifier que BPA et dividendes sont dans la m\u00eame unit\u00e9' % dev) if not motifs else None
+    R['unites_suspectes'] = ' ; '.join(m for m in motifs if 'sous-unit' not in m) or None
+    if R['unites_suspectes']:
+        warn('Unit\u00e9s suspectes : ' + R['unites_suspectes'] + ' \u2014 pence/livres, milliers ou devise ?')
+    elif motifs:
+        warn(motifs[0])
+    chk('Coh\u00e9rence des unit\u00e9s (cours, BPA, multiple)', '\u00e9chec' if R['unites_suspectes'] else 'valid\u00e9',
+        R['unites_suspectes'] or '')
+
+
+def portes(D, R):
+    """Bandeau des portes : etat lisible de chaque condition d'achat."""
+    q = R.get('q') or {}
+    calc = R.get('calc')
+    P = [('Qualit\u00e9', None if q.get('Q') is None else bool(q.get('porte'))),
+         ('Croissance', (R['gc'] >= 5) if num(R.get('gc')) else None),
+         ('Preuves', R.get('preuves_ok')),
+         ('Guidance', None if R.get('guidance_cas') is None and not (D.get('resultats') or {}).get('verdict')
+          else R.get('guidance_cas') not in ('VETO ACTIF', 'IMPACT NON BORNABLE')),
+         ('Ancrage', bool(R.get('valorisation_valide')) if calc else None),
+         ('Unit\u00e9s', (not R.get('unites_suspectes')) if calc else None),
+         ('Prix', (R.get('porte_prix') == 'ouverte') if calc else None)]
+    R['portes'] = P
+    return P
+
+
+def portes_txt(R):
+    return ' \u00b7 '.join('%s %s' % (n, '\u2705' if e else '\u26aa' if e is None else '\u274c') for n, e in R.get('portes') or [])
+
+
+# ------------------------------------------------------------------ verdict final (V22.5.1)
+EXCLUSIONS = ('REJET', 'HORS S\u00c9LECTION', 'HORS P\u00c9RIM\u00c8TRE')
+
+
+def verdict_final(D, R):
+    """Toutes les portes en echec sont relevees ; la plus prioritaire (ordre du \u00a712) gouverne,
+    les autres restent affichees comme causes secondaires. Un echec de prix ne masque jamais une exclusion,
+    et un controle d'achat ne requalifie jamais un dossier deja exclu."""
+    meta = D.get('meta') or {}
+    prop = G(D, 'verdict.achat') or ''
+    ach = str(prop).upper()
+    veut = ('ACHAT' in ach or 'RENFORCEMENT' in ach) and 'BLOQU' not in ach
+    sur_prix = 'PRIX' in ach or 'WATCHLIST PROCHE' in ach or 'WATCHLIST LOIN' in ach
+    exclu = any(k in ach for k in EXCLUSIONS)
+    fiab = (meta.get('fiabilite') or 'B').upper()[:1]
+    E = []
+    if (D.get('qualite') or {}).get('blocage'):
+        E.append((1, 'REJET \u2014 STRUCTURE', 'blocage structurel d\u00e9clar\u00e9'))
+    if fiab == 'D' and not exclu:
+        E.append((2, '\u00c0 DOCUMENTER \u2014 ACHAT BLOQU\u00c9', 'fiabilit\u00e9 D'))
+    if not R.get('calc') and veut:
+        E.append((2, '\u00c0 DOCUMENTER \u2014 ACHAT BLOQU\u00c9', 'valorisation non ex\u00e9cut\u00e9e (sc\u00e9narios ou cours incomplets)'))
+    if R.get('calc'):
+        if not R.get('valorisation_valide') and (veut or sur_prix):
+            E.append((2, '\u00c0 DOCUMENTER \u2014 ACHAT BLOQU\u00c9', 'ancrage terminal non valid\u00e9'))
+        if veut and not R['q']['porte']:
+            E.append((4, 'HORS S\u00c9LECTION', 'porte qualit\u00e9 non franchie'))
+        if veut and num(R.get('tx_brut')) and R['tx_brut'] > TX_MAX + 1e-9:
+            E.append((4, 'HORS S\u00c9LECTION', 'risque au-del\u00e0 de 21 %'))
+        if veut and R.get('porte_prix') != 'ouverte':
+            E.append((6, 'WATCHLIST %s \u2014 PRIX' % ('PROCHE' if R.get('porte_prix') == 'PROCHE' else 'LOIN'),
+                      'cours au-dessus du prix d\'achat'))
+        if veut and R.get('unites_suspectes'):
+            E.append((2, '\u00c0 DOCUMENTER \u2014 ACHAT BLOQU\u00c9', 'incoh\u00e9rence d\u2019unit\u00e9s probable (' + R['unites_suspectes'] + ')'))
+        gcas = R.get('guidance_cas')
+        if veut and gcas == 'IMPACT NON BORNABLE':
+            E.append((2, '\u00c0 DOCUMENTER \u2014 ACHAT BLOQU\u00c9', 'guidance abaiss\u00e9e, impact non bornable'))
+        if veut and gcas == 'VETO ACTIF':
+            E.append((5, 'WATCHLIST \u2014 GUIDANCE', 'veto de guidance actif'))
+        if veut and num(R.get('gc')) and R['gc'] < 5 - 1e-9:
+            E.append((7, 'WATCHLIST \u2014 CONFIRMATION', 'croissance centrale par action %s %%/an < 5 %%' % fr(R['gc'], 1)))
+        if veut and not R.get('preuves_ok'):
+            E.append((7, 'WATCHLIST \u2014 CONFIRMATION', R.get('preuves_motif') or 'confirmations insuffisantes'))
+        if veut and num(R.get('part_mult')) and R['part_mult'] > 50:
+            E.append((7, 'WATCHLIST \u2014 CONFIRMATION', 'part du multiple >50 %'))
+        if ('RENFORCEMENT' in ach and R.get('porte_prix') == 'ouverte' and num(R.get('PR'))
+                and vv(meta.get('cours')) > R['PR'] + 1e-9):
+            E.append((8, 'ACHAT COMPL\u00c9MENTAIRE POSSIBLE',
+                      'cours entre le prix de renforcement (%s) et le prix d\'achat' % fprix(R['PR'])))
+    E.sort(key=lambda e: e[0])
+    vf = E[0][1] if E else (prop or 'n.d.')
+    motifs = [E[0][2]] if E else []
+    R['verdict_final'] = vf
+    R['verdict_motifs'] = motifs
+    R['verdict_secondaires'] = [e[2] for e in E[1:]]
+    R['verdict_modifie'] = bool(E) and str(vf).upper() != ach
+    if R['verdict_modifie']:
+        warn('Verdict %s remplac\u00e9 par %s : %s%s.' % (prop or 'absent', vf, motifs[0],
+             (' (aussi : %s)' % ' ; '.join(R['verdict_secondaires'])) if R['verdict_secondaires'] else ''))
+    chk('Verdict final contr\u00f4l\u00e9 par le moteur', 'valid\u00e9',
+        'inchang\u00e9' if not R['verdict_modifie'] else 'corrig\u00e9 \u2014 %s' % ' ; '.join(motifs + R['verdict_secondaires']))
+    return vf
 
 
 # ------------------------------------------------------------------ these
@@ -1083,7 +1340,7 @@ def rendu(D, R):
     A('<div class="head"><div><h1>%s</h1><div class="sub">%s \u00b7 %s \u00b7 %s \u00b7 %s</div>'
       '<div class="sub">Mode %s \u00b7 \u00e9valu\u00e9 le %s \u00b7 %s \u00b7 fiabilit\u00e9 %s \u00b7 taux exig\u00e9 %s %%/an</div></div>'
       '<div><div class="cours">%s %s</div><div class="sub">cours du %s</div></div></div>' % (
-          esc(meta.get('societe')), esc(meta.get('ticker')), esc(meta.get('bourse')), esc(meta.get('secteur')),
+          esc(meta.get('societe')), esc(R.get('ticker') or meta.get('ticker')), esc(meta.get('bourse')), esc(meta.get('secteur')),
           esc(meta.get('pays')), esc(meta.get('mode', 'nouvelle position')), esc(meta.get('date_eval')), VERSION,
           esc(meta.get('fiabilite')), fr(R.get('tx'), 1), fprix(cours), esc(dev), esc(meta.get('date_cours'))))
 
@@ -1100,7 +1357,15 @@ def rendu(D, R):
             A('</table></div>')
         for note in audit.get('notes') or []:
             A('<p class="sub">%s</p>' % esc(note))
-        A('<p class="sub">Empreinte des hypothèses : %s. Un autre cours ne modifie pas cette empreinte.</p></div>' % esc(R.get('empreinte_hypotheses')))
+        A('<p class="sub">Empreinte des hypothèses : %s. Un autre cours ou un autre taux de change du jour ne modifie pas cette empreinte (la valeur en euros, elle, peut bouger).</p></div>' % esc(R.get('empreinte_hypotheses')))
+    al = R.get('alignement')
+    if R.get('calc'):
+        A('<div class="sub" style="margin:6px 0 14px">Horizon : %s</div>' % (
+            ('exercices projet\u00e9s clos du %s au %s \u00b7 sortie le %s sur le BPA des 12 mois glissants%s \u00b7 dividendes \u00e0 cl\u00f4ture + %s mois'
+             % (al['clotures'][1], al['clotures'][4], al['sortie'],
+                (' (dont %s mois prolong\u00e9s au rythme prudent)' % fr(al.get('extrapolation_mois'), 0)) if (al.get('extrapolation_mois') or 0) >= 0.5 else '',
+                fr(al['delai_mois'], 0))) if al else
+            'exercices non dat\u00e9s \u2014 convention par d\u00e9faut (cl\u00f4tures aux anniversaires de l\u2019\u00e9valuation)'))
     if R.get('calc') and not R.get('valorisation_valide'):
         A('<div class="c" style="border-color:var(--l2)">Prix indicatifs uniquement : ancrage terminal à corriger avant toute décision.</div>')
     # -- verdict
@@ -1111,10 +1376,15 @@ def rendu(D, R):
           bdg(v.get('suivi', 'n.d.'), L_LAB('suivi', v.get('suivi')), 'gros'),
           esc(v.get('phrase')), esc(v.get('cause')),
           ' \u00b7 ' + esc(v.get('cause2')) if v.get('cause2') else ''))
+    A('<div class="c"><h3>Les portes de l\u2019achat</h3><div>%s</div><div class="sub">Il faut tout en vert pour acheter ; '
+      '\u26aa = non \u00e9valu\u00e9.</div></div>' % ' '.join(
+          bdg(('\u2705 ' if e else '\u26aa ' if e is None else '\u274c ') + n, 5 if e else 'gris' if e is None else 2)
+          for n, e in portes(D, R)))
     if R.get('verdict_modifie'):
         A('<div class="c" style="border-color:var(--l3)"><b>Verdict corrig\u00e9 par le moteur.</b> '
           'Le dossier proposait \u00ab %s \u00bb ; les contr\u00f4les l\'interdisent : %s.</div>' % (
-              esc(v.get('achat')), esc(' ; '.join(R.get('verdict_motifs') or []))))
+              esc(v.get('achat')), esc(' ; '.join((R.get('verdict_motifs') or []) + [
+              'aussi : ' + x for x in (R.get('verdict_secondaires') or [])]))))
 
     # -- 4 cartes
     q = R['q']
@@ -1209,7 +1479,8 @@ def rendu(D, R):
       '<th class="n">BPA vs N\u22121</th><th class="n">BPA vs attentes</th></tr><tr>%s</tr></table></div>'
       '<p>%s</p><div class="sub">Confirmations : %s</div></div>' % (
           bdg(res.get('verdict', 'IND\u00c9TERMIN\u00c9'), L_LAB('resultats', res.get('verdict'))), cells,
-          esc(res.get('guidance') or res.get('commentaire')), esc(' \u00b7 '.join(res.get('confirmations') or []))))
+          esc(res.get('guidance') or res.get('commentaire')), esc(' \u00b7 '.join((' \u2014 '.join(str(y) for y in c if y) if isinstance(c, list) else str(c))
+                                for c in (res.get('confirmations') or []) if c))))
     rows = ''.join('<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % (
         esc(r.get('fait')), esc(r.get('mecanisme')), esc(r.get('gravite')), esc(r.get('indicateur')), esc(r.get('hypothese')))
         for r in (G(D, 'risques.registre') or []))
@@ -1349,10 +1620,15 @@ def rendu(D, R):
     # ---------------- bloc 4
     A('<h2>Combien en acheter, et quoi surveiller</h2>')
     tl = R.get('taille') or {}
-    A('<div class="c"><h3>Taille, tranches et rythme</h3>'
-      '<p>Taille maximale : <b>%s %%</b> du portefeuille%s \u2014 contrainte active : %s.</p>'
+    st_t = tl.get('statut')
+    if st_t == 'sans objet':
+        t_txt = '<p>Taille : <b>sans objet</b> \u2014 dossier exclu ou bloqu\u00e9, aucune position \u00e0 dimensionner.</p>'
+    else:
+        t_txt = ('<p>%s : <b>%s %%</b> du portefeuille%s \u2014 contrainte active : %s.</p>' % (
+            'Plafond conditionnel (seulement si le prix d\'achat est atteint)' if st_t == 'conditionnel' else 'Taille maximale',
+            fr(tl.get('max'), 1), ' (provisoire : volume inconnu)' if tl.get('provisoire') else '', esc(tl.get('contrainte'))))
+    A('<div class="c"><h3>Taille, tranches et rythme</h3>' + t_txt.replace('%', '%%') +
       '<p>Tranches %s \u00b7 tranche 1 %s</p><div>%s</div><div class="sub">Capital pr\u00e9serv\u00e9 au prix d\'achat : %s /100 \u00b7 priorit\u00e9 de suivi : %s</div></div>' % (
-          fr(tl.get('max'), 1), ' (provisoire : volume inconnu)' if tl.get('provisoire') else '', esc(tl.get('contrainte')),
           esc(R.get('tranches') or 'n.d.'), esc(R.get('tranche1') or 'n.d.'),
           bdg('Momentum : %s' % (R.get('momentum') or 'n.d.'), L_LAB('momentum', R.get('momentum'))),
           fr(R.get('cap_PA'), 0), esc(R.get('priorite') or 'n.d.')))
@@ -1385,30 +1661,99 @@ def rendu(D, R):
       'pr\u00e9compte 30 %%, retenue \u00e9trang\u00e8re %s %%. %s</p><p class="sub">%s</p></details>' % (
           src, ctr, fr(100 * (valo.get('retenue_etrangere') or 0), 0), esc(valo.get('fiscalite_note')),
           esc(' \u00b7 '.join(WARN))))
+    src = json.dumps(D.get('_source') or {}, ensure_ascii=False).replace('</', '<\\/')
+    A('<script type="application/json" id="nico-source" data-version="%s">%s</script>' % (VERSION, src))
     A('</div></body></html>')
     return ''.join(out)
 
 
 # ------------------------------------------------------------------ ligne NICO
+STATUTS = {'PF', 'WL', 'SURV', 'SPEC', 'OUT', 'TODO'}
+
+
+def statut_suivi(D, R):
+    """V22.5.1 : statut codifie d'abord ; sinon libelle, du plus restrictif au plus permissif."""
+    meta = D.get('meta') or {}; v = D.get('verdict') or {}
+    s = str(v.get('suivi') or '').upper()
+    ach = str(R.get('verdict_final') or v.get('achat') or '').upper()
+    if meta.get('detenue'):
+        return 'PF'
+    code = str(v.get('statut') or '').strip().upper()
+    if code in STATUTS:
+        return code
+    if 'RETIRER' in s or '\u274c' in s or 'REJET' in ach or 'P\u00c9RIM\u00c8TRE' in ach:
+        return 'OUT'
+    if 'SP\u00c9CULATIVE' in s or 'SPECULATIVE' in s or '\u26a0' in s:
+        return 'SPEC'
+    if 'SURVEILLANCE' in s or '\U0001f7e1' in s:
+        return 'SURV'
+    if 'CONSERVER' in s or '\u2705' in s:
+        return 'WL'
+    warn('D\u00e9cision de suivi non reconnue (%s) : statut TODO dans la ligne NICO.' % (v.get('suivi') or 'absente'))
+    return 'TODO'
+
+
+import unicodedata
+
+
+def _sans_accent(t):
+    return ''.join(c for c in unicodedata.normalize('NFD', str(t or '')) if unicodedata.category(c) != 'Mn').lower()
+
+
+# (mots-cles de la place, suffixe) : du plus specifique au plus general. '' = cotation americaine, sans suffixe.
+PLACES = [
+    (('first north stockholm', 'nasdaq stockholm', 'stockholm'), '.ST'), (('copenhague', 'copenhagen'), '.CO'),
+    (('helsinki',), '.HE'), (('oslo',), '.OL'), (('bruxelles', 'brussels'), '.BR'), (('paris',), '.PA'),
+    (('amsterdam',), '.AS'), (('lisbonne', 'lisbon'), '.LS'), (('milan', 'borsa italiana'), '.MI'),
+    (('madrid', 'bme'), '.MC'), (('xetra', 'francfort', 'frankfurt'), '.DE'),
+    (('london', 'londres', 'lse', 'aim'), '.L'), (('six', 'zurich', 'swiss'), '.SW'),
+    (('vienne', 'vienna', 'wiener'), '.VI'), (('varsovie', 'warsaw', 'gpw'), '.WA'), (('tokyo', 'tse'), '.T'),
+    (('hong kong', 'hkex'), '.HK'), (('asx', 'australi'), '.AX'), (('tsxv', 'tsx venture', 'tsx-v'), '.V'),
+    (('tsx', 'toronto'), '.TO'), (('nzx',), '.NZ'), (('singapore', 'sgx'), '.SI'),
+    (('shanghai',), '.SS'), (('shenzhen',), '.SZ'), (('nasdaq', 'nyse', 'amex', 'otc'), ''),
+]
+
+
+def ticker_normalise(D, R):
+    """V22.5.1 : le ticker de la ligne NICO porte le suffixe de place. Complete seulement si la place
+    est identifiee sans ambiguite ; sinon alerte. Le ticker saisi reste affiche."""
+    meta = D.get('meta') or {}
+    t = str(meta.get('ticker') or '').strip()
+    b = _sans_accent(meta.get('bourse'))
+    suf = None
+    for mots, sx in PLACES:
+        if any(re.search(r'(^|[^a-z])' + re.escape(m) + r'($|[^a-z])', b) for m in mots):
+            suf = sx
+            break
+    R['ticker_saisi'] = t
+    if not t:
+        R['ticker'] = t
+        return t
+    if '.' in t:
+        if suf and not t.upper().endswith(suf.upper()):
+            warn('Ticker %s : suffixe diff\u00e9rent de celui attendu pour %s (%s) \u2014 v\u00e9rifier.' % (t, meta.get('bourse'), suf))
+            chk('Ticker avec suffixe de place', '\u00e9chec', '%s attendu' % suf)
+        else:
+            chk('Ticker avec suffixe de place', 'valid\u00e9', t)
+        R['ticker'] = t
+    elif suf is None:
+        warn('Ticker %s sans suffixe et place \u00ab %s \u00bb non reconnue sans ambigu\u00eft\u00e9 : '
+             'ajouter le suffixe \u00e0 la main (ex. FRP.L).' % (t, meta.get('bourse') or 'absente'))
+        chk('Ticker avec suffixe de place', '\u00e9chec', 'place ambigu\u00eb ou absente')
+        R['ticker'] = t
+    else:
+        R['ticker'] = t + suf
+        chk('Ticker avec suffixe de place', 'valid\u00e9',
+            ('compl\u00e9t\u00e9 : %s \u2192 %s' % (t, R['ticker'])) if suf else 'cotation am\u00e9ricaine, sans suffixe')
+    return R['ticker']
+
+
 def ligne_nico(D, R):
     meta = D.get('meta') or {}
     v = D.get('verdict') or {}
-    s = (v.get('suivi') or '').upper()
-    ach = (R.get('verdict_final') or v.get('achat') or '').upper()
-    if meta.get('detenue'):
-        st = 'PF'
-    elif 'CONSERVER' in s:
-        st = 'WL'
-    elif 'SURVEILLANCE' in s:
-        st = 'SURV'
-    elif 'SP\u00c9CULATIVE' in s:
-        st = 'SPEC'
-    elif 'RETIRER' in s or 'REJET' in ach or 'P\u00c9RIM\u00c8TRE' in ach:
-        st = 'OUT'
-    else:
-        st = 'TODO'
+    st = statut_suivi(D, R)
     note = (v.get('nico_note') or v.get('suivi_condition') or '').replace('|', '/')
-    ch = ['NICO', meta.get('ticker', ''), meta.get('societe', ''), meta.get('devise', ''), st,
+    ch = ['NICO', R.get('ticker') or meta.get('ticker', ''), meta.get('societe', ''), meta.get('devise', ''), st,
           fprix(R.get('PA')), fprix(vv(meta.get('cours'))), fr(R.get('tx'), 1), fr(R.get('retenu'), 1),
           fr(R.get('cap_cours'), 0), fr(R['q']['Q'], 0), v.get('suivi_date', ''), meta.get('date_eval', ''),
           meta.get('secteur', ''), meta.get('pays', ''), note]
@@ -1451,22 +1796,31 @@ def pm_html(R):
         (' (%s)' % esc(pm['date']) if pm.get('date') else '')
 
 
+def taille_txt(R):
+    tl = R.get('taille') or {}
+    if tl.get('statut') == 'sans objet' or not num(tl.get('max')):
+        return 'sans objet' if tl.get('statut') == 'sans objet' else 'n.d.'
+    return '%s %s %%' % ('plafond conditionnel' if tl.get('statut') == 'conditionnel' else 'max', fr(tl['max'], 1))
+
+
 def resume(D, R):
     meta = D.get('meta') or {}; v = D.get('verdict') or {}
-    L = ['\U0001f4c4 %s (%s) \u2014 %s' % (meta.get('societe'), meta.get('ticker'), meta.get('date_eval')),
-         'Verdict : %s \u2014 %s' % (R.get('verdict_final') or v.get('achat'), v.get('phrase')),
+    L = ['\U0001f4c4 %s (%s) \u2014 %s' % (meta.get('societe'), R.get('ticker') or meta.get('ticker'), meta.get('date_eval')),
+         'Verdict : %s%s' % (R.get('verdict_final') or v.get('achat') or 'n.d.', (' \u2014 ' + v['phrase']) if v.get('phrase') else ''),
          'Q %s %% (couverture %s %%) \u00b7 C %s %% \u00b7 croissance centrale %s %%/an' % (
              fr(R['q']['Q'], 0), fr(R['q']['cov'], 0), fr(R.get('C'), 0), fr(R.get('gc'), 1)),
          'Taux exig\u00e9 %s %%/an \u00b7 rendement retenu %s %%/an \u00b7 prix d\'achat %s \u00b7 capital pr\u00e9serv\u00e9 %s/100' % (
              fr(R.get('tx'), 1), fr(R.get('retenu'), 1), fprix(R.get('PA')), fr(R.get('cap_cours'), 0)),
-         'Central vs historique %s pts \u00b7 sensibilit\u00e9 du prix \u2212%s %% \u00b7 taille max %s %% \u00b7 tranches %s' % (
-             fr(R.get('ecart_hist'), 1, True), fr(R.get('tolerance'), 0),
-             fr((R.get('taille') or {}).get('max'), 1), R.get('tranches') or 'n.d.'),
+         'Central vs historique %s pts \u00b7 sensibilit\u00e9 du prix %s \u00b7 taille %s \u00b7 tranches %s' % (
+             fr(R.get('ecart_hist'), 1, True),
+             ('\u2212' + fr(R['tolerance'], 0) + ' %') if num(R.get('tolerance')) else 'n.d.', taille_txt(R),
+             R.get('tranches') or 'n.d.'),
          'Rentabilit\u00e9 : %s %s \u00b7 pourquoi maintenant : %s' % ((R.get('rentab') or {}).get('lab'),
              '(tendance %s)' % (R.get('rentab') or {}).get('tend') if (R.get('rentab') or {}).get('tend') else '',
              (R.get('pm') or {}).get('lab', 'n.d.')),
          'Suivi : %s \u2014 %s (%s) \u00b7 priorit\u00e9 %s' % (v.get('suivi') or 'n.d.', v.get('suivi_condition') or 'n.d.',
                                                                v.get('suivi_date') or 'n.d.', R.get('priorite') or 'n.d.')]
+    L.insert(2, 'Portes : ' + portes_txt(R))
     if WARN:
         L.append('\u26a0\ufe0f ' + ' \u00b7 '.join(WARN))
     L.append(R['nico'])
@@ -1478,15 +1832,28 @@ def main():
         print(__doc__); sys.exit(1)
     src = sys.argv[1]
     out_dir = sys.argv[3] if len(sys.argv) > 3 and sys.argv[2] == '-o' else os.path.dirname(os.path.abspath(src))
+    base = os.path.splitext(os.path.basename(src))[0]
     with open(src, encoding='utf-8') as f:
-        D = json.load(f)
+        brut = f.read()
+    if src.lower().endswith(('.html', '.htm')):
+        m = re.search(r'<script type="application/json" id="nico-source"[^>]*>(.*?)</script>', brut, re.S)
+        if not m:
+            print('Ce HTML ne contient pas de source NICO (dossier ant\u00e9rieur \u00e0 la V22.6).'); sys.exit(2)
+        D = json.loads(m.group(1).replace('<\\/', '</'))
+        base = base + '_relance'
+        with open(os.path.join(out_dir, base + '.json'), 'w', encoding='utf-8') as f:
+            json.dump(D, f, ensure_ascii=False, indent=1)
+    else:
+        D = json.loads(brut)
+    D['_source'] = copy.deepcopy({k: v for k, v in D.items() if k != '_source'})
     R = calculer(D)
     calc_pourquoi(D, R)
     nbm, nbp = compter_these(G(D, 'acte0.these.texte'))
     if nbm > 80 or not (3 <= nbp <= 4):
         warn('Th\u00e8se : %s mots / %s phrases \u2014 format 3 \u00e0 4 phrases, 80 mots au plus.' % (nbm, nbp))
+    ticker_normalise(D, R)
     R['nico'] = ligne_nico(D, R)
-    base = os.path.splitext(os.path.basename(src))[0]
+    portes(D, R)
     hp = os.path.join(out_dir, base + '.html')
     with open(hp, 'w', encoding='utf-8') as f:
         f.write(rendu(D, R))
