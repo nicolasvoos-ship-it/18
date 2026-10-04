@@ -18,8 +18,11 @@ import json, sys, os, re, math, html, copy, hashlib, datetime, statistics as stx
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V22.6"
-VERSION_DATE = "02/10/2026"
+VERSION = "V22.7"
+VERSION_DATE = "04/10/2026"
+# V22.7 : plancher de perte (regle des -40 %), modificateur plancher prouve, taille selon le plancher,
+# credibilite du baissier (ancrage, ecart au central, Altman/Ohlson, Beneish).
+CAP_MIN, CAP_SOLIDE, CAP_FORT, CAP_B, CASH_B = 60.0, 70.0, 85.0, 80.0, 20.0
 WARN, CHK = [], []
 
 
@@ -547,7 +550,9 @@ CHAMPS_NUM = [
     'resultats.reperes.bpa_n1', 'resultats.reperes.bpa_attentes',
 ]
 CHAMPS_NUM_VV = ['meta.cours', 'meta.capitalisation_meur', 'valo.base_normalisee', 'valo.base_publiee',
-                 'rentabilite.wacc']  # lus via vv() : seule la valeur interne est controlee
+                 'rentabilite.wacc', 'plancher.tresorerie_nette_meur',
+                 'risques.forensique.z_altman', 'risques.forensique.o_ohlson_pct',
+                 'risques.forensique.m_beneish', 'risques.forensique.f_piotroski']  # lus via vv() : seule la valeur interne est controlee
 CHAMPS_TXT = ['meta.fiabilite', 'valo.clause', 'taux_exige.motif']
 
 
@@ -705,6 +710,165 @@ def aligner_exercices(D, R):
     return tk, dm / 12.0
 
 
+
+# ------------------------------------------------------------------ V22.7 : plancher de perte
+ANCRAGES = ('PIRE EXERCICE', 'CHOC CHIFFR', 'MILIEU DE CYCLE', 'TEST DEMANDE')
+
+
+def eval_baissier(D, R, scs):
+    """Credibilite du baissier : un baissier trop gentil ne peut ni baisser le taux, ni grossir la ligne.
+    CREDIBLE = ancre sur un fait, nettement sous le central, solvabilite mesuree et saine, pas d'alerte comptable.
+    DOUTEUX = un test echoue. NON VERIFIE = rien d'anormal mais mesure de solvabilite absente."""
+    Bs, Cc = scs.get('baissier') or {}, scs.get('central') or {}
+    fo = G(D, 'risques.forensique') or {}
+    z, o = vv(fo.get('z_altman')), vv(fo.get('o_ohlson_pct'))
+    m, f = vv(fo.get('m_beneish')), vv(fo.get('f_piotroski'))
+    sect = _sans_accent((D.get('meta') or {}).get('secteur'))
+    financier = any(k in sect for k in ('banque', 'bank', 'assur', 'insur', 'financ'))
+    tests = []  # (libelle, etat True/False/None, detail)
+    anc = Bs.get('ancrage')
+    lab = str((anc[0] if isinstance(anc, list) and anc else anc) or '').strip().upper()
+    fait = str((anc[1] if isinstance(anc, list) and len(anc) > 1 else '') or '').strip()
+    ok_anc = bool(lab) and any(a in _sans_accent(lab).upper() or a in lab for a in ANCRAGES) and bool(fait)
+    if not anc:
+        warn('Ancrage du baissier non renseign\u00e9 (valo.scenarios.baissier.ancrage) : baissier NON V\u00c9RIFI\u00c9, aucun bonus de plancher.')
+    tests.append(('Ancrage du baissier', ok_anc if anc else None,
+                  ('%s : %s' % (lab, fait)) if ok_anc else 'absent ou sans fait (PIRE EXERCICE, CHOC CHIFFRÉ, MILIEU DE CYCLE, TEST DEMANDE −20 %)'))
+    rt = None
+    try:
+        vb, vc = Bs['bpa'][3] * Bs['multiple'], Cc['bpa'][3] * Cc['multiple']
+        rt = vb / vc * 100 if vc > 0 else None
+    except (KeyError, TypeError, IndexError):
+        pass
+    tests.append(('Écart au central', None if rt is None else rt < 80,
+                  'valeur terminale baissière = %s %% de la centrale (il faut < 80 %%)' % fr(rt, 0) if num(rt) else 'n.d.'))
+    if financier:
+        tests.append(('Solvabilité (Altman / Ohlson)', None, 'non applicable au secteur financier'))
+        solv = True
+    elif num(z) or num(o):
+        det = (num(z) and z < 1.81) or (num(o) and o >= 50)
+        solv = not det
+        tests.append(('Solvabilité (Altman / Ohlson)', solv,
+                      'Z %s%s · O %s%s' % (fr(z, 2), ' (zone de détresse <1,81)' if num(z) and z < 1.81 else
+                                           ' (zone grise)' if num(z) and z < 2.99 else '',
+                                           (fr(o, 0) + ' %') if num(o) else 'n.d.', ' (≥50 % : défaut probable)' if num(o) and o >= 50 else '')))
+    else:
+        solv = None
+        tests.append(('Solvabilité (Altman / Ohlson)', None, 'non mesurée — à reprendre dans Unclestock'))
+    if num(m):
+        tests.append(('Comptes (Beneish M)', m <= -1.78, 'M %s%s' % (fr(m, 2), ' > −1,78 : manipulation possible' if m > -1.78 else '')))
+    else:
+        tests.append(('Comptes (Beneish M)', None, 'non calculé (métrique éparse : absence non pénalisée)'))
+    if num(f):
+        tests.append(('Solidité (Piotroski F)', None if f > 3 else False, 'F %s/9%s' % (fr(f, 0), ' : faiblesse' if f <= 3 else '')))
+    echec = [t for t in tests if t[1] is False]
+    if echec:
+        lab_b = 'DOUTEUX'
+    elif ok_anc and num(rt) and solv is not None:
+        lab_b = 'CRÉDIBLE'
+    else:
+        lab_b = 'NON VÉRIFIÉ'
+    R['baissier'] = {'lab': lab_b, 'tests': tests, 'ratio_central': rt,
+                     'lvl': {'CRÉDIBLE': 5, 'DOUTEUX': 2}.get(lab_b, 'gris')}
+    chk('Baissier crédible (V22.7)', {'CRÉDIBLE': 'validé', 'DOUTEUX': 'échec'}.get(lab_b, 'n.d.'),
+        ' ; '.join('%s : %s' % (t[0], t[2]) for t in tests if t[1] is not True) or 'tous les tests passés')
+    if lab_b == 'DOUTEUX':
+        warn('Baissier DOUTEUX (%s) : capital préservé possiblement surestimé ; ni modificateur plancher, ni bonus de taille, taille plafonnée à 3 %%.'
+             % ' ; '.join(t[0] for t in echec))
+    return lab_b
+
+
+def prix_plancher(Bs, ctx, pmax, cible=CAP_MIN):
+    """Prix le plus haut qui garde le capital preserve du baissier >= cible (regle des -40 %)."""
+    cap = lambda P: cap_preserve(P, Bs, ctx)
+    lo, hi = pmax * 1e-6, pmax
+    try:
+        if cap(hi) >= cible:
+            return hi
+        if cap(lo) < cible:
+            return None
+    except (ZeroDivisionError, ValueError, TypeError):
+        return None
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        if cap(mid) >= cible:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def poser_prix(R, tx, _prix, prix_pour, flux, C, ctx, pmax, mact):
+    R['tx_bandes'] = (tx, max(2.0, tx - 5), max(2.0, tx - 10))
+    R['PA'] = _prix(tx / 100.0)
+    R['PJ'] = _prix(R['tx_bandes'][1] / 100.0)
+    R['PO'] = _prix(R['tx_bandes'][2] / 100.0)
+    R['PR'] = _prix(min(0.30, (tx + 3) / 100.0))
+    R['PS'] = _prix(min(0.30, (tx + 6) / 100.0))
+    R['tx_action'] = (tx, min(30.0, tx + 3), min(30.0, tx + 6))
+    R['PA_sans_revalo'] = prix_pour(tx / 100.0, lambda P: flux(P, C, ctx, 4, mact)[0], pmax) if num(mact) else None
+
+
+def appliquer_plancher(D, R, Bs, ctx, pmax, _prix, C, mact):
+    """A : le prix d'achat ne peut pas depasser le prix plancher (-40 % au pire dans le baissier).
+    B : plancher prouve -> taux exige -1 pt si toutes les conditions factuelles sont reunies."""
+    R['P60'] = prix_plancher(Bs, ctx, pmax)
+    # ---- B : plancher prouve
+    meta = D.get('meta') or {}
+    pl = D.get('plancher') or {}
+    tn, capm = vv(pl.get('tresorerie_nette_meur')), vv(meta.get('capitalisation_meur'))
+    dis = pl.get('distribution')
+    dlab = str((dis[0] if isinstance(dis, list) and dis else dis) or '').strip().upper()
+    dtxt = str((dis[1] if isinstance(dis, list) and len(dis) > 1 else '') or '').strip()
+    cond = [('trésorerie nette ≥ 20 % de la capitalisation',
+             bool(num(tn) and num(capm) and capm > 0 and tn / capm * 100 >= CASH_B),
+             ('%s %%' % fr(tn / capm * 100, 0)) if (num(tn) and num(capm) and capm > 0) else 'n.d.'),
+            ('cash réellement distribué sur 3 ans', dlab.startswith('OUI') and bool(dtxt), dtxt or 'n.d.'),
+            ('baissier crédible', (R.get('baissier') or {}).get('lab') == 'CRÉDIBLE', (R.get('baissier') or {}).get('lab', 'n.d.')),
+            ('porte qualité franchie', bool(R['q'].get('porte')), 'Q %s %%' % fr(R['q'].get('Q'), 0))]
+    R['B_cond'] = cond
+    R['B_actif'] = False
+    tx = R['tx']
+    if all(c[1] for c in cond):
+        brut2 = R['tx_brut'] - 1.0
+        tx2 = max(TX_MIN, min(TX_MAX, round(brut2 * 2) / 2))
+        if tx2 < tx - 1e-9:
+            pa2 = _prix(tx2 / 100.0)
+            pa2e = min(pa2, R['P60']) if (num(pa2) and num(R['P60'])) else pa2
+            cap2 = cap_preserve(pa2e, Bs, ctx) if num(pa2e) else None
+            cond.append(('capital préservé ≥ 80 au nouveau prix d’achat', bool(num(cap2) and cap2 >= CAP_B),
+                         '%s /100' % fr(cap2, 0)))
+            if num(cap2) and cap2 >= CAP_B:
+                R['tx_mods'].append(('plancher prouvé (trésorerie nette, cash distribué, baissier crédible, capital ≥ 80 au prix d’achat)', -1.0))
+                R['tx_brut'], R['tx'], R['B_actif'] = brut2, tx2, True
+                R['tx_borne'] = abs(brut2 - tx2) > 1e-9
+                chk('Modificateur plancher prouvé', 'validé', 'taux exigé %s → %s %%' % (fr(tx, 1), fr(tx2, 1)))
+        else:
+            cond.append(('effet sur le taux', False, 'taux déjà au plancher de 12 %'))
+    if not R['B_actif']:
+        chk('Modificateur plancher prouvé', 'n.a.', ' ; '.join('%s : %s' % (c[0], c[2]) for c in cond if not c[1]) or 'sans effet')
+    poser_prix(R, R['tx'], _prix, prix_pour, flux, C, ctx, pmax, mact)
+    # ---- A : regle des -40 %
+    R['PA_fond'] = R['PA']
+    R['plancher_limite'] = False
+    if R['P60'] is None:
+        R['plancher_limite'] = True
+        for k in ('PA', 'PR', 'PS'):
+            R[k] = None
+        warn('Aucun prix ne garde 60/100 dans le baissier : la règle des −40 %% bloque tout prix d’achat.')
+        chk('Règle des −40 % (capital préservé ≥ 60)', 'échec', 'aucun prix admissible')
+        return
+    if num(R['PA']) and R['P60'] < R['PA'] - 1e-9:
+        R['plancher_limite'] = True
+        for k in ('PA', 'PR', 'PS'):
+            if num(R[k]):
+                R[k] = min(R[k], R['P60'])
+        warn('Prix d’achat ramené de %s à %s par la règle des −40 %% (capital préservé du baissier ≥ 60/100).'
+             % (fprix(R['PA_fond']), fprix(R['PA'])))
+    chk('Règle des −40 % (capital préservé ≥ 60)', 'validé',
+        'prix plancher %s%s' % (fprix(R['P60']), ' — limite le prix d’achat' if R['plancher_limite'] else ' — non contraignant'))
+
+
 def calculer(D):
     WARN.clear()
     CHK.clear()
@@ -776,6 +940,7 @@ def calculer(D):
            'net_div': (1 - (valo.get('retenue_etrangere') or 0)) * (1 - (valo.get('precompte', 0.30) or 0))}
     R['ctx'] = ctx
     C, Bs = scs['central'], scs['baissier']
+    eval_baissier(D, R, scs)
 
     cf_c, I0 = flux(cours, C, ctx)
     R['tri_central'] = tri(cf_c)
@@ -805,15 +970,9 @@ def calculer(D):
 
     for r, nom in ((0.12, 'P12'), (0.15, 'P15'), (0.18, 'P18')):
         R[nom] = _prix(r)
+    appliquer_plancher(D, R, Bs, ctx, pmax, _prix, C, mact)
     tx = R.get('tx') or 15.0
-    R['tx_bandes'] = (tx, max(2.0, tx - 5), max(2.0, tx - 10))
-    R['PA'] = _prix(tx / 100.0)
-    R['PJ'] = _prix(R['tx_bandes'][1] / 100.0)
-    R['PO'] = _prix(R['tx_bandes'][2] / 100.0)
-    R['PR'] = _prix(min(0.30, (tx + 3) / 100.0))
-    R['PS'] = _prix(min(0.30, (tx + 6) / 100.0))
-    R['tx_action'] = (tx, min(30.0, tx + 3), min(30.0, tx + 6))
-    R['PA_sans_revalo'] = prix_pour(tx / 100.0, lambda P: flux(P, C, ctx, 4, mact)[0], pmax) if num(mact) else None
+    R['niv_retenu'] = L_RDT_TX(R['retenu'], tx)
     R['P15_sans_revalo'] = prix_pour(0.15, lambda P: flux(P, C, ctx, 4, mact)[0], pmax) if num(mact) else None
     if all(num(R[k]) for k in ('PA', 'PJ', 'PO')):
         okb = R['PA'] <= R['PJ'] <= R['PO'] + 1e-9
@@ -958,18 +1117,27 @@ def calculer(D):
     Q = R['q']['Q']; fiab = (meta.get('fiabilite') or 'B').upper()[:1]
     pari = False
     lim = []
+    blab = (R.get('baissier') or {}).get('lab')
+    cc_ = R.get('cap_cours')
+    R['forteresse'] = bool(num(cc_) and cc_ >= CAP_FORT and blab == 'CR\u00c9DIBLE')
     if num(Q) and Q >= 70:
         capQ = 6 if Q >= 90 else 5 if Q >= 85 else 4 if Q >= 80 else 3
+        if R['forteresse']:
+            capQ += 1  # V22.7 : plancher forteresse (>= 85/100 au cours, baissier credible)
         fac = {'A': 1, 'B': 1, 'C': 0.7, 'D': 0}.get(fiab, 1)
         if pari:
             fac = min(fac, 0.7)
-        lim.append(('qualit\u00e9 ajust\u00e9e', capQ * fac))
+        lim.append(('qualit\u00e9 ajust\u00e9e' + (' + forteresse' if R['forteresse'] else ''), capQ * fac))
     vis = R['q']['vis']
     if num(vis) and vis < 50:
         lim.append(('visibilit\u00e9 <50 %', 2))
     L = max(0.0, 1 - R['cap_cours'] / 100) if num(R['cap_cours']) else None
     if num(L) and L > 0:
         lim.append(('budget de perte 1,5 %', 1.5 / L))
+    if num(cc_) and CAP_MIN <= cc_ < CAP_SOLIDE:
+        lim.append(('plancher fragile (60\u201369/100)', 3))
+    if blab == 'DOUTEUX':
+        lim.append(('baissier douteux', 3))
     liq = meta.get('liquidite_max_pct')
     if num(liq):
         lim.append(('liquidit\u00e9', liq))
@@ -978,8 +1146,14 @@ def calculer(D):
                    'provisoire': not num(liq)}
     R['tranches'] = '50 / 25 / 25 %' if (R['momentum'] == 'FAVORABLE' and fiab != 'C' and not pari) else '1/3 \u2013 1/3 \u2013 1/3'
     R['tranche1'] = 'au prix admissible (≤ prix d’achat) ; exposition au multiple à examiner séparément'
-    R['priorite'] = ('ACTIF' if cours <= R['PJ'] else 'VEILLE') if num(R.get('PJ')) and R['PJ'] > 0 else 'non \u00e9valu\u00e9e'
-    R['porte_prix'] = 'ouverte' if (num(R.get('PA')) and cours <= R['PA']) else ('PROCHE' if (num(R.get('PJ')) and cours <= R['PJ']) else 'LOIN')
+    # V22.7 : quand la regle des -40 % limite le prix, PROCHE = a moins de 5 points de capital preserve du seuil (55/100)
+    R['PJ_eff'] = R.get('PJ')
+    if R.get('plancher_limite') and num(R.get('PJ')):
+        p55 = prix_plancher(Bs, ctx, pmax, CAP_MIN - 5)
+        R['PJ_eff'] = min(R['PJ'], p55) if num(p55) else None
+    pj = R['PJ_eff']
+    R['priorite'] = ('ACTIF' if cours <= pj else 'VEILLE') if num(pj) and pj > 0 else 'non \u00e9valu\u00e9e'
+    R['porte_prix'] = 'ouverte' if (num(R.get('PA')) and cours <= R['PA']) else ('PROCHE' if (num(pj) and cours <= pj) else 'LOIN')
 
     R['calc'] = True
     lire_preuves(D, R)
@@ -1085,6 +1259,7 @@ def portes(D, R):
           else R.get('guidance_cas') not in ('VETO ACTIF', 'IMPACT NON BORNABLE')),
          ('Ancrage', bool(R.get('valorisation_valide')) if calc else None),
          ('Unit\u00e9s', (not R.get('unites_suspectes')) if calc else None),
+         ('Plancher \u221240 %', (R['cap_cours'] >= CAP_MIN) if (calc and num(R.get('cap_cours'))) else None),
          ('Prix', (R.get('porte_prix') == 'ouverte') if calc else None)]
     R['portes'] = P
     return P
@@ -1124,8 +1299,13 @@ def verdict_final(D, R):
         if veut and num(R.get('tx_brut')) and R['tx_brut'] > TX_MAX + 1e-9:
             E.append((4, 'HORS S\u00c9LECTION', 'risque au-del\u00e0 de 21 %'))
         if veut and R.get('porte_prix') != 'ouverte':
-            E.append((6, 'WATCHLIST %s \u2014 PRIX' % ('PROCHE' if R.get('porte_prix') == 'PROCHE' else 'LOIN'),
-                      'cours au-dessus du prix d\'achat'))
+            cc_, pf_ = R.get('cap_cours'), R.get('PA_fond')
+            mot = 'cours au-dessus du prix d\'achat'
+            if num(cc_) and cc_ < CAP_MIN:
+                mot = ('r\u00e8gle des \u221240 %% : capital pr\u00e9serv\u00e9 %s/100 au cours, prix plancher %s%s'
+                       % (fr(cc_, 0), fprix(R.get('P60')),
+                          '' if (not num(pf_) or vv(meta.get('cours')) <= pf_ + 1e-9) else ' (et cours au-dessus du prix au taux exig\u00e9)'))
+            E.append((6, 'WATCHLIST %s \u2014 PRIX' % ('PROCHE' if R.get('porte_prix') == 'PROCHE' else 'LOIN'), mot))
         if veut and R.get('unites_suspectes'):
             E.append((2, '\u00c0 DOCUMENTER \u2014 ACHAT BLOQU\u00c9', 'incoh\u00e9rence d\u2019unit\u00e9s probable (' + R['unites_suspectes'] + ')'))
         gcas = R.get('guidance_cas')
@@ -1325,6 +1505,61 @@ def encadres_qualite(D, R):
     return a
 
 
+
+def plancher_html(R):
+    """V22.7 : bloc « Ce qu'il te reste si tu t'es trompé »."""
+    if not R.get('calc'):
+        return ''
+    cc, cpa = R.get('cap_cours'), R.get('cap_PA')
+    b = R.get('baissier') or {}
+    pos = lambda x: max(0.0, min(100.0, x)) if num(x) else None
+    zones = [(0, 60, '#f0605f', 'perte > 40 %'), (60, 70, '#f3a33b', 'fragile'),
+             (70, 85, '#9edb6b', 'solide'), (85, 100, '#2dc7c9', 'forteresse')]
+    seg = ''.join('<div class="seg" style="left:%s%%;width:%s%%;background:%s"></div>' % (a, b_ - a, c) for a, b_, c, _ in zones)
+    lab = ''.join('<div class="tick" style="left:%s%%;top:70px">%s</div>' % ((a + b_) / 2, l) for a, b_, _, l in zones)
+    cur = ''
+    if num(cc):
+        cur += '<div class="cur" style="left:%s%%">\u25b2 au cours %s</div>' % (pos(cc), fr(cc, 0))
+    if num(cpa):
+        cur += ('<div class="tick" style="left:%s%%;top:96px;color:var(--cy)">\u25b3 au prix d\u2019achat %s</div>' % (pos(cpa), fr(cpa, 0)))
+    tests = ''.join('<tr><td>%s</td><td>%s</td><td class="b">%s</td></tr>' % (
+        esc(t[0]), '\u2705' if t[1] else '\u26aa' if t[1] is None else '\u274c', esc(t[2])) for t in b.get('tests') or [])
+    conds = ''.join('<tr><td>%s</td><td>%s</td><td class="b">%s</td></tr>' % (
+        esc(c[0]), '\u2705' if c[1] else '\u274c', esc(c[2])) for c in R.get('B_cond') or [])
+    lim = ''
+    if R.get('plancher_limite') and num(R.get('PA')):
+        lim = ('<p><b>Le prix d\u2019achat est limité par la règle des \u221240 %%</b> : %s au lieu de %s au seul taux exigé.</p>'
+               % (fprix(R['PA']), fprix(R.get('PA_fond'))))
+    elif R.get('plancher_limite'):
+        lim = '<p><b>Aucun prix ne respecte la règle des \u221240 %</b> dans ce baissier : achat impossible.</p>'
+    eff = []
+    if R.get('B_actif'):
+        eff.append('taux exigé \u22121 pt (plancher prouvé)')
+    if R.get('forteresse'):
+        eff.append('\U0001f3f0 forteresse : plafond de taille +1 pt')
+    if num(cc) and CAP_MIN <= cc < CAP_SOLIDE:
+        eff.append('plancher fragile : taille plafonnée à 3 %')
+    if b.get('lab') == 'DOUTEUX':
+        eff.append('baissier douteux : taille plafonnée à 3 %, aucun bonus')
+    return ('<div class="c capital-box"><h3>\U0001f6e1\ufe0f Ce qu\u2019il te reste si tu t\u2019es trompé</h3>'
+            '<p class="sub">Capital préservé du scénario baissier à 4 ans, dividendes compris. Sous 60/100, la perte dépasse 40 %% : '
+            'c\u2019est la règle « au-delà de \u221240 %%, je me suis trompé ». Le prix plancher est le prix le plus haut qui garde 60/100.</p>'
+            '<div class="rl" style="height:120px;margin-top:40px">%s%s%s</div>'
+            '<div class="grid g3">%s%s%s</div>%s'
+            '<div style="margin:10px 0">%s %s</div>'
+            '<details><summary>Crédibilité du baissier \u2014 les tests</summary><div class="scroll"><table>%s</table></div></details>'
+            '<details><summary>Modificateur « plancher prouvé » (\u22121 pt) \u2014 les conditions</summary><div class="scroll"><table>%s</table></div></details>'
+            '</div>') % (
+        seg, lab, cur,
+        carte('Capital préservé au cours', '%s /100' % fr(cc, 0), L_CAP(cc), 'si le baissier arrive'),
+        carte('Au prix d\u2019achat', '%s /100' % fr(cpa, 0), L_CAP(cpa), 'ce que tu achètes vraiment'),
+        carte('Prix plancher \u221240 %', fprix(R.get('P60')), 5 if not R.get('plancher_limite') else 3,
+              'contraignant' if R.get('plancher_limite') else 'non contraignant'),
+        lim, bdg('Baissier ' + b.get('lab', 'n.d.'), b.get('lvl', 'gris')),
+        ' '.join(bdg(e, 4) for e in eff) or '<span class="sub">aucun effet sur le taux ni sur la taille</span>',
+        tests or '<tr><td>n.d.</td></tr>', conds or '<tr><td>n.d.</td></tr>')
+
+
 def rendu(D, R):
     meta = D.get('meta') or {}
     valo = D.get('valo') or {}
@@ -1413,6 +1648,7 @@ def rendu(D, R):
           fr(R.get('tx'), 1), mr, fr(R.get('tx'), 1),
           '<div class="sub">Valeur born\u00e9e \u00e0 l\'intervalle 12\u201321 %.</div>' if R.get('tx_borne') else ''))
 
+    A(plancher_html(R))
     A('<div class="sub" style="margin:6px 0 14px">Tri rapide : %s. Les scores sont des conventions de s\u00e9lection en %%, pas des probabilit\u00e9s.</div>' % esc(meta.get('tri')))
 
     # -- ACTE 0
@@ -1577,7 +1813,7 @@ def rendu(D, R):
         tk = ''.join('<div class="tick" style="left:%s%%;top:%spx">%s \u00b7 %s %% \u00b7 %s</div>' %
                      (pc(p), top, lib, fr(t, 0), fprix(p)) for p, t, lib, top in
                      ((PS, ta[2], 'Forte marge', 70), (PR, ta[1], 'Renfort', 92),
-                      (PA, ta[0], 'Objectif', 114)))
+                      (PA, ta[0], 'Objectif' + (' (plancher \u221240 %)' if R.get('plancher_limite') else ''), 114)))
         A('<div class="c"><h3>Barrette de prix (%s) \u2014 uniquement les niveaux actionnables</h3><div class="rl">%s%s'
           '<div class="cur" style="left:%s%%">\u25b2 cours %s \u2192 %s %%/an</div></div>'
           '<div class="sub">Objectif %s %% : %s \u00b7 renfort %s %% : %s \u00b7 forte marge %s %% : %s. '
@@ -1757,6 +1993,9 @@ def ligne_nico(D, R):
           fprix(R.get('PA')), fprix(vv(meta.get('cours'))), fr(R.get('tx'), 1), fr(R.get('retenu'), 1),
           fr(R.get('cap_cours'), 0), fr(R['q']['Q'], 0), v.get('suivi_date', ''), meta.get('date_eval', ''),
           meta.get('secteur', ''), meta.get('pays', ''), note]
+    bl = (R.get('baissier') or {}).get('lab')
+    if bl:
+        ch.append('BAISSIER ' + bl)
     return ' | '.join(str(c).replace('\u202f', '') for c in ch)
 
 
@@ -1821,6 +2060,13 @@ def resume(D, R):
          'Suivi : %s \u2014 %s (%s) \u00b7 priorit\u00e9 %s' % (v.get('suivi') or 'n.d.', v.get('suivi_condition') or 'n.d.',
                                                                v.get('suivi_date') or 'n.d.', R.get('priorite') or 'n.d.')]
     L.insert(2, 'Portes : ' + portes_txt(R))
+    if R.get('calc'):
+        L.insert(5, 'Plancher : capital pr\u00e9serv\u00e9 %s/100 au cours, %s au prix d\'achat \u00b7 prix plancher \u221240 %% %s%s \u00b7 baissier %s%s%s' % (
+            fr(R.get('cap_cours'), 0), fr(R.get('cap_PA'), 0), fprix(R.get('P60')),
+            ' (limite le prix d\'achat)' if R.get('plancher_limite') else '',
+            (R.get('baissier') or {}).get('lab', 'n.d.'),
+            ' \u00b7 plancher prouv\u00e9 \u22121 pt' if R.get('B_actif') else '',
+            ' \u00b7 \U0001f3f0 forteresse' if R.get('forteresse') else ''))
     if WARN:
         L.append('\u26a0\ufe0f ' + ' \u00b7 '.join(WARN))
     L.append(R['nico'])
