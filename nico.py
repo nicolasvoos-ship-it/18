@@ -18,8 +18,10 @@ import json, sys, os, re, math, html, copy, hashlib, datetime, statistics as stx
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V22.7"
+VERSION = "V22.7.1"
 VERSION_DATE = "04/10/2026"
+# V22.7.1 : tresorerie nette comptee hors multiple. Valeur de sortie = (BPA - produit financier net) x multiple
+# + tresorerie nette par action, dans les trois scenarios ; alerte si le prix d'achat tombe sous la tresorerie nette.
 # V22.7 : plancher de perte (regle des -40 %), modificateur plancher prouve, taille selon le plancher,
 # credibilite du baissier (ancrage, ecart au central, Altman/Ohlson, Beneish).
 CAP_MIN, CAP_SOLIDE, CAP_FORT, CAP_B, CASH_B = 60.0, 70.0, 85.0, 80.0, 20.0
@@ -455,6 +457,21 @@ def fx_at(sc, x0, t):
     return f[min(max(int(math.ceil(t)), 1), 4) - 1]
 
 
+def tn_sc(sc, ctx):
+    """V22.7.1 : tresorerie nette et produit financier net par action a l'horizon, pour ce scenario."""
+    tn = sc.get('tresorerie_an4') if num(sc.get('tresorerie_an4')) else ctx.get('tn')
+    pf = sc.get('produit_fin_an4') if num(sc.get('produit_fin_an4')) else ctx.get('pf')
+    return (tn if num(tn) else 0.0), (pf if num(pf) else 0.0)
+
+
+def val_term(sc, ctx, h=4.0, mult=None):
+    """Valeur par action a l'horizon : exploitation x multiple + tresorerie nette (V22.7.1)."""
+    m = sc['multiple'] if mult is None else mult
+    tn, pf = tn_sc(sc, ctx)
+    expl = bpa_at(sc, ctx['base'], h, ctx['gt'], ctx.get('tk')) - pf
+    return max(0.0, max(0.0, expl) * m + tn)
+
+
 def flux(P, sc, ctx, h=4.0, mult=None, divs=True):
     x0 = ctx['x0']; B = P * x0
     I0 = B * (1 + TOB + ctx['fa'])
@@ -470,8 +487,7 @@ def flux(P, sc, ctx, h=4.0, mult=None, divs=True):
                 tq = round(tp, 6)
                 cf[tq] = cf.get(tq, 0.0) + dps_at(sc, k, ctx['gt']) * fx_at(sc, x0, tp) * ctx['net_div']
             k += 1
-    m = sc['multiple'] if mult is None else mult
-    S = max(0.0, bpa_at(sc, ctx['base'], h, ctx['gt'], ctx.get('tk')) * m * fx_at(sc, x0, h))
+    S = val_term(sc, ctx, h, mult) * fx_at(sc, x0, h)
     vente = S - TAX_PV * max(S - B, 0.0) - S * (TOB + ctx['fv'])
     cf[float(h)] = cf.get(float(h), 0.0) + vente
     return sorted(cf.items()), I0
@@ -551,6 +567,7 @@ CHAMPS_NUM = [
 ]
 CHAMPS_NUM_VV = ['meta.cours', 'meta.capitalisation_meur', 'valo.base_normalisee', 'valo.base_publiee',
                  'rentabilite.wacc', 'plancher.tresorerie_nette_meur',
+                 'valo.tresorerie_nette_action', 'valo.produit_financier_action',
                  'risques.forensique.z_altman', 'risques.forensique.o_ohlson_pct',
                  'risques.forensique.m_beneish', 'risques.forensique.f_piotroski']  # lus via vv() : seule la valeur interne est controlee
 CHAMPS_TXT = ['meta.fiabilite', 'valo.clause', 'taux_exige.motif']
@@ -625,7 +642,7 @@ def normaliser_entrees(D):
     for nom, sc in (scs.items() if isinstance(scs, dict) else []):
         if not isinstance(sc, dict):
             continue
-        for k in ('multiple', 'poids'):
+        for k in ('multiple', 'poids', 'tresorerie_an4', 'produit_fin_an4'):
             if k in sc:
                 x = sc[k]
                 if isinstance(x, list) and x and not isinstance(x[0], (list, dict)):
@@ -736,7 +753,9 @@ def eval_baissier(D, R, scs):
                   ('%s : %s' % (lab, fait)) if ok_anc else 'absent ou sans fait (PIRE EXERCICE, CHOC CHIFFRÉ, MILIEU DE CYCLE, TEST DEMANDE −20 %)'))
     rt = None
     try:
-        vb, vc = Bs['bpa'][3] * Bs['multiple'], Cc['bpa'][3] * Cc['multiple']
+        cx = R.get('ctx') or {'base': None, 'gt': 0.0}
+        vb = val_term(Bs, cx) if 'base' in cx else Bs['bpa'][3] * Bs['multiple']
+        vc = val_term(Cc, cx) if 'base' in cx else Cc['bpa'][3] * Cc['multiple']
         rt = vb / vc * 100 if vc > 0 else None
     except (KeyError, TypeError, IndexError):
         pass
@@ -937,8 +956,23 @@ def calculer(D):
     ctx = {'x0': x0, 'base': base, 'gt': gt, 'tk': tk, 'delai': delai,
            'fa': (valo.get('frais_achat_pct') or 0) / 100.0,
            'fv': (valo.get('frais_vente_pct') or 0) / 100.0,
-           'net_div': (1 - (valo.get('retenue_etrangere') or 0)) * (1 - (valo.get('precompte', 0.30) or 0))}
+           'net_div': (1 - (valo.get('retenue_etrangere') or 0)) * (1 - (valo.get('precompte', 0.30) or 0)),
+           'tn': vv(valo.get('tresorerie_nette_action')), 'pf': vv(valo.get('produit_financier_action'))}
     R['ctx'] = ctx
+    tn0 = ctx['tn']
+    tnm, capm = vv(G(D, 'plancher.tresorerie_nette_meur')), vv(G(D, 'meta.capitalisation_meur'))
+    if num(tn0):
+        if not num(ctx['pf']):
+            warn('Tr\u00e9sorerie nette s\u00e9par\u00e9e mais produit financier net par action absent : '
+                 'les int\u00e9r\u00eats restent dans le BPA multipli\u00e9, le cash est compt\u00e9 deux fois en partie.')
+        chk('Tr\u00e9sorerie nette compt\u00e9e hors multiple (V22.7.1)', 'valid\u00e9' if num(ctx['pf']) else '\u00e9chec',
+            'valeur de sortie = (BPA \u2212 %s) \u00d7 multiple + %s par action ; multiples de r\u00e9f\u00e9rence \u00e0 exprimer hors cash'
+            % (fr(ctx['pf'], 2), fr(tn0, 2)))
+    elif num(tnm) and num(capm) and capm > 0 and tnm >= 0.10 * capm:
+        warn('Tr\u00e9sorerie nette = %s %% de la capitalisation, non s\u00e9par\u00e9e du multiple '
+             '(valo.tresorerie_nette_action) : plancher et prix d\u2019achat sous-estim\u00e9s.' % fr(100 * tnm / capm, 0))
+        chk('Tr\u00e9sorerie nette compt\u00e9e hors multiple (V22.7.1)', '\u00e9chec',
+            'cash net \u2265 10 %% de la capitalisation, non renseign\u00e9 par action')
     C, Bs = scs['central'], scs['baissier']
     eval_baissier(D, R, scs)
 
@@ -996,6 +1030,13 @@ def calculer(D):
         chk('R\u00e9sidus de VAN aux prix r\u00e9solus', 'valid\u00e9' if res < 1e-4 else '\u00e9chec',
             'max %.2e \u00b7 prix limit\u00e9 par les %s' % (res, lim))
 
+    if num(tn0) and tn0 > 0 and num(R.get('PA')):
+        pa_ok = R['PA'] >= tn0 - 1e-9
+        chk('Prix d\u2019achat \u2265 tr\u00e9sorerie nette par action (V22.7.1)', 'valid\u00e9' if pa_ok else '\u00e9chec',
+            'prix %s, tr\u00e9sorerie nette %s' % (fprix(R['PA']), fprix(tn0)))
+        if not pa_ok:
+            warn('Prix d\u2019achat sous la tr\u00e9sorerie nette par action : v\u00e9rifier que le cash n\u2019est ni '
+                 'perdu dans le multiple, ni consid\u00e9r\u00e9 comme inaccessible sans le dire (tresorerie_an4).')
     R['cap_cours'] = cap_preserve(cours, Bs, ctx)
     R['cap_P15'] = cap_preserve(R['P15'], Bs, ctx) if num(R['P15']) else None
     R['cap_PA'] = cap_preserve(R['PA'], Bs, ctx) if num(R['PA']) else None
@@ -1828,7 +1869,12 @@ def rendu(D, R):
         if not sc or 'ctx' not in R:  # arret precoce : pas de scenarios chiffres
             continue
         t_ = tri(flux(cours, sc, R['ctx'])[0])
-        pt = sc['bpa'][3] * sc['multiple']
+        pt = val_term(sc, R['ctx'])
+        tns, pfs = tn_sc(sc, R['ctx'])
+        if tns or pfs:
+            sc = dict(sc); sc['txt'] = ('Valeur \u00e0 4 ans = exploitation %s \u00d7 %s + tr\u00e9sorerie nette %s. ' % (
+                fr(bpa_at(sc, R['ctx']['base'], 4.0, R['ctx']['gt'], R['ctx'].get('tk')) - pfs, 2), fr(sc['multiple'], 1),
+                fprix(tns))) + (sc.get('txt') or '')
         srows += ('<tr><td><b>%s</b></td><td class="n">%s %%</td><td class="n">%s</td><td class="n">%s\u00d7</td><td class="n">%s</td>'
                   '<td class="n t%s">%s %%/an</td></tr><tr class="scn"><td colspan="6">%s</td></tr>') % (
                      nom.capitalize(), fr(100 * sc.get('poids', POIDS_DEF[nom]), 0), fr(sc['bpa'][3], 2),
@@ -1839,7 +1885,7 @@ def rendu(D, R):
     dc = R.get('decomp') or {}
     A('<div class="c"><h3>Trois sc\u00e9narios \u00e0 quatre ans</h3><div class="scroll"><table class="sc">'
       '<tr><th>Sc\u00e9nario</th><th class="n">Poids</th><th class="n">BPA an 4</th><th class="n">Multiple</th>'
-      '<th class="n">Prix terminal</th><th class="n">TRI</th></tr>%s</table></div>'
+      '<th class="n">Valeur \u00e0 4 ans</th><th class="n">TRI</th></tr>%s</table></div>'
       '<div class="sub">Base publi\u00e9e %s \u2192 base normalis\u00e9e %s \u00b7 %s</div></div>' % (
           srows, fr(vv(valo.get('base_publiee')), 2), fr(vv(valo.get('base_normalisee')), 2), esc(valo.get('effet'))))
     A('<div class="c"><h3>Robustesse du rendement</h3><div class="scroll"><table>'
