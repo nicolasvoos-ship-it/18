@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """NICO - moteur unique de dossier.
 
-Usage :  python3 nico.py Dossier_Societe_TICKER_AAAA-MM-JJ.json [-o dossier_sortie]
+Usage :  python3 nico.py Societe_TICKER_AAAA-MM-JJ.json [-o dossier_sortie]
 
 Fait tout ce qui est mecanique, pour que le modele n'ecrive que des faits et des phrases :
   1. calculs financiers (TRI, flux ponderes, P12/P15/P18, capital preserve, horizons,
@@ -18,8 +18,11 @@ import json, sys, os, re, math, html, copy, hashlib, datetime, statistics as stx
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V22.7.1"
-VERSION_DATE = "04/10/2026"
+VERSION = "V22.8"
+VERSION_DATE = "25/10/2026"
+# V22.8 : rubrique « le probleme existera-t-il encore ? » (acte0.avenir) : besoin futur + captation de la valeur,
+# synthese et controles de coherence avec Modele 2 et Modele 3 ; aucun point, aucun veto, aucun effet sur le prix.
+# Nom des fichiers sans prefixe « Dossier_ » (retire automatiquement s'il est present).
 # V22.7.1 : tresorerie nette comptee hors multiple. Valeur de sortie = (BPA - produit financier net) x multiple
 # + tresorerie nette par action, dans les trois scenarios ; alerte si le prix d'achat tombe sous la tresorerie nette.
 # V22.7 : plancher de perte (regle des -40 %), modificateur plancher prouve, taille selon le plancher,
@@ -139,6 +142,10 @@ FAM = {
               '\u00c0 DOCUMENTER': 'doc', 'RENFORCEMENT': 5, 'CONFIRMATION': 3, 'GUIDANCE': 3, 'REJET': 1, 'ACHAT': 6},
     'pm': {'CATALYSEUR DAT\u00c9': 5, 'CATALYSEUR PROBABLE': 4, 'RENDEMENT PAR LES FLUX': 5,
            'PARI DE REVALORISATION': 3, 'NON DOCUMENT\u00c9': 'gris'},
+    'avenir': {'NON DOCUMENT\u00c9': 'gris', 'IND\u00c9TERMIN\u00c9': 'gris', 'EN HAUSSE': 5, 'STABLE': 4,
+               'EN BAISSE': 2, 'NON': 1},
+    'captation': {'IND\u00c9TERMIN\u00c9': 'gris', 'NON DOCUMENT\u00c9': 'gris', 'CAPT\u00c9E': 5, 'PARTAG\u00c9E': 4,
+                  'DISPUT\u00c9E': 3, 'PERDUE': 2},
     'suivi': {'SOUS SURVEILLANCE': 4, 'SP\u00c9CULATIVE': 3, 'CONSERVER': 5, 'RETIRER': 2},
     'fiab': {'A': 6, 'B': 5, 'C': 3, 'D': 1},
     'momentum': {'FAVORABLE': 5, 'D\u00c9FAVORABLE': 3, 'MIXTE': 4, 'IND\u00c9TERMIN\u00c9': 'gris'},
@@ -1718,6 +1725,24 @@ def rendu(D, R):
           '' if (nbm <= 80 and 3 <= nbp <= 4) else ' \u2014 <span class="t3">hors format</span>', lh))
     A('</div>')
 
+    # -- V22.8 : le probleme existera-t-il encore ?
+    avr = R.get('avenir') or {}
+    if avr.get('doc'):
+        A('<div class="c"><h3>\U0001f52e Le problème existera-t-il encore ?</h3>'
+          '<p><b>Problème résolu</b> — %s</p><div class="grid g3">'
+          '<div><div class="lab">Le besoin demain</div><div>%s</div><div class="sub">%s</div></div>'
+          '<div><div class="lab">La société en gardera-t-elle la valeur ?</div><div>%s</div><div class="sub">%s</div></div>'
+          '<div><div class="lab">Lecture</div><div>%s</div><div class="sub">%s</div></div></div>'
+          '<div class="sub">Lecture seulement : les faits se notent dans Modèle 2 et Modèle 3, '
+          'aucun point ni effet sur le prix. Un besoin croissant ne garantit pas des profits croissants.</div></div>' % (
+              esc(avr.get('probleme') or 'n.d.'),
+              bdg(avr.get('ex'), avr.get('ex_lvl', 'gris')), esc(avr.get('ex_txt')),
+              bdg(avr.get('ca'), avr.get('ca_lvl', 'gris')), esc(avr.get('ca_txt')),
+              bdg(avr.get('synth'), avr.get('lvl', 'gris')), esc(avr.get('txt'))))
+    else:
+        A('<div class="c"><h3>\U0001f52e Le problème existera-t-il encore ?</h3><div>%s</div>'
+          '<div class="sub">Rubrique non renseignée dans ce dossier.</div></div>' % bdg('NON DOCUMENTÉ', 'gris'))
+
     # -- bande compacte
     sec = D.get('secteur') or {}
     rb = R['rentab']
@@ -2045,6 +2070,75 @@ def ligne_nico(D, R):
     return ' | '.join(str(c).replace('\u202f', '') for c in ch)
 
 
+AVENIR_SYNTH = {
+    ('EN HAUSSE', 'CAPTÉE'): ('VENT PORTEUR CAPTÉ', 6, 'Le besoin grandit et la société garde la valeur : la demande travaille pour l\'actionnaire.'),
+    ('EN HAUSSE', 'PARTAGÉE'): ('VENT PORTEUR PARTAGÉ', 5, 'Le besoin grandit ; la valeur se partage entre acteurs rationnels.'),
+    ('EN HAUSSE', 'DISPUTÉE'): ('DEMANDE PORTEUSE, MARGES DISPUTÉES', 3, 'Le besoin grandit, mais la concurrence peut absorber la croissance dans les prix.'),
+    ('EN HAUSSE', 'PERDUE'): ('PIÈGE DE CROISSANCE', 2, 'Besoin croissant, profits captés par d\'autres : la demande ne garantit pas le résultat par action.'),
+    ('STABLE', 'CAPTÉE'): ('RENTE DURABLE', 5, 'Besoin stable et valeur gardée : rendement par les flux plutôt que par le volume.'),
+    ('STABLE', 'PARTAGÉE'): ('BESOIN STABLE', 4, 'Besoin durable, croissance à aller chercher dans les parts de marché ou le prix.'),
+    ('STABLE', 'DISPUTÉE'): ('BESOIN STABLE, MARGES DISPUTÉES', 3, 'Le besoin reste, la marge est l\'enjeu.'),
+    ('STABLE', 'PERDUE'): ('COMMODITÉ', 2, 'Besoin durable mais banalisé : la valeur part vers les clients ou les concurrents.'),
+    ('EN BAISSE', 'CAPTÉE'): ('RENTE QUI S\'ÉRODE', 3, 'La société garde la valeur d\'un besoin qui rétrécit : rendement possible, croissance non.'),
+    ('EN BAISSE', 'PARTAGÉE'): ('RENTE QUI S\'ÉRODE', 3, 'Besoin en repli partagé entre acteurs : volumes sous pression.'),
+    ('EN BAISSE', 'DISPUTÉE'): ('DÉCLIN', 2, 'Besoin en repli et concurrence pour ce qui reste.'),
+    ('EN BAISSE', 'PERDUE'): ('DÉCLIN', 2, 'Besoin en repli et valeur captée par d\'autres.'),
+}
+
+
+def _cle(lab, fam):
+    u = str(lab or '').upper()
+    for k in sorted(FAM[fam], key=len, reverse=True):
+        if k in u:
+            return k
+    return None
+
+
+def calc_avenir(D, R):
+    """Rubrique V22.8 : le probleme existera-t-il encore, et la societe en gardera-t-elle la valeur ?
+    Lecture seulement : aucun point, aucun veto, aucun effet sur le prix (R3). Les faits se notent
+    dans Modele 2 (moat) et Modele 3 (durabilite) ; le moteur signale les incoherences."""
+    av = G(D, 'acte0.avenir')
+    if not isinstance(av, dict):
+        R['avenir'] = {'doc': False, 'synth': 'NON DOCUMENTÉ', 'lvl': 'gris', 'txt': ''}
+        warn('Rubrique \U0001f52e « le problème existera-t-il encore ? » non renseignée (acte0.avenir).')
+        chk('Problème de demain', 'n.d.', 'acte0.avenir absent')
+        return
+    ex = av.get('existera'); ca = av.get('captation')
+    ex = (list(ex) + ['', ''])[:2] if isinstance(ex, list) else [ex or '', '']
+    ca = (list(ca) + ['', ''])[:2] if isinstance(ca, list) else [ca or '', '']
+    k_ex, k_ca = _cle(ex[0], 'avenir'), _cle(ca[0], 'captation')
+    if k_ex in (None, 'NON DOCUMENTÉ', 'INDÉTERMINÉ'):
+        synth, lvl, txt = 'À DOCUMENTER', 'gris', 'Le devenir du besoin n\'est pas établi.'
+    elif k_ex == 'NON':
+        synth, lvl, txt = 'BESOIN EN VOIE DE DISPARITION', 1, 'Le problème résolu disparaît : aucune trajectoire de croissance ne peut s\'appuyer dessus.'
+    elif k_ca in (None, 'NON DOCUMENTÉ', 'INDÉTERMINÉ'):
+        synth, lvl, txt = 'CAPTATION À DOCUMENTER', 'gris', 'Le besoin est qualifié, mais pas la part de valeur que la société en gardera.'
+    else:
+        synth, lvl, txt = AVENIR_SYNTH[(k_ex, k_ca)]
+    R['avenir'] = {'doc': True, 'probleme': av.get('probleme') or '', 'ex': ex[0] or 'n.d.', 'ex_txt': ex[1],
+                   'ex_lvl': L_LAB('avenir', ex[0]), 'ca': ca[0] or 'n.d.', 'ca_txt': ca[1],
+                   'ca_lvl': L_LAB('captation', ca[0]) if k_ex != 'NON' else 'gris',
+                   'synth': synth, 'lvl': lvl, 'txt': txt}
+    # coherence avec les controles proprietaires (aucune note modifiee)
+    mod = G(D, 'qualite.controles.modele') or []
+    def note(i):
+        try:
+            return float(mod[i][0]) if isinstance(mod[i], list) else float(mod[i])
+        except Exception:
+            return None
+    m2, m3 = note(1), note(2)
+    if k_ex in ('NON', 'EN BAISSE') and m3 == 1:
+        warn('Modèle 3 noté 1 (utilité durable) alors que le besoin est %s : justifier ou corriger.' % ('en voie de disparition' if k_ex == 'NON' else 'en baisse'))
+    if k_ca == 'PERDUE' and m2 == 1:
+        warn('Modèle 2 noté 1 (avantage démontré) alors que la valeur est captée par d\'autres : justifier ou corriger.')
+    if k_ca == 'CAPTÉE' and m2 is not None and m2 < 0.5:
+        warn('Valeur déclarée CAPTÉE alors que Modèle 2 = 0 (aucun avantage) : incohérence à résoudre.')
+    if not str(ex[1]).strip() or (k_ex != 'NON' and not str(ca[1]).strip()):
+        warn('Rubrique \U0001f52e : badge sans justification — écrire le pourquoi à côté de chaque badge.')
+    chk('Problème de demain', 'validé' if lvl != 'gris' else 'n.d.', synth)
+
+
 def calc_pourquoi(D, R):
     """Pourquoi maintenant (V22.5) : l'analyste fournit le catalyseur ; le moteur
     qualifie l'absence d'apres la part du multiple. Aucun point, aucun veto, aucun
@@ -2106,6 +2200,9 @@ def resume(D, R):
          'Suivi : %s \u2014 %s (%s) \u00b7 priorit\u00e9 %s' % (v.get('suivi') or 'n.d.', v.get('suivi_condition') or 'n.d.',
                                                                v.get('suivi_date') or 'n.d.', R.get('priorite') or 'n.d.')]
     L.insert(2, 'Portes : ' + portes_txt(R))
+    avr = R.get('avenir') or {}
+    L.insert(3, '\U0001f52e Avenir : besoin %s \u00b7 valeur %s \u2192 %s' % (
+        avr.get('ex', 'n.d.'), avr.get('ca', 'n.d.'), avr.get('synth', 'NON DOCUMENT\u00c9')))
     if R.get('calc'):
         L.insert(5, 'Plancher : capital pr\u00e9serv\u00e9 %s/100 au cours, %s au prix d\'achat \u00b7 prix plancher \u221240 %% %s%s \u00b7 baissier %s%s%s' % (
             fr(R.get('cap_cours'), 0), fr(R.get('cap_PA'), 0), fprix(R.get('P60')),
@@ -2125,6 +2222,8 @@ def main():
     src = sys.argv[1]
     out_dir = sys.argv[3] if len(sys.argv) > 3 and sys.argv[2] == '-o' else os.path.dirname(os.path.abspath(src))
     base = os.path.splitext(os.path.basename(src))[0]
+    if base.lower().startswith('dossier_'):
+        base = base[len('dossier_'):]  # V22.8 : plus de prefixe Dossier_
     with open(src, encoding='utf-8') as f:
         brut = f.read()
     if src.lower().endswith(('.html', '.htm')):
@@ -2140,6 +2239,7 @@ def main():
     D['_source'] = copy.deepcopy({k: v for k, v in D.items() if k != '_source'})
     R = calculer(D)
     calc_pourquoi(D, R)
+    calc_avenir(D, R)
     nbm, nbp = compter_these(G(D, 'acte0.these.texte'))
     if nbm > 80 or not (3 <= nbp <= 4):
         warn('Th\u00e8se : %s mots / %s phrases \u2014 format 3 \u00e0 4 phrases, 80 mots au plus.' % (nbm, nbp))
