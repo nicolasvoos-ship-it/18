@@ -18,8 +18,12 @@ import json, sys, os, re, math, html, copy, hashlib, datetime, statistics as stx
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V22.8"
+VERSION = "V22.9"
 VERSION_DATE = "25/10/2026"
+# V22.9 : rectangle « Initiés » : transactions structurees (inities.transactions), classement calcule par le
+# moteur (ACHAT FORT / VENTES FORTES AU PLUS BAS...), effets : achat fort des inities avec leur propre argent
+# = -1 pt de taux exige et tranches 50/25/25 ; ventes fortes discretionnaires pres du plus bas 52 semaines
+# = +1 pt et tranches en tiers. Controle en echec si les inities ne sont pas verifies.
 # V22.8 : rubrique « le probleme existera-t-il encore ? » (acte0.avenir) : besoin futur + captation de la valeur,
 # synthese et controles de coherence avec Modele 2 et Modele 3 ; aucun point, aucun veto, aucun effet sur le prix.
 # Nom des fichiers sans prefixe « Dossier_ » (retire automatiquement s'il est present).
@@ -176,6 +180,117 @@ DROITS = {'SOLIDES': 0.0, 'STANDARD': 0.0, 'FRAGILES': 2.0,
           'NON DOCUMENTE': 1.0, 'NON DOCUMENT\u00c9': 1.0}
 
 
+# ------------------------------------------------------------------ V22.9 : initiés
+INIT_FORT_PCT = 0.10        # % de la capitalisation, flux net sur 12 mois, achats/ventes de marche
+INIT_MIN_EUR = 250000.0     # plancher absolu pour parler de flux fort
+INIT_CLUSTER = 3            # acheteurs (ou vendeurs) distincts sur 90 jours = mouvement groupe
+INIT_BAS_TIERS = 1 / 3.0    # vente « au plus bas » : prix moyen dans le tiers bas du range 52 semaines
+INIT_NATURES_MARCHE = ('MARCH', 'BOURSE', 'OPEN MARKET')
+
+
+def _nature_marche(n):
+    u = _sans_accent(str(n or '')).upper()
+    return (not u) or any(k in u for k in ('MARCHE', 'BOURSE', 'OPEN MARKET', 'MARKET'))
+
+
+def calc_inities(D, R):
+    """Flux des dirigeants : achats et ventes faits avec leur propre argent, sur le marche.
+    Options exercees, plans, attributions, ventes fiscales : affichees, jamais comptees."""
+    meta = D.get('meta') or {}
+    ini = D.get('inities') or {}
+    txs = ini.get('transactions')
+    ref = _date(meta.get('date_eval')) or datetime.date.today()
+    capm = vv(meta.get('capitalisation_meur'))
+    cours = vv(meta.get('cours'))
+    mom = D.get('momentum') or {}
+    hi, lo = vv(mom.get('plus_haut_52s')), vv(mom.get('plus_bas_52s'))
+    I = {'lab': None, 'lvl': 'gris', 'mod': 0.0, 'lignes': [], 'effet': '', 'source': ini.get('source'),
+         'periode': ini.get('periode') or '12 mois'}
+    R['init'] = I
+    if not isinstance(txs, list):
+        legacy = V(G(D, 'qualite.inities'))['v']
+        I['lab'] = 'NON VÉRIFIÉ'
+        I['legacy'] = legacy
+        warn('Initiés non vérifiés : renseigner inities.transactions (liste vide si aucune transaction trouvée) et inities.source.')
+        chk('Initiés vérifiés (achats et ventes des dirigeants sur 12 mois)', 'échec',
+            'champ inities absent' + (' — ancien badge : %s' % legacy if legacy else ''))
+        return I
+    if not ini.get('source'):
+        warn('Initiés : source non nommée (registre ou publications officielles de l’émetteur).')
+    a12 = v12 = a90 = 0.0
+    acheteurs90, vendeurs90, acheteurs12, vendeurs12 = set(), set(), set(), set()
+    pa_num = pa_den = pv_num = pv_den = 0.0
+    dernier_achat = None
+    for t in txs:
+        if not isinstance(t, (list, tuple)) or len(t) < 6:
+            warn('Transaction d’initié ignorée (format [date, nom, fonction, ACHAT|VENTE, nature, montant_eur, prix]) : %s' % (t,))
+            continue
+        d = _date(t[0]); nom = str(t[1] or '?'); fct = t[2]; sens = _sans_accent(str(t[3] or '')).upper()
+        nature = t[4]; mt = _en_nombre(vv(t[5])) if t[5] is not None else None
+        px = _en_nombre(vv(t[6])) if len(t) > 6 and t[6] is not None else None
+        age = (ref - d).days if d else None
+        marche = _nature_marche(nature)
+        dans12 = age is not None and 0 <= age <= 365
+        compte = marche and dans12 and num(mt)
+        I['lignes'].append({'date': t[0], 'nom': nom, 'fonction': fct, 'sens': 'ACHAT' if 'ACHAT' in sens or 'BUY' in sens else 'VENTE',
+                            'nature': nature or 'marché', 'montant': mt, 'prix': px, 'compte': bool(compte), 'age': age})
+        if not compte:
+            continue
+        if 'ACHAT' in sens or 'BUY' in sens:
+            a12 += mt; acheteurs12.add(nom)
+            if num(px): pa_num += mt; pa_den += mt / px
+            if age <= 90: a90 += mt; acheteurs90.add(nom)
+            if dernier_achat is None or d > dernier_achat: dernier_achat = d
+        else:
+            v12 += mt; vendeurs12.add(nom)
+            if num(px): pv_num += mt; pv_den += mt / px
+            if age <= 90: vendeurs90.add(nom)
+    cap_eur = capm * 1e6 if num(capm) and capm > 0 else None
+    net = a12 - v12
+    I.update({'a12': a12, 'v12': v12, 'a90': a90, 'net': net, 'nb_ach': len(acheteurs12), 'nb_vend': len(vendeurs12),
+              'nb_ach90': len(acheteurs90), 'nb_vend90': len(vendeurs90),
+              'pct_a': 100 * a12 / cap_eur if cap_eur else None, 'pct_v': 100 * v12 / cap_eur if cap_eur else None,
+              'pct_net': 100 * net / cap_eur if cap_eur else None,
+              'px_achat': pa_num / pa_den if pa_den else None, 'px_vente': pv_num / pv_den if pv_den else None,
+              'dernier_achat': dernier_achat.strftime('%d/%m/%Y') if dernier_achat else None,
+              'mois_dernier_achat': (ref - dernier_achat).days / 30.44 if dernier_achat else None})
+    seuil = max(INIT_MIN_EUR, (cap_eur or 0) * INIT_FORT_PCT / 100)
+    achat_fort = (net >= seuil) or (len(acheteurs90) >= INIT_CLUSTER and a90 >= INIT_MIN_EUR and v12 < a12 / 2)
+    vente_forte = (-net >= seuil) or (len(vendeurs90) >= INIT_CLUSTER and v12 >= INIT_MIN_EUR and a12 < v12 / 2)
+    pos = None
+    if num(I['px_vente']) and num(hi) and num(lo) and hi > lo:
+        pos = (I['px_vente'] - lo) / (hi - lo)
+    I['pos_vente'] = pos
+    I['seuil'] = seuil
+    if achat_fort and vente_forte:
+        I['lab'], I['lvl'] = 'SIGNAUX CONTRAIRES', 4
+        I['effet'] = 'achats et ventes forts en même temps : aucun effet'
+    elif achat_fort:
+        I['lab'], I['lvl'], I['mod'] = 'ACHAT FORT DES INITIÉS', 6, -1.0
+        I['effet'] = 'taux exigé −1 pt et tranches 50 / 25 / 25 %'
+    elif vente_forte and num(pos) and pos <= INIT_BAS_TIERS:
+        I['lab'], I['lvl'], I['mod'] = 'VENTES FORTES AU PLUS BAS', 2, 1.0
+        I['effet'] = 'taux exigé +1 pt et tranches en tiers'
+    elif vente_forte:
+        I['lab'], I['lvl'] = 'VENTES FORTES', 3
+        I['effet'] = 'alerte sans effet sur le prix (ventes hors du tiers bas du range 52 semaines%s)' % (
+            '' if num(pos) else ' — plus haut et plus bas 52 semaines non fournis, position non mesurée')
+    elif a12 > 0 and a12 >= v12:
+        I['lab'], I['lvl'] = 'ACHATS LIMITÉS', 5
+        I['effet'] = 'sous le seuil d’un achat fort : aucun effet'
+    elif v12 > 0:
+        I['lab'], I['lvl'] = 'VENTES LIMITÉES', 4
+        I['effet'] = 'sous le seuil de ventes fortes : aucun effet'
+    else:
+        I['lab'], I['lvl'] = 'AUCUNE TRANSACTION', 4
+        I['effet'] = 'aucune transaction de marché trouvée sur 12 mois : aucun effet'
+    if I['mod'] < 0 and num(I.get('mois_dernier_achat')) and I['mois_dernier_achat'] > 6:
+        I['effet'] += ' — dernier achat il y a %s mois : signal qui vieillit' % fr(I['mois_dernier_achat'], 0)
+    chk('Initiés vérifiés (achats et ventes des dirigeants sur 12 mois)', 'validé',
+        '%s · %s' % (I['lab'], ini.get('source') or 'source non nommée'))
+    return I
+
+
 def L_RDT_TX(x, tx):
     """Couleur du rendement RELATIVE au taux exige de la ligne (grille 4 bandes)."""
     if not (num(x) and num(tx)):
@@ -238,6 +353,10 @@ def calc_taux_exige(D, R):
     fiab = (meta.get('fiabilite') or 'B').upper()[:1]
     if fiab == 'C':
         mods.append(('fiabilit\u00e9 C (incertitude mat\u00e9rielle born\u00e9e)', 1.0))
+
+    ini_ = R.get('init') or {}
+    if ini_.get('mod'):
+        mods.append(('initi\u00e9s : %s' % ini_['lab'].lower(), ini_['mod']))
 
     # Cyclicite et levier : PAS de prime de taux (R3) \u2014 deja chiffres dans le scenario
     # baissier, dans les frais financiers (canal 1) et dans le pilier Bilan.
@@ -910,6 +1029,7 @@ def calculer(D):
     decl = str(vv(rent.get('tendance')) or '').upper()
     if R['rentab'].get('tend') and decl in ('STABLE', 'EN HAUSSE', 'EN BAISSE', 'VOLATILE') and decl != R['rentab']['tend']:
         warn('Tendance de rentabilit\u00e9 d\u00e9clar\u00e9e %s, mesur\u00e9e %s : expliquer l\u2019\u00e9cart dans tendance_preuve.' % (decl, R['rentab']['tend']))
+    calc_inities(D, R)
     calc_taux_exige(D, R)
 
     scs = valo.get('scenarios') or {}
@@ -1193,6 +1313,11 @@ def calculer(D):
                    'contrainte': min(lim, key=lambda t: t[1])[0] if lim else None,
                    'provisoire': not num(liq)}
     R['tranches'] = '50 / 25 / 25 %' if (R['momentum'] == 'FAVORABLE' and fiab != 'C' and not pari) else '1/3 \u2013 1/3 \u2013 1/3'
+    _il = (R.get('init') or {}).get('lab')
+    if _il == 'ACHAT FORT DES INITI\u00c9S' and fiab != 'C' and not pari:
+        R['tranches'] = '50 / 25 / 25 %'
+    elif _il == 'VENTES FORTES AU PLUS BAS':
+        R['tranches'] = '1/3 \u2013 1/3 \u2013 1/3'
     R['tranche1'] = 'au prix admissible (≤ prix d’achat) ; exposition au multiple à examiner séparément'
     # V22.7 : quand la regle des -40 % limite le prix, PROCHE = a moins de 5 points de capital preserve du seuil (55/100)
     R['PJ_eff'] = R.get('PJ')
@@ -1554,6 +1679,59 @@ def encadres_qualite(D, R):
 
 
 
+def _meur(x):
+    if not num(x):
+        return 'n.d.'
+    return ('%s M€' % fr(x / 1e6, 1)) if abs(x) >= 1e6 else ('%s k€' % fr(x / 1e3, 0))
+
+
+def inities_html(D, R):
+    """V22.9 : rectangle dedie aux inities (flux de marche, argent propre)."""
+    I = R.get('init') or {}
+    lab = I.get('lab') or 'NON VÉRIFIÉ'
+    lvl = I.get('lvl', 'gris')
+    bord = {6: 'var(--l5)', 5: 'var(--l5)', 4: 'var(--l4)', 3: 'var(--l3)', 2: 'var(--l2)', 1: 'var(--l1)'}.get(lvl, 'var(--gris)')
+    cours = vv((D.get('meta') or {}).get('cours'))
+    o = ['<div class="c" style="border:2px solid %s"><h3>\U0001f454 Initiés — ce que les dirigeants font de leur propre argent</h3>' % bord]
+    o.append('<div>%s</div>' % bdg(lab, lvl, 'gros'))
+    if lab == 'NON VÉRIFIÉ':
+        o.append('<p class="sub">Transactions des dirigeants non vérifiées dans ce dossier%s. '
+                 'Le contrôle est en échec : relancer avec inities.transactions.</p></div>' % (
+                     (' (ancien badge : %s)' % esc(I.get('legacy'))) if I.get('legacy') else ''))
+        return ''.join(o)
+    pxa, pxv = I.get('px_achat'), I.get('px_vente')
+    comp = ''
+    if num(pxa) and num(cours):
+        e = 100 * (cours / pxa - 1)
+        comp = 'cours %s %s %% vs leur prix moyen' % (fprix(cours), fr(e, 0, True))
+    o.append('<div class="grid g4" style="margin-top:16px">')
+    o.append(carte('Achats de marché · 12 mois', _meur(I.get('a12')), 5 if I.get('a12') else 'gris',
+                   '%s %% de la capitalisation · %s acheteur(s)' % (fr(I.get('pct_a'), 2), I.get('nb_ach', 0))))
+    o.append(carte('Ventes de marché · 12 mois', _meur(I.get('v12')), 2 if I.get('v12') else 'gris',
+                   '%s %% de la capitalisation · %s vendeur(s)' % (fr(I.get('pct_v'), 2), I.get('nb_vend', 0))))
+    o.append(carte('Prix moyen payé par les initiés', fprix(pxa) if num(pxa) else 'n.d.', 5 if num(pxa) else 'gris', comp or '—'))
+    o.append(carte('Dernier achat', esc(I.get('dernier_achat') or 'aucun'), 5 if I.get('dernier_achat') else 'gris',
+                   ('il y a %s mois' % fr(I.get('mois_dernier_achat'), 0)) if num(I.get('mois_dernier_achat')) else '—'))
+    o.append('</div>')
+    o.append('<p style="margin-top:6px"><b>Effet dans le moteur :</b> %s.</p>' % esc(I.get('effet')))
+    if num(pxv):
+        o.append('<p class="sub">Prix moyen des ventes : %s%s.</p>' % (fprix(pxv), (
+            ' — %s %% du range 52 semaines' % fr(100 * I['pos_vente'], 0)) if num(I.get('pos_vente')) else ''))
+    if I.get('lignes'):
+        rows = ''.join('<tr><td>%s</td><td>%s<div class="sub" style="margin:0">%s</div></td><td class="t%s">%s</td><td>%s</td>'
+                       '<td class="n">%s</td><td class="n">%s</td></tr>' % (
+            esc(l['date']), esc(l['nom']), esc(l['fonction'] or ''), 5 if l['sens'] == 'ACHAT' else 2, l['sens'],
+            esc(l['nature']) + ('' if l['compte'] else ' · non comptée'), _meur(l['montant']), fprix(l['prix']) if num(l['prix']) else 'n.d.')
+            for l in sorted(I['lignes'], key=lambda l: l['age'] if l['age'] is not None else 9e9))
+        o.append('<details open><summary>Transactions retenues</summary><div class="scroll"><table>'
+                 '<tr><th>Date</th><th>Qui</th><th>Sens</th><th>Nature</th><th class="n">Montant</th><th class="n">Prix</th></tr>%s</table></div></details>' % rows)
+    o.append('<div class="sub">Seuil d’un flux fort : %s nets sur 12 mois (0,10 %% de la capitalisation, 250 k€ au moins), '
+             'ou au moins 3 dirigeants dans le même sens en 90 jours. Seuls les achats et ventes de marché comptent : '
+             'options, plans, attributions et ventes fiscales sont affichés sans être comptés. Source : %s.</div></div>' % (
+                 _meur(I.get('seuil')), esc(I.get('source') or 'non nommée')))
+    return ''.join(o)
+
+
 def plancher_html(R):
     """V22.7 : bloc « Ce qu'il te reste si tu t'es trompé »."""
     if not R.get('calc'):
@@ -1683,6 +1861,7 @@ def rendu(D, R):
     A(carte('Capital pr\u00e9serv\u00e9 / 100 \u20ac', fr(R.get('cap_cours'), 0), R.get('niv_cap', 'gris'),
             'baissier \u00e0 4 ans, au cours \u2014 sc\u00e9nario mod\u00e9lis\u00e9'))
     A('</div>')
+    A(inities_html(D, R))
 
     mr = ''.join('<tr><td>%s</td><td class="n t%s">%s pt</td></tr>' % (
         esc(lab), 5 if d < 0 else 3, fr(d, 1, True)) for lab, d in (R.get('tx_mods') or []))
@@ -1831,8 +2010,8 @@ def rendu(D, R):
       '<div class="c"><h3>Direction, initi\u00e9s et alignement</h3><p>%s</p><div>%s %s %s</div><div class="sub">%s</div></div></div>' % (
           esc(G(D, 'qualite.moat')), bdg(pp['v'] or 'IND\u00c9TERMIN\u00c9', L_LAB('prix', pp['v'])),
           esc(G(D, 'qualite.direction_txt')),
-          bdg('Initi\u00e9s : %s' % (V(G(D, 'qualite.inities'))['v'] or 'INFORMATION INDISPONIBLE'),
-              L_LAB('inities', V(G(D, 'qualite.inities'))['v'])),
+          bdg('Initi\u00e9s : %s' % ((R.get('init') or {}).get('lab') or 'NON V\u00c9RIFI\u00c9'),
+              (R.get('init') or {}).get('lvl', 'gris')),
           bdg(V(G(D, 'gouvernance.actionnariat'))['v'] or 'NON DOCUMENT\u00c9',
               L_LAB('actionnariat', V(G(D, 'gouvernance.actionnariat'))['v'])),
           bdg('KPI : %s' % (V(G(D, 'gouvernance.kpi'))['v'] or 'NON PUBLI\u00c9'),
@@ -2201,10 +2380,15 @@ def resume(D, R):
                                                                v.get('suivi_date') or 'n.d.', R.get('priorite') or 'n.d.')]
     L.insert(2, 'Portes : ' + portes_txt(R))
     avr = R.get('avenir') or {}
-    L.insert(3, '\U0001f52e Avenir : besoin %s \u00b7 valeur %s \u2192 %s' % (
+    _I = R.get('init') or {}
+    L.insert(3, '\U0001f454 Initi\u00e9s : %s%s' % (_I.get('lab') or 'NON V\u00c9RIFI\u00c9', (
+        ' \u2014 achats 12 mois %s (%s %% de la capi., %s acheteur(s)) \u00b7 ventes %s \u00b7 %s' % (
+            _meur(_I.get('a12')), fr(_I.get('pct_a'), 2), _I.get('nb_ach', 0), _meur(_I.get('v12')), _I.get('effet')))
+        if 'a12' in _I else ''))
+    L.insert(4, '\U0001f52e Avenir : besoin %s \u00b7 valeur %s \u2192 %s' % (
         avr.get('ex', 'n.d.'), avr.get('ca', 'n.d.'), avr.get('synth', 'NON DOCUMENT\u00c9')))
     if R.get('calc'):
-        L.insert(5, 'Plancher : capital pr\u00e9serv\u00e9 %s/100 au cours, %s au prix d\'achat \u00b7 prix plancher \u221240 %% %s%s \u00b7 baissier %s%s%s' % (
+        L.insert(6, 'Plancher : capital pr\u00e9serv\u00e9 %s/100 au cours, %s au prix d\'achat \u00b7 prix plancher \u221240 %% %s%s \u00b7 baissier %s%s%s' % (
             fr(R.get('cap_cours'), 0), fr(R.get('cap_PA'), 0), fprix(R.get('P60')),
             ' (limite le prix d\'achat)' if R.get('plancher_limite') else '',
             (R.get('baissier') or {}).get('lab', 'n.d.'),
