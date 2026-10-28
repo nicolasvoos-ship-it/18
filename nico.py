@@ -18,8 +18,12 @@ import json, sys, os, re, math, html, copy, hashlib, datetime, statistics as stx
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V22.9"
-VERSION_DATE = "25/10/2026"
+VERSION = "V22.9.1"
+VERSION_DATE = "28/10/2026"
+# V22.9.1 : correctif de la tendance de rentabilite. Une serie qui monte chaque annee (aucun recul de plus
+# d'1 pt) est EN HAUSSE meme si elle accelere ; sa stabilite se mesure alors par la plus forte baisse annuelle.
+# Badge « EN ASCENSION » (meme niveau 4 que IRREGULIERE) quand seules les premieres annees sont sous le cout du
+# capital. Aucun point, poids, seuil ni plafond modifie.
 # V22.9 : rectangle « Initiés » : transactions structurees (inities.transactions), classement calcule par le
 # moteur (ACHAT FORT / VENTES FORTES AU PLUS BAS...), effets : achat fort des inities avec leur propre argent
 # = -1 pt de taux exige et tranches 50/25/25 ; ventes fortes discretionnaires pres du plus bas 52 semaines
@@ -437,8 +441,10 @@ def roic_badge(serie, wacc):
     if n >= 4:
         qs = stx.quantiles(vals, n=4, method='inclusive')
         out['iqr'] = qs[2] - qs[0]
-    out['tend'], out['pente'], out['iqr_res'] = tendance_roic(vals)
+    out['tend'], out['pente'], out['iqr_res'], out['chute_max'] = tendance_roic(vals)
     out['iqr_eff'] = out['iqr_res'] if out['tend'] == 'EN HAUSSE' else out['iqr']
+    if out['tend'] == 'EN HAUSSE' and num(out['iqr_res']) and out['iqr_res'] > 5:
+        out['iqr_eff'] = out['chute_max']  # V22.9.1 : hausse monotone qui accelere
     if n < 3:
         return dict(out, lab='HISTORIQUE INSUFFISANT', lvl='gris')
     if not num(wacc):
@@ -454,6 +460,10 @@ def roic_badge(serie, wacc):
         lab, l = 'FRAGILE', 3
     elif ab < n or iqr > 5:
         lab, l = 'IRR\u00c9GULI\u00c8RE', 4
+        i0 = next((i for i, v in enumerate(vals) if v > wacc), None)
+        if (out['tend'] == 'EN HAUSSE' and iqr <= 5 and i0 is not None
+                and all(v > wacc for v in vals[i0:])):
+            lab = 'EN ASCENSION'  # V22.9.1 : seules les premieres annees sont sous le cout du capital
     elif n < 5:
         lab, l = 'HISTORIQUE COURT', 4
     elif out['min'] >= wacc + 3 and out['med'] >= wacc + 8:
@@ -478,7 +488,7 @@ def tendance_roic(vals):
     des residus. Une progression reguliere n'est pas une instabilite (V22.5)."""
     n = len(vals)
     if n < 4:
-        return None, None, None
+        return None, None, None, None
     mx, my = (n - 1) / 2.0, sum(vals) / n
     pente = sum((i - mx) * (v - my) for i, v in enumerate(vals)) / sum((i - mx) ** 2 for i in range(n))
     res = [v - (my + pente * (i - mx)) for i, v in enumerate(vals)]
@@ -486,7 +496,9 @@ def tendance_roic(vals):
     iqr_res = qs[2] - qs[0]
     iqr = stx.quantiles(vals, n=4, method='inclusive')
     iqr = iqr[2] - iqr[0]
-    if pente >= 1 and vals[-1] >= vals[0] + 2 and iqr_res <= 5:
+    chute_max = max([0] + [vals[i - 1] - vals[i] for i in range(1, n)])
+    monotone = chute_max <= 1  # V22.9.1 : aucun recul annuel de plus d'1 pt
+    if pente >= 1 and vals[-1] >= vals[0] + 2 and (iqr_res <= 5 or monotone):
         t = 'EN HAUSSE'
     elif pente <= -1 and vals[-1] <= vals[0] - 2:
         t = 'EN BAISSE'
@@ -494,7 +506,7 @@ def tendance_roic(vals):
         t = 'STABLE'
     else:
         t = 'VOLATILE'
-    return t, pente, iqr_res
+    return t, pente, iqr_res, chute_max
 
 
 def completer_rentab(rb, rent):
