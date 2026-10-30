@@ -18,8 +18,32 @@ import json, sys, os, re, math, html, copy, hashlib, datetime, statistics as stx
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V22.9.1"
-VERSION_DATE = "28/10/2026"
+VERSION = "V23.4"
+VERSION_DATE = "30/10/2026"
+# V23.4 : 3e contre-expertise : est_financier = marqueur de metrique OU profil.financier = true (false ne peut plus
+# annuler la metrique, contradiction signalee) ; en methode operationnelle, le pont par les actions ne vaut que si
+# l'equivalence resultat net / NOPAT est documentee (triangle.equivalence_nopat), sinon COMPARAISON NON DOCUMENTEE.
+# ATTENTION (depuis V23.3) : la qualification financiere explicite s'applique aussi au test de solvabilite du baissier ;
+# pour une societe dont le secteur contenait « financ » sans etre banque/assureur, la credibilite du baissier peut changer
+# et, par les regles existantes, le bonus de plancher, le taux exige, les prix et la taille. Recalculer ces dossiers.
+# V23.3 : 2e contre-expertise : jamais de ROE comme rendement operationnel ; croissance theorique comparee a une
+# croissance de meme nature (NOPAT ou resultat net) via un pont documente, sinon COMPARAISON NON DOCUMENTEE ;
+# nouveaux champs numeriques normalises ; PER total non calculable = n.d. (plus de repli silencieux) ; financiere
+# = qualification explicite (metrique SECTEUR FINANCIER ou profil.financier), plus de detection par « financ » ;
+# serie de creation de valeur malformee = historique absent.
+# V23.2 : corrections issues de la contre-expertise ChatGPT du 30/10/2026 : Sloan jamais converti d'office ; forensique
+# et spread adaptes au secteur financier, avec couverture affichee ; creation de valeur classee sur le spread ACTUEL ;
+# triangle : methode operationnelle (ROIC x reinvestissement net/NOPAT) ou fonds propres (ROE x retention) declaree,
+# rendement marginal prefere a la mediane, badges COMPATIBLE / A FINANCER / NON APPLICABLE, autofinancement non
+# mesure = qualite non verte, PER total dans le PEGY, cas limites ; nombres non finis et listes vides rejetes.
+# V23.1 : triangle recale sur l'equilibre (PER <= croissance + rendement du dividende, PEGY) ; encadre Marge brute
+# et bloc Robustesse du rendement retires de l'affichage ; rectangle Inities place sous Direction. Aucun calcul de prix modifie.
+# V23 : trois blocs de LECTURE, aucun seuil, poids, veto ni prix modifie (R3).
+#  (A) Fiche de tri (profil) : badges moat / recurrence / cycle, ratio de Sloan, ethique et part de l'Etat.
+#      Ethique contraire ou Etat > 50 % = RED FLAG affiche dans le verdict, jamais un blocage : Nico tranche.
+#  (B) Creation de valeur : economic spread (actuel, moyenne 5 ans, pire sur 10 ans), marge EVA, EVA momentum.
+#  (C) Triangle 15/15/15 (ROIC, croissance centrale, PER/PEG) + controle de croissance autofinancee
+#      (ROIC x part reinvestie contre croissance centrale). Alerte seulement.
 # V22.9.1 : correctif de la tendance de rentabilite. Une serie qui monte chaque annee (aucun recul de plus
 # d'1 pt) est EN HAUSSE meme si elle accelere ; sa stabilite se mesure alors par la plus forte baisse annuelle.
 # Badge « EN ASCENSION » (meme niveau 4 que IRREGULIERE) quand seules les premieres annees sont sous le cout du
@@ -74,7 +98,7 @@ def G(d, path, default=None):
 
 
 def num(x):
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and not (isinstance(x, float) and math.isnan(x))
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)  # V23.2 : infinis rejetes
 
 
 def fr(x, d=1, signe=False):
@@ -159,6 +183,13 @@ FAM = {
     'momentum': {'FAVORABLE': 5, 'D\u00c9FAVORABLE': 3, 'MIXTE': 4, 'IND\u00c9TERMIN\u00c9': 'gris'},
     'mult_exige': {'COMPATIBLE': 5, 'EXIGEANT': 3, 'NON \u00c9TAY\u00c9': 2},
     'resilience': {'ROBUSTE': 5, 'PARI DE R\u00c9GIME': 3, 'SENSIBLE': 4, 'PEU SENSIBLE': 4, 'NON \u00c9VALU\u00c9': 'gris'},
+    # V23 : fiche de tri
+    'moat': {'LARGE': 5, '\u00c9TROIT': 4, 'ETROIT': 4, 'AUCUN': 2, 'IND\u00c9TERMIN\u00c9': 'gris', 'NON DOCUMENT\u00c9': 'gris'},
+    'recurrence': {'R\u00c9CURRENT': 5, 'RECURRENT': 5, 'SEMI-R\u00c9CURRENT': 4, 'SEMI-RECURRENT': 4,
+                   'PONCTUEL': 3, 'IND\u00c9TERMIN\u00c9': 'gris', 'NON DOCUMENT\u00c9': 'gris'},
+    'cycle': {'NON CYCLIQUE': 5, 'BAS DE CYCLE': 4, 'MILIEU DE CYCLE': 4, 'HAUT DE CYCLE': 2,
+              'IND\u00c9TERMIN\u00c9': 'gris', 'NON DOCUMENT\u00c9': 'gris'},
+    'ethique': {'CONFORME': 5, '\u00c0 TRANCHER': 3, 'A TRANCHER': 3, 'CONTRAIRE': 1, 'NON DOCUMENT\u00c9': 'gris'},
 }
 
 
@@ -707,7 +738,13 @@ CHAMPS_NUM_VV = ['meta.cours', 'meta.capitalisation_meur', 'valo.base_normalisee
                  'rentabilite.wacc', 'plancher.tresorerie_nette_meur',
                  'valo.tresorerie_nette_action', 'valo.produit_financier_action',
                  'risques.forensique.z_altman', 'risques.forensique.o_ohlson_pct',
-                 'risques.forensique.m_beneish', 'risques.forensique.f_piotroski']  # lus via vv() : seule la valeur interne est controlee
+                 'risques.forensique.m_beneish', 'risques.forensique.f_piotroski',
+                 # V23
+                 'risques.forensique.sloan', 'profil.etat_pct',
+                 'creation_valeur.spread', 'creation_valeur.spread_5a', 'creation_valeur.spread_pire_10a',
+                 'creation_valeur.eva_marge', 'creation_valeur.eva_momentum',
+                 'triangle.reinvestissement', 'triangle.rendement_marginal', 'triangle.roe',
+                 'triangle.variation_actions', 'triangle.croissance_comparable']  # lus via vv() : seule la valeur interne est controlee
 CHAMPS_TXT = ['meta.fiabilite', 'valo.clause', 'taux_exige.motif']
 
 
@@ -721,7 +758,10 @@ def _en_nombre(x):
         t = x.strip().replace('\u00a0', '').replace(' ', '').replace('%', '').replace(',', '.')
         if t in ('', 'n.d.', 'nd', 'null', 'None'):
             return None
-        return float(t)
+        v = float(t)
+        if not math.isfinite(v):
+            raise ValueError(x)  # V23.2 : 'inf' ou 'nan' illisibles
+        return v
     raise ValueError(x)
 
 
@@ -745,6 +785,10 @@ def normaliser_entrees(D):
         if parent is None:
             return
         brut = parent[cle]
+        if isinstance(brut, list) and not brut:  # V23.2 : liste vide = n.d., jamais un plantage
+            parent[cle] = None
+            notes.append('%s : liste vide \u2014 n.d.' % path)
+            return
         val = brut
         if isinstance(brut, dict) and 'v' in brut:
             val = brut.get('v')
@@ -875,11 +919,11 @@ def eval_baissier(D, R, scs):
     CREDIBLE = ancre sur un fait, nettement sous le central, solvabilite mesuree et saine, pas d'alerte comptable.
     DOUTEUX = un test echoue. NON VERIFIE = rien d'anormal mais mesure de solvabilite absente."""
     Bs, Cc = scs.get('baissier') or {}, scs.get('central') or {}
-    fo = G(D, 'risques.forensique') or {}
+    fo = G(D, 'risques.forensique')
+    fo = fo if isinstance(fo, dict) else {}  # V23.2 : champ malforme = n.d., jamais un plantage
     z, o = vv(fo.get('z_altman')), vv(fo.get('o_ohlson_pct'))
     m, f = vv(fo.get('m_beneish')), vv(fo.get('f_piotroski'))
-    sect = _sans_accent((D.get('meta') or {}).get('secteur'))
-    financier = any(k in sect for k in ('banque', 'bank', 'assur', 'insur', 'financ'))
+    financier = est_financier(D)  # V23.3 : qualification explicite, plus de detection par le nom du secteur
     tests = []  # (libelle, etat True/False/None, detail)
     anc = Bs.get('ancrage')
     lab = str((anc[0] if isinstance(anc, list) and anc else anc) or '').strip().upper()
@@ -1580,6 +1624,7 @@ background:var(--gris);white-space:nowrap;font-family:ui-monospace,SFMono-Regula
 .b.l2{background:var(--l2)}.b.l1{background:var(--l1);color:#fff}
 .b.lgris{background:var(--gris)}.b.ldoc{background:transparent;color:var(--l3);border:1px solid var(--l3)}
 .b.gros{font-size:16px;padding:7px 17px}
+.b.wrap{white-space:normal;text-align:left}
 .t6,.t5{color:var(--l5)}.t4{color:var(--l4)}.t3{color:var(--l3)}.t2{color:var(--l2)}.t1{color:var(--l1)}
 .tgris,.tdoc{color:var(--gris)}
 table{width:100%;border-collapse:collapse;font-size:16px;font-variant-numeric:tabular-nums}
@@ -1679,14 +1724,7 @@ def encadres_qualite(D, R):
     a = '<section class="c capital-box"><h3>La machine à créer du profit</h3><p class="sub">Chaque euro supplémentaire investi crée-t-il suffisamment de profit après impôt, et combien peut-on encore investir ainsi ?</p><table>'
     a += ''.join('<tr><th>%s</th><td>%s</td></tr>' % (esc(k), v) for k, v in rows)
     a += '</table><details><summary>Historique du ROIC et sources</summary>' + qual_serie(rent.get('roic')) + qual_texte(rent.get('source')) + '</details><p class="sub">ROIC après impôt ; AT ROCE comparable seulement à définition cohérente. Rentabilité économique ≠ rendement boursier.</p></section>'
-    a += '<section class="c margin-box"><h3>Marge brute — maîtrise de son environnement</h3>'
-    a += qual_badge(mg.get('tendance')) + '<p class="sub">La marge est un indice de pouvoir de prix, pas une preuve suffisante de domination.</p>'
-    a += qual_serie(mg.get('serie'))
-    a += '<table>' + ''.join('<tr><th>%s</th><td>%s</td></tr>' % (label, qual_texte(mg.get(key))) for label, key in [
-        ('Définition et comparabilité', 'definition'), ('Prix, coûts, volumes et mix', 'explication'),
-        ('Pouvoir de prix : preuves et limites', 'pouvoir_prix_preuve'),
-        ('Position concurrentielle', 'conclusion'), ('À surveiller', 'surveillance')]) + '</table>'
-    a += '<p class="sub">Une baisse modérée appelle une explication, sans veto automatique. Aucun score supplémentaire ; faits rattachés aux piliers existants.</p></section>'
+    # V23.1 : encadre Marge brute retire du dossier (demande de Nico, 30/10/2026) ; le champ reste lu si present, sans affichage.
     return a
 
 
@@ -1849,6 +1887,7 @@ def rendu(D, R):
           bdg(v.get('suivi', 'n.d.'), L_LAB('suivi', v.get('suivi')), 'gros'),
           esc(v.get('phrase')), esc(v.get('cause')),
           ' \u00b7 ' + esc(v.get('cause2')) if v.get('cause2') else ''))
+    A(flags_html(R))  # V23 : red flags ethique / Etat / forensique, sans blocage
     A('<div class="c"><h3>Les portes de l\u2019achat</h3><div>%s</div><div class="sub">Il faut tout en vert pour acheter ; '
       '\u26aa = non \u00e9valu\u00e9.</div></div>' % ' '.join(
           bdg(('\u2705 ' if e else '\u26aa ' if e is None else '\u274c ') + n, 5 if e else 'gris' if e is None else 2)
@@ -1873,7 +1912,6 @@ def rendu(D, R):
     A(carte('Capital pr\u00e9serv\u00e9 / 100 \u20ac', fr(R.get('cap_cours'), 0), R.get('niv_cap', 'gris'),
             'baissier \u00e0 4 ans, au cours \u2014 sc\u00e9nario mod\u00e9lis\u00e9'))
     A('</div>')
-    A(inities_html(D, R))
 
     mr = ''.join('<tr><td>%s</td><td class="n t%s">%s pt</td></tr>' % (
         esc(lab), 5 if d < 0 else 3, fr(d, 1, True)) for lab, d in (R.get('tx_mods') or []))
@@ -1933,6 +1971,7 @@ def rendu(D, R):
     else:
         A('<div class="c"><h3>\U0001f52e Le problème existera-t-il encore ?</h3><div>%s</div>'
           '<div class="sub">Rubrique non renseignée dans ce dossier.</div></div>' % bdg('NON DOCUMENTÉ', 'gris'))
+    A(profil_html(D, R))  # V23 : fiche de tri
 
     # -- bande compacte
     sec = D.get('secteur') or {}
@@ -2017,6 +2056,7 @@ def rendu(D, R):
           esc(G(D, 'rentabilite.definition'))))
 
     A(encadres_qualite(D, R))
+    A(valeur_html(R))  # V23 : creation de valeur
 
     A('<div class="grid g2"><div class="c"><h3>Moat et pouvoir de prix</h3><p>%s</p><div>%s</div></div>'
       '<div class="c"><h3>Direction, initi\u00e9s et alignement</h3><p>%s</p><div>%s %s %s</div><div class="sub">%s</div></div></div>' % (
@@ -2029,6 +2069,7 @@ def rendu(D, R):
           bdg('KPI : %s' % (V(G(D, 'gouvernance.kpi'))['v'] or 'NON PUBLI\u00c9'),
               L_LAB('kpi', V(G(D, 'gouvernance.kpi'))['v'])),
           esc(G(D, 'gouvernance.synthese'))))
+    A(inities_html(D, R))  # V23.1 : rectangle des initiés juste sous « Direction, initiés et alignement »
 
     tb = G(D, 'croissance.tableau') or {}
     if tb.get('annees'):
@@ -2047,6 +2088,7 @@ def rendu(D, R):
 
     # ---------------- bloc 3
     A('<h2>\u00c0 quel prix cela devient int\u00e9ressant</h2>')
+    A(triangle_html(R))  # V23 : triangle 15/15/15
     tol = R.get('tolerance')
     A('<div class="grid g3">%s%s%s</div>' % (
         carte('Rendement au cours du jour', '%s %%/an' % fr(R.get('retenu'), 1), R.get('niv_retenu', 'gris'),
@@ -2095,25 +2137,17 @@ def rendu(D, R):
                   '<td class="n t%s">%s %%/an</td></tr><tr class="scn"><td colspan="6">%s</td></tr>') % (
                      nom.capitalize(), fr(100 * sc.get('poids', POIDS_DEF[nom]), 0), fr(sc['bpa'][3], 2),
                      fr(sc['multiple'], 1), fprix(pt), L_RDT(t_) if L_RDT(t_) != 'gris' else 'gris', fr(t_, 1), esc(sc.get('txt', '')))
-    hz = R.get('horizons') or {}
-    hrows = ''.join('<tr><td>%s ans</td><td class="n">%s %%</td><td class="n">%s %%</td></tr>' % (
-        fr(h, 1), fr(hz[h]['avec'], 1), fr(hz[h]['sans'], 1)) for h in sorted(hz))
-    dc = R.get('decomp') or {}
     A('<div class="c"><h3>Trois sc\u00e9narios \u00e0 quatre ans</h3><div class="scroll"><table class="sc">'
       '<tr><th>Sc\u00e9nario</th><th class="n">Poids</th><th class="n">BPA an 4</th><th class="n">Multiple</th>'
       '<th class="n">Valeur \u00e0 4 ans</th><th class="n">TRI</th></tr>%s</table></div>'
-      '<div class="sub">Base publi\u00e9e %s \u2192 base normalis\u00e9e %s \u00b7 %s</div></div>' % (
-          srows, fr(vv(valo.get('base_publiee')), 2), fr(vv(valo.get('base_normalisee')), 2), esc(valo.get('effet'))))
-    A('<div class="c"><h3>Robustesse du rendement</h3><div class="scroll"><table>'
-      '<tr><th>Horizon</th><th class="n">avec revalorisation</th><th class="n">sans</th></tr>%s</table></div>'
-      '<div class="sub">D\u00e9composition du TRI central : op\u00e9rations %s %% \u00b7 dividendes %s pts \u00b7 multiple %s pts</div>'
-      '<div style="margin-top:8px">%s %s</div>'
-      '<div class="sub">Croissance exig\u00e9e pour %s %%/an nets : %s %%/an (inversion m\u00e9canique, seuil indicatif) \u00b7 multiple exig\u00e9 par le cours : %s\u00d7</div>'
-      '<div class="sub">Seconde m\u00e9thode : %s</div></div>' % (
-          hrows, fr(dc.get('A'), 1), fr(dc.get('div'), 1), fr(dc.get('mult'), 1),
-          bdg('Part du multiple %s %%' % fr(R.get('part_mult'), 0), R.get('niv_part', 'gris')),
+      '<div class="sub">Base publi\u00e9e %s \u2192 base normalis\u00e9e %s \u00b7 %s</div>'
+      '<div style="margin-top:10px">%s %s</div>'
+      '<div class="sub">Multiple exig\u00e9 par le cours pour %s %%/an nets : %s\u00d7 (\u00e0 comparer au multiple central) \u00b7 seconde m\u00e9thode : %s</div></div>' % (
+          srows, fr(vv(valo.get('base_publiee')), 2), fr(vv(valo.get('base_normalisee')), 2), esc(valo.get('effet')),
           bdg('Multiple exig\u00e9 : %s' % R.get('mult_exige_lab', 'n.d.'), L_LAB('mult_exige', R.get('mult_exige_lab'))),
-          fr(R.get('tx'), 1), fr(R.get('g_exigee'), 1), fr(R.get('mult_exige'), 1), esc(valo.get('seconde_methode'))))
+          bdg('Part du multiple %s %%' % fr(R.get('part_mult'), 0), R.get('niv_part', 'gris')),
+          fr(R.get('tx'), 1), fr(R.get('mult_exige'), 1), esc(valo.get('seconde_methode') or 'n.d.')))
+    # V23.1 : bloc « Robustesse du rendement » retire (demande de Nico, 30/10/2026) ; calculs conserves dans le moteur.
 
     # ---------------- bloc 4
     A('<h2>Combien en acheter, et quoi surveiller</h2>')
@@ -2163,6 +2197,549 @@ def rendu(D, R):
     A('<script type="application/json" id="nico-source" data-version="%s">%s</script>' % (VERSION, src))
     A('</div></body></html>')
     return ''.join(out)
+
+
+# ------------------------------------------------------------------ V23 : fiche de tri, creation de valeur, triangle
+# Trois blocs de LECTURE. Aucun point dans Q, aucun veto, aucun effet sur le taux exige, le prix ou la taille (R3).
+L_SPREAD2 = lambda x: cut(x, [0, 2, 4, 8], [2, 3, 4, 5, 6])      # economic spread, pts
+L_EVAM = lambda x: cut(x, [0, 5, 10], [2, 3, 4, 5])               # marge EVA, % du CA
+L_EVAMO = lambda x: cut(x, [-1, 0, 1], [2, 3, 4, 5])              # EVA momentum, % du CA precedent
+SLOAN_MAX, BENEISH_MAX, ALTMAN_MIN, PIOTROSKI_MAX = 0.10, -1.78, 1.81, 3
+
+
+def est_financier(D):
+    """V23.3 : banque ou assureur par qualification EXPLICITE : metrique de rentabilite « (SECTEUR FINANCIER) »
+    ou profil.financier = true. Servir des clients financiers ou fournir des terminaux de paiement ne suffit pas."""
+    pf = (D.get('profil') or {}) if isinstance(D.get('profil'), dict) else {}
+    lab = str(vv((D.get('rentabilite') or {}).get('metrique') if isinstance(D.get('rentabilite'), dict) else '') or '').upper()
+    marqueur = 'SECTEUR FINANCIER' in lab
+    decl = pf.get('financier')
+    if decl is False and marqueur:  # V23.4 : un false ne peut pas annuler la qualification par la metrique
+        warn('Qualification financière contradictoire : profil.financier = false mais métrique « %s » \u2014 traitée comme financière.' % lab)
+    if decl is True and not marqueur:
+        warn('profil.financier = true mais métrique de rentabilité non financière (%s) : aligner la métrique (ROE / ROTE (SECTEUR FINANCIER)).'
+             % (lab or 'n.d.'))
+    return decl is True or marqueur
+
+
+def _badge2(x):
+    y = (list(x) + ['', ''])[:2] if isinstance(x, list) else [x or '', '']
+    return str(y[0] or '').strip(), str(y[1] or '').strip()
+
+
+def _note_ctrl(D, pilier, i):
+    cs = G(D, 'qualite.controles.' + pilier) or []
+    try:
+        c = cs[i]
+        c = c[0] if isinstance(c, list) else c
+        return float(c) if num(c) else None
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def calc_profil(D, R):
+    """(A) Fiche de tri : les criteres du tri 10 par 10, visibles dans le dossier complet.
+    Ethique contraire et Etat > 50 % = red flags affiches, jamais un blocage (decision de Nico, 30/10/2026)."""
+    pr = D.get('profil') if isinstance(D.get('profil'), dict) else {}
+    out = {'doc': bool(pr)}
+    for k in ('moat', 'recurrence', 'cycle', 'ethique'):
+        lab, txt = _badge2(pr.get(k))
+        out[k] = {'lab': lab.upper() if lab else 'NON DOCUMENTÉ', 'txt': txt,
+                  'lvl': L_LAB(k, lab) if lab else 'gris', 'cle': _cle(lab, k) if lab else None}
+    etat = vv(pr.get('etat_pct'))
+    out['etat'] = etat
+    out['etat_lvl'] = 'gris' if not num(etat) else (5 if etat <= 10 else 3 if etat <= 50 else 1)
+    out['etat_txt'] = V(pr.get('etat_pct'))['src'] or V(pr.get('etat_pct'))['note'] or ''
+    # forensique : drapeaux du tri (Sloan ajoute), aucune incidence sur la credibilite du baissier
+    fo = G(D, 'risques.forensique')
+    fo = fo if isinstance(fo, dict) else {}  # V23.2 : champ malforme = n.d.
+    z, m, f, s = (vv(fo.get(k)) for k in ('z_altman', 'm_beneish', 'f_piotroski', 'sloan'))
+    if num(s) and abs(s) > 1.5:  # V23.2 : jamais de conversion deduite de la grandeur
+        warn('Ratio de Sloan %s : valeur ambiguë (le contrat attend un décimal, 0,10 et non 10) — vérifier l\u2019unité ; '
+             'aucune conversion automatique.' % fr(s, 2))
+    financier = est_financier(D)  # V23.3 : qualification explicite, plus de detection par le nom du secteur
+    # applicabilite : Altman, Beneish et Sloan ne sont pas concus pour les banques et assureurs
+    indic = [('Altman Z', z, (lambda v: v < ALTMAN_MIN), '%s < 1,81', 2, not financier),
+             ('Beneish M', m, (lambda v: v > BENEISH_MAX), '%s > \u22121,78', 2, not financier),
+             ('Sloan', s, (lambda v: v > SLOAN_MAX), '%s > 0,10', 2, not financier),
+             ('Piotroski', f, (lambda v: v <= PIOTROSKI_MAX), '%s/9 \u2264 3', 0, True)]
+    alertes, mesures, absents, exclus = [], 0, [], []
+    for nom, v, test, fmt, d, applicable in indic:
+        if not applicable:
+            exclus.append(nom)
+        elif not num(v):
+            absents.append(nom)
+        else:
+            mesures += 1
+            if test(v):
+                alertes.append('%s %s' % (nom, fmt % fr(v, d)))
+    out['forensique'] = {'z': z, 'm': m, 'f': f, 'sloan': s, 'alertes': alertes, 'mesures': mesures,
+                         'absents': absents, 'exclus': exclus, 'financier': financier}
+    if len(alertes) >= 2:
+        warn('Double alerte forensique (%s) : investigation requise. Dans le tri 10 par 10, ta règle la plafonne en liste 4 ; '
+             'aucun effet automatique dans le moteur.' % ' ; '.join(alertes))
+    # red flags : signal seulement
+    flags = []
+    e = out['ethique']
+    if e['cle'] == 'CONTRAIRE':
+        flags.append((1, '\U0001f6a9 Éthique — contraire à tes valeurs', e['txt'] or 'motif non précisé'))
+    elif e['cle'] in ('À TRANCHER', 'A TRANCHER'):
+        flags.append((3, '⚠️ Éthique — à trancher', e['txt'] or 'motif non précisé'))
+    if num(etat) and etat > 50:
+        flags.append((1, '\U0001f6a9 État actionnaire de contrôle (%s %%)' % fr(etat, 0),
+                      out['etat_txt'] or 'contrôle public : intérêt de l’État avant celui des minoritaires possible'))
+    elif num(etat) and etat > 10:
+        flags.append((3, '⚠️ État actionnaire à %s %%' % fr(etat, 0), out['etat_txt']))
+    if len(alertes) >= 2:
+        flags.append((3, '⚠️ Double alerte forensique', ' · '.join(alertes)))
+    R['flags'] = flags
+    # coherence avec les controles proprietaires (aucune note modifiee)
+    m2, v1 = _note_ctrl(D, 'modele', 1), _note_ctrl(D, 'visibilite', 0)
+    km, kr, kc = out['moat']['cle'], out['recurrence']['cle'], out['cycle']['cle']
+    if km == 'LARGE' and m2 is not None and m2 < 0.5:
+        warn('Moat LARGE déclaré alors que Modèle 2 = 0 (aucun avantage prouvé) : incohérence à résoudre.')
+    if km == 'AUCUN' and m2 == 1:
+        warn('Moat AUCUN déclaré alors que Modèle 2 = 1 (avantage démontré) : justifier ou corriger.')
+    if kr in ('RÉCURRENT', 'RECURRENT') and v1 == 0:
+        warn('Revenus déclarés RÉCURRENTS alors que Visibilité 1 = 0 : justifier ou corriger.')
+    if kr == 'PONCTUEL' and v1 == 1:
+        warn('Revenus déclarés PONCTUELS alors que Visibilité 1 = 1 (contrats ou carnet fiables) : justifier ou corriger.')
+    if kc == 'HAUT DE CYCLE':
+        bp, bn = vv(G(D, 'valo.base_publiee')), vv(G(D, 'valo.base_normalisee'))
+        if num(bp) and num(bn) and bp > 0 and bn >= 0.98 * bp:
+            warn('Haut de cycle probable mais base normalisée ≈ base publiée : la base est-elle au sommet ? (§7 : milieu de cycle).')
+        anc = G(D, 'valo.scenarios.baissier.ancrage')
+        lab_a = str((anc[0] if isinstance(anc, list) and anc else anc) or '').upper()
+        if anc and not any(k in lab_a for k in ('MILIEU DE CYCLE', 'PIRE EXERCICE')):
+            warn('Haut de cycle probable : le baissier devrait partir du milieu de cycle ou du pire exercice publié.')
+    manquants = [nom for nom, k in (('moat', 'moat'), ('récurrence', 'recurrence'), ('cycle', 'cycle'),
+                                    ('éthique', 'ethique')) if out[k]['lvl'] == 'gris']
+    if not num(etat):
+        manquants.append('part de l’État')
+    if not num(s):
+        manquants.append('Sloan')
+    if manquants:
+        warn('Fiche de tri incomplète (profil) : %s.' % ', '.join(manquants))
+    chk('Fiche de tri (V23)', 'validé' if not manquants else 'n.d.',
+        'complète' if not manquants else 'manque : ' + ', '.join(manquants))
+    chk('Éthique et État : signal sans blocage (V23)', 'validé',
+        ' ; '.join(t for _, t, _ in flags) if flags else 'aucun red flag')
+    R['profil'] = out
+
+
+def calc_valeur(D, R):
+    """(B) Creation de valeur. V23.2 : la situation ACTUELLE se classe sur le spread actuel ; moyenne 5 ans et pire
+    sur 10 ans restent du contexte. Cas nuls traites a part. Pour les financieres, le spread ROIC - WACC d'Unclestock
+    n'est jamais compare a un ROE - cout des fonds propres."""
+    cv = D.get('creation_valeur') if isinstance(D.get('creation_valeur'), dict) else {}
+    sp, s5, s10, em, emo = (vv(cv.get(k)) for k in ('spread', 'spread_5a', 'spread_pire_10a', 'eva_marge', 'eva_momentum'))
+    brut = cv.get('serie')
+    if brut is not None and not isinstance(brut, (list, tuple)):
+        warn('creation_valeur.serie illisible \u2014 historique absent.')
+        brut = []
+    serie = [(x[0], vv(x[1])) for x in (brut or [])
+             if isinstance(x, (list, tuple)) and len(x) > 1 and num(vv(x[1]))]
+    if not any(num(x) for x in (sp, s5, s10, em, emo)) and not serie:
+        R['valeur'] = {'doc': False, 'synth': 'NON DOCUMENTÉ', 'lvl': 'gris'}
+        warn('Bloc \U0001f48e création de valeur non renseigné (creation_valeur) : à demander dans le même appel Unclestock.')
+        chk('Création de valeur (V23)', 'n.d.', 'creation_valeur absent')
+        return
+    mom = ''
+    if num(emo):
+        mom = ('Le profit économique augmente ; son origine (capital investi, marges ou coût du capital) est à expliquer.' if emo > 0 else
+               'Le profit économique est stable.' if emo == 0 else
+               'Le profit économique recule : marge en baisse, capital qui rapporte moins ou coût du capital plus élevé.')
+    if num(sp):
+        if sp > 0:
+            if num(emo) and emo > 0:
+                synth, lvl = 'CRÉATION DE VALEUR EN HAUSSE', (6 if (sp >= 8 and emo >= 1) else 5)
+            elif num(emo) and emo == 0:
+                synth, lvl = 'CRÉE DE LA VALEUR, PROFIT ÉCONOMIQUE STABLE', 5
+            elif num(emo):
+                synth, lvl = 'CRÉE DE LA VALEUR, MAIS MOINS', 4
+            else:
+                synth, lvl = 'CRÉE DE LA VALEUR', 4
+            txt = 'Aujourd\u2019hui, chaque euro investi rapporte plus qu\u2019il ne coûte. ' + mom
+        elif sp == 0:
+            synth, lvl = 'AU COÛT DU CAPITAL', 3
+            txt = 'Aujourd\u2019hui, le capital rapporte exactement ce qu\u2019il coûte : ni création, ni destruction. ' + mom
+        else:
+            if num(emo) and emo > 0:
+                synth, lvl = 'DÉTRUIT ENCORE, MAIS S\u2019AMÉLIORE', 3
+            else:
+                synth, lvl = 'DESTRUCTION DE VALEUR', 2
+            txt = 'Aujourd\u2019hui, le capital rapporte moins qu\u2019il ne coûte. ' + mom
+        if num(s5) and (s5 > 0) != (sp > 0) and s5 != 0 and sp != 0:
+            txt += ' La moyenne 5 ans (%s pts) dit l\u2019inverse : changement de régime à expliquer.' % fr(s5, 1, True)
+    elif num(s5):
+        synth = 'CRÉATION HISTORIQUE \u2014 SITUATION ACTUELLE NON DOCUMENTÉE' if s5 > 0 else (
+            'DESTRUCTION HISTORIQUE \u2014 SITUATION ACTUELLE NON DOCUMENTÉE' if s5 < 0 else
+            'HISTORIQUE AU COÛT DU CAPITAL \u2014 SITUATION ACTUELLE NON DOCUMENTÉE')
+        lvl, txt = 'gris', 'Seule la moyenne sur 5 ans est connue : elle ne dit pas où en est la société aujourd\u2019hui. ' + mom
+    else:
+        synth, lvl, txt = 'À DOCUMENTER', 'gris', 'Spread actuel non renseigné. ' + mom
+    rb = R.get('rentab') or {}
+    if rb.get('metrique') == 'ROIC':
+        if num(rb.get('med')) and num(rb.get('wacc')) and num(s5):
+            d = (rb['med'] - rb['wacc']) - s5
+            if abs(d) > 5:
+                warn('Spread moyen 5 ans (%s pts) éloigné de la médiane du dossier \u2014 ROIC \u2212 coût du capital (%s pts) : '
+                     'définitions différentes (avant/après impôt, WACC). La série du dossier reste la référence des notes.'
+                     % (fr(s5, 1, True), fr(rb['med'] - rb['wacc'], 1, True)))
+    else:
+        warn('Spread Unclestock = ROIC \u2212 WACC ; le dossier mesure la rentabilité en %s : pas de comparaison entre les deux '
+             '(pour une financière, la référence est ROE \u2212 coût des fonds propres).' % rb.get('metrique', 'n.d.'))
+    pire = ''
+    if num(s10):
+        pire = ('Au pire de la décennie, le capital rapportait moins qu\u2019il ne coûte : ancrage possible du baissier (PIRE EXERCICE).' if s10 < 0 else
+                'Au pire de la décennie, le capital rapportait tout juste son coût.' if s10 == 0 else
+                'Même au pire de la décennie, le capital rapportait plus qu\u2019il ne coûte : signe d\u2019un avantage qui résiste au cycle.')
+    R['valeur'] = {'doc': True, 'sp': sp, 's5': s5, 's10': s10, 'em': em, 'emo': emo, 'serie': serie,
+                   'synth': synth, 'lvl': lvl, 'txt': txt.strip(), 'pire': pire, 'source': V(cv.get('source'))['v'] or
+                   V(cv.get('spread'))['src'] or V(cv.get('spread_5a'))['src'] or ''}
+    chk('Création de valeur (V23)', 'validé' if lvl != 'gris' else 'n.d.', synth)
+
+
+def _equiv_nopat(tr):
+    """V23.4 : equivalence resultat net / NOPAT documentee = ["OUI", motif] (dette et frais financiers stables...)."""
+    e = tr.get('equivalence_nopat')
+    lab, motif = _badge2(e) if isinstance(e, (list, str)) else (('OUI', '') if e is True else ('', ''))
+    return motif if (lab.upper().startswith('OUI') and motif) else ''
+
+
+METHODES_TRI = {'OPERATIONNELLE': 'OPÉRATIONNELLE', 'OPÉRATIONNELLE': 'OPÉRATIONNELLE',
+                'FONDS PROPRES': 'FONDS PROPRES'}
+
+
+def calc_triangle(D, R):
+    """(C) Triangle 15/15/15, lu comme un EQUILIBRE : un actif capable de grandir en s'autofinancant, a prix raisonnable.
+      - Croissance : croissance du BPA par action + rendement du dividende >= 15 %/an (repere brut).
+      - Prix : PEGY = PER total / (croissance + dividende) <= 1.
+      - Qualite : rentabilite >= 15 % ET croissance theoriquement compatible avec le reinvestissement.
+    V23.2 : deux methodes jamais melangees -- OPERATIONNELLE (rendement des nouveaux investissements x reinvestissement
+    net / NOPAT -> croissance du NOPAT) ou FONDS PROPRES (ROE x taux de retention -> croissance du resultat net).
+    Le rendement marginal documente est prefere a la mediane historique. Lecture seulement."""
+    tr = D.get('triangle') if isinstance(D.get('triangle'), dict) else {}
+    rb = R.get('rentab') or {}
+    med = rb.get('med') if num(rb.get('med')) else rb.get('last')
+    g = R.get('gc')
+    meta = D.get('meta') or {}
+    valo = D.get('valo') or {}
+    cours = vv(meta.get('cours'))
+    # --- PER total (V23.2) : cours / BPA normalise si la tresorerie est separee, sinon multiple actuel
+    base = vv(valo.get('base_normalisee'))
+    tn = vv(valo.get('tresorerie_nette_action'))
+    est_fcf = 'FCF' in str(valo.get('metrique') or '').upper()
+    per_lab = 'P/FCF' if est_fcf else 'PER'
+    if num(tn):
+        if num(cours) and cours > 0 and num(base) and base > 0:
+            per, per_src = cours / base, '%s total (cours / base normalisée, trésorerie incluse)' % per_lab
+        else:
+            per, per_src = None, '%s total non calculable (trésorerie séparée, base normalisée absente ou non positive)' % per_lab
+            warn('Triangle : %s total non calculable \u2014 le multiple hors trésorerie n\u2019est pas repris.' % per_lab)
+    else:
+        per, per_src = vv(valo.get('multiple_actuel')), '%s actuel du dossier' % per_lab
+    # --- dividende
+    dps = G(D, 'valo.scenarios.central.dps') or []
+    d1 = dps[0] if (isinstance(dps, list) and dps and num(dps[0])) else None
+    rdt = 100.0 * d1 / cours if (num(d1) and num(cours) and cours > 0) else None
+    rdt_src = ('dividende central de l\u2019an 1 / cours (repère prospectif : vérifier qu\u2019il est ordinaire et représentatif)'
+               if num(rdt) else 'aucun dividende renseigné : PEGY = PEG')
+    moteur = (g + (rdt or 0.0)) if num(g) else None
+    pegy = per / moteur if (num(per) and per > 0 and num(moteur) and moteur > 0) else None
+    # --- methode de croissance theorique
+    meth_brute = _sans_accent(vv(tr.get('methode')) or '').upper()
+    methode = METHODES_TRI.get(meth_brute) or ('OPÉRATIONNELLE' if 'OPERA' in meth_brute else
+                                               'FONDS PROPRES' if 'FONDS' in meth_brute else None)
+    reinv = vv(tr.get('reinvestissement'))
+    marg = vv(tr.get('rendement_marginal'))
+    roe = vv(tr.get('roe'))
+    metr = rb.get('metrique', 'ROIC')
+    if methode == 'FONDS PROPRES':
+        taux, taux_src = (roe, 'ROE attendu') if num(roe) else (
+            (med, 'ROE médian du dossier') if metr == 'ROE' else (None, ''))
+        if not num(taux):
+            warn('Triangle, méthode FONDS PROPRES : renseigner triangle.roe (ROE attendu) \u2014 un %s n\u2019en tient pas lieu.' % metr)
+    else:
+        if methode is None and num(reinv):
+            warn('Triangle : méthode non déclarée (triangle.methode) \u2014 lue comme OPÉRATIONNELLE (rendement × réinvestissement net / NOPAT).')
+        methode = methode or 'OPÉRATIONNELLE'
+        if num(marg):
+            taux, taux_src = marg, 'rendement marginal documenté'
+        elif num(med) and metr in ('ROIC', 'ROCE après impôt'):
+            taux, taux_src = med, '%s médian historique (approximation)' % metr
+        else:
+            taux, taux_src = None, ''
+            if num(med):
+                warn('Triangle, méthode OPÉRATIONNELLE : la rentabilité du dossier est un %s, jamais utilisé comme rendement '
+                     'opérationnel \u2014 renseigner triangle.rendement_marginal ou passer en méthode FONDS PROPRES.' % metr)
+    # croissance de meme nature que la croissance theorique (NOPAT ou resultat net), jamais le BPA brut
+    gc_decl = vv(tr.get('croissance_comparable'))
+    var_act = vv(tr.get('variation_actions'))
+    nature = 'du NOPAT' if methode == 'OPÉRATIONNELLE' else 'du résultat net'
+    if num(gc_decl):
+        gcomp, gcomp_src = gc_decl, 'croissance centrale %s déclarée' % nature
+    elif num(g) and num(var_act) and methode == 'OPÉRATIONNELLE' and not _equiv_nopat(tr):
+        gcomp, gcomp_src = None, ('pont par les actions = croissance du résultat net, pas du NOPAT : documenter '
+                                  'triangle.equivalence_nopat ou renseigner triangle.croissance_comparable (NOPAT)')
+    elif num(g) and num(var_act):
+        gcomp = ((1 + g / 100.0) * (1 + var_act / 100.0) - 1) * 100.0
+        gcomp_src = ('croissance du résultat net déduite du BPA (%s %%/an) et du nombre d\u2019actions (%s %%/an)%s'
+                     % (fr(g, 1), fr(var_act, 1, True), (' \u2014 équivalence avec le NOPAT documentée : %s' % _equiv_nopat(tr))
+                        if methode == 'OPÉRATIONNELLE' else ''))
+    else:
+        gcomp, gcomp_src = None, ''
+    gmax = None
+    chk_lib = 'Croissance compatible avec le réinvestissement (triangle, V23)'
+    if not num(reinv) or not num(taux):
+        af, aflvl = 'NON MESURÉE', 'gris'
+        chk(chk_lib, 'n.d.', 'renseigner triangle.methode, triangle.reinvestissement et le rendement adapté à la méthode')
+    elif taux <= 0 or reinv < 0:
+        af, aflvl = 'NON APPLICABLE \u2014 PONT REQUIS', 'gris'
+        chk(chk_lib, 'n.a.', 'rentabilité ou réinvestissement non positif : seul le pont de financement du §7 tranche')
+    else:
+        gmax = taux * reinv / 100.0
+        if not num(gcomp):
+            af, aflvl = 'COMPARAISON NON DOCUMENTÉE', 'gris'
+            chk(chk_lib, 'n.d.', 'croissance théorique %s %%/an %s, sans pont vers le BPA : renseigner triangle.croissance_comparable '
+                'ou triangle.variation_actions' % (fr(gmax, 1), nature))
+        elif gcomp <= gmax + 1e-6:  # tolerance d'arrondi machine
+            af, aflvl = 'COMPATIBLE', 5
+        elif gcomp <= gmax + 2 + 1e-6:
+            af, aflvl = 'COMPATIBLE À 2 PTS PRÈS', 4
+        else:
+            af, aflvl = 'À FINANCER', 3
+            warn('Croissance centrale %s %s %%/an > croissance théorique compatible %s %%/an (%s %s %% × %s %% %s) : '
+                 'il faut dette, dilution, hausse de marge ou rendement marginal supérieur \u2014 vérifier le pont du §5 et du §7.'
+                 % (nature, fr(gcomp, 1), fr(gmax, 1), taux_src, fr(taux, 1), fr(reinv, 0),
+                    'réinvestis' if methode == 'OPÉRATIONNELLE' else 'retenus'))
+        if num(gcomp):
+            chk(chk_lib, 'alerte' if af == 'À FINANCER' else 'validé',
+                'croissance %s %s %%/an, théorique %s %%/an (%s)' % (nature, fr(gcomp, 1), fr(gmax, 1), methode.lower()))
+        if reinv > 100:
+            warn('Réinvestissement %s %% : au-delà de 100 %%, la croissance suppose trésorerie accumulée ou financement externe \u2014 '
+                 'à montrer dans le pont du §7.' % fr(reinv, 0))
+    # --- sommets
+    if num(med):
+        lq = cut(med, [10, 15], [2, 4, 5])
+    else:
+        lq = 'gris'
+    q_raison = None
+    if lq == 5 and af in ('NON MESURÉE', 'COMPARAISON NON DOCUMENTÉE'):
+        lq, q_raison = 4, 'rentabilité au rendez-vous, mais compatibilité de la croissance avec le réinvestissement non mesurée'
+    elif lq == 5 and af.startswith('NON APPLICABLE'):
+        lq, q_raison = 4, 'rentabilité au rendez-vous, mais modèle de croissance non applicable : le pont de financement tranche'
+    elif lq in (4, 5) and af == 'À FINANCER':
+        lq, q_raison = 3, 'la rentabilité ne suffit pas à financer la croissance visée : dette, dilution ou hausse de marge devront prendre le relais'
+    elif lq != 'gris' and lq != 5:
+        q_raison = 'rentabilité sous le repère de 15 %%%s' % (
+            ' ; financement théorique compatible avec la croissance' if af.startswith('COMPATIBLE') else '')
+    lg = cut(moteur, [5, 10, 15], [2, 3, 4, 5])
+    g_raison = None
+    if lg != 'gris' and lg != 5:
+        g_raison = 'croissance + dividende sous 15 %/an (repère brut)'
+    if num(g) and g < 0 and num(rdt) and rdt > 0:
+        g_raison = (g_raison + ' \u2014 ' if g_raison else '') + 'rendement porté par la distribution, BPA en recul'
+    if num(per) and per > 0 and num(moteur) and moteur <= 0:
+        lp, p_raison = 2, 'PEGY non applicable : croissance + dividende non positifs'
+    else:
+        lp = cut(pegy, [1.0 + 1e-9, 1.5, 2.0], [5, 4, 3, 2]) if num(pegy) else 'gris'
+        p_raison = ('le %s dépasse croissance + dividende (PEGY %s) : la croissance se paie trop cher' % (per_lab, fr(pegy, 2))
+                    if lp not in ('gris', 5) else None)
+    verts = sum(1 for l in (lq, lg, lp) if l == 5)
+    connus = sum(1 for l in (lq, lg, lp) if l != 'gris')
+    raisons = [r for r in (q_raison, g_raison, p_raison) if r]
+    manque = [n for n, l in (('qualité', lq), ('croissance', lg), ('prix', lp)) if l != 5 and l != 'gris']
+    if connus < 3:
+        synth, lvl = 'TRIANGLE INCOMPLET', 'gris'
+        txt = 'Donnée manquante pour un sommet (rentabilité, croissance centrale ou %s).' % per_lab
+    elif verts == 3:
+        synth, lvl = 'LE TRIANGLE TIENT', 5
+        txt = ('Équilibre trouvé : rentabilité au rendez-vous, croissance théoriquement compatible avec le réinvestissement, '
+               'croissance + dividende ≥ 15 %% et %s qui ne dépasse pas ce moteur.' % per_lab)
+    elif verts == 2:
+        synth, lvl = 'TRIANGLE BANCAL \u2014 %s' % manque[0].upper(), 4
+        txt = (raisons[0][0].upper() + raisons[0][1:] + '.') if raisons else ''
+    else:
+        synth, lvl = 'HORS TRIANGLE', 3 if verts == 1 else 2
+        txt = 'L\u2019équilibre n\u2019y est pas : ' + ' ; '.join(raisons) + '.'
+    R['triangle'] = {'roic': med, 'metrique': rb.get('metrique', 'ROIC'), 'g': g, 'rdt': rdt, 'rdt_src': rdt_src,
+                     'moteur': moteur, 'per': per, 'per_lab': per_lab, 'per_src': per_src, 'pegy': pegy,
+                     'lq': lq, 'lg': lg, 'lp': lp, 'verts': verts, 'connus': connus, 'synth': synth, 'lvl': lvl,
+                     'txt': txt, 'reinv': reinv, 'taux': taux, 'taux_src': taux_src, 'methode': methode,
+                     'gmax': gmax, 'af': af, 'aflvl': aflvl, 'gcomp': gcomp, 'gcomp_src': gcomp_src, 'nature': nature,
+                     'reinv_src': V(tr.get('reinvestissement'))['src'] or V(tr.get('reinvestissement'))['note'] or '',
+                     'mult_cst': R.get('tri_mult_constant')}
+
+
+def _col(l):
+    return 'var(--gris)' if l in ('gris', 'doc', None) else 'var(--l%s)' % (5 if l == 6 else l)
+
+
+def flags_html(R):
+    fl = R.get('flags') or []
+    if not fl:
+        return ''
+    pire = min(l for l, _, _ in fl)
+    rows = ''.join('<div style="margin:8px 0">%s<div class="sub" style="margin-top:4px">%s</div></div>' % (
+        bdg(t, l, 'gros wrap'), esc(x)) for l, t, x in fl)
+    return ('<div class="c" style="border:2px solid %s"><h3>Red flags — à toi de trancher</h3>%s'
+            '<div class="sub">Signal seulement : aucun effet sur le verdict, le prix, le taux exigé ni la taille. '
+            'Tu décides en conscience si tu passes outre.</div></div>') % (_col(pire), rows)
+
+
+def profil_html(D, R):
+    P = R.get('profil') or {}
+    if not P:
+        return ''
+    fo = P.get('forensique') or {}
+
+    def tuile(titre, lab, lvl, txt):
+        return ('<div><div class="lab">%s</div><div style="margin-top:6px">%s</div><div class="sub">%s</div></div>'
+                % (esc(titre), bdg(lab, lvl, 'wrap'), esc(txt)))
+    etat = P.get('etat')
+    ial = V(G(D, 'risques.ia'))['v']
+    f_txt = 'Altman Z %s · Beneish M %s · Piotroski %s/9 · Sloan %s' % (
+        fr(fo.get('z'), 2), fr(fo.get('m'), 2), fr(fo.get('f'), 0), fr(fo.get('sloan'), 2))
+    na = len(fo.get('alertes') or [])
+    nm = fo.get('mesures', 0)
+    f_lab = '%s ALERTE%s SUR %s MESURÉ%s' % (na, 'S' if na > 1 else '', nm, 'S' if nm > 1 else '')
+    f_known = nm > 0
+    f_cov = []
+    if fo.get('absents'):
+        f_cov.append('non documentés : ' + ', '.join(fo['absents']))
+    if fo.get('exclus'):
+        f_cov.append('non applicables au secteur financier : ' + ', '.join(fo['exclus']))
+    tiles = [
+        tuile('\U0001f3f0 Moat', P['moat']['lab'], P['moat']['lvl'], P['moat']['txt']),
+        tuile('\U0001f501 Récurrence des revenus', P['recurrence']['lab'], P['recurrence']['lvl'], P['recurrence']['txt']),
+        tuile('\U0001f504 Cycle', P['cycle']['lab'], P['cycle']['lvl'], P['cycle']['txt']),
+        tuile('\U0001f916 IA', ial or 'INDÉTERMINÉ', L_LAB('ia', ial), V(G(D, 'risques.ia'))['prov'] or ''),
+        tuile('\U0001f331 Éthique', P['ethique']['lab'], P['ethique']['lvl'], P['ethique']['txt']),
+        tuile('\U0001f3db️ Part de l’État', ('%s %%' % fr(etat, 0)) if num(etat) else 'n.d.', P.get('etat_lvl', 'gris'),
+              P.get('etat_txt') or ''),
+        tuile('\U0001f9ea Forensique', f_lab if f_known else 'NON MESURÉ', (3 if na >= 1 else (5 if not fo.get('absents') else 4)) if f_known else 'gris',
+              f_txt + ((' — ' + ' ; '.join(fo['alertes'])) if fo.get('alertes') else '') +
+              ((' · ' + ' · '.join(f_cov)) if f_cov else '')),
+    ]
+    return ('<div class="c"><h3>\U0001f9ed Fiche de tri</h3><div class="grid g3">%s</div>'
+            '<div class="sub" style="margin-top:12px">Les critères du tri 10 par 10, pour que le dossier complet les voie tous. '
+            'Lecture seulement : moat et récurrence se notent dans Modèle 2 et Visibilité 1, le cycle dans la base et le baissier.</div></div>'
+            % ''.join(tiles))
+
+
+def _barres_h(items, unite='pts'):
+    """Barres horizontales autour de zero, en SVG (donnees reelles uniquement)."""
+    items = [(l, v) for l, v in items if num(v)]
+    if not items:
+        return ''
+    m = max(abs(v) for _, v in items) or 1.0
+    m = max(m, 4.0)
+    W, x0, h = 360, 180, 30
+    H = h * len(items) + 14
+    out = ['<svg viewBox="0 0 %d %d" width="100%%" style="max-width:520px;display:block;margin:12px 0" role="img" aria-label="spread">' % (W, H)]
+    out.append('<line x1="%d" y1="4" x2="%d" y2="%d" stroke="var(--txt2)" stroke-width="1"/>' % (x0, x0, H - 4))
+    for i, (lab, v) in enumerate(items):
+        y = 8 + i * h
+        w = abs(v) / m * 100
+        x = x0 if v >= 0 else x0 - w
+        col = 'var(--l5)' if v > 0 else 'var(--l2)'
+        out.append('<rect x="%.1f" y="%d" width="%.1f" height="18" rx="3" fill="%s"/>' % (x, y, max(w, 1.5), col))
+        out.append('<text x="%d" y="%d" fill="var(--txt2)" font-size="12" font-family="ui-monospace,Menlo,monospace"%s>%s</text>' % (
+            (x0 - 108 if v >= 0 else x0 + 8), y + 13, '', esc(lab)))
+        out.append('<text x="%.1f" y="%d" fill="var(--txt)" font-size="12" font-family="ui-monospace,Menlo,monospace" text-anchor="%s">%s %s</text>' % (
+            (x + w + 4) if v >= 0 else (x - 4), y + 13, 'start' if v >= 0 else 'end', fr(v, 1, True), unite))
+    out.append('</svg>')
+    return ''.join(out)
+
+
+def valeur_html(R):
+    Vb = R.get('valeur') or {}
+    if not Vb.get('doc'):
+        return ('<div class="c capital-box"><h3>\U0001f48e Création de valeur</h3><div>%s</div>'
+                '<div class="sub">Economic spread et EVA non renseignés dans ce dossier.</div></div>' % bdg('NON DOCUMENTÉ', 'gris'))
+    cartes = ''.join([
+        carte('Spread actuel', ('%s pts' % fr(Vb.get('sp'), 1, True)) if num(Vb.get('sp')) else 'n.d.', L_SPREAD2(Vb.get('sp')), 'ROIC − coût du capital'),
+        carte('Moyenne 5 ans', ('%s pts' % fr(Vb.get('s5'), 1, True)) if num(Vb.get('s5')) else 'n.d.', L_SPREAD2(Vb.get('s5')), 'le rythme de croisière'),
+        carte('Pire sur 10 ans', ('%s pts' % fr(Vb.get('s10'), 1, True)) if num(Vb.get('s10')) else 'n.d.', L_SPREAD2(Vb.get('s10')), 'la résistance au cycle'),
+        carte('EVA momentum', ('%s %%' % fr(Vb.get('emo'), 1, True)) if num(Vb.get('emo')) else 'n.d.', L_EVAMO(Vb.get('emo')),
+              'variation du profit économique / CA · marge EVA %s' % (('%s %%' % fr(Vb.get('em'), 1)) if num(Vb.get('em')) else 'n.d.')),
+    ])
+    serie = Vb.get('serie') or []
+    if serie:
+        graph = _barres_h([(str(a), v) for a, v in serie]) + '<div class="sub">Spread annuel publié par la source.</div>'
+    else:
+        graph = _barres_h([('pire 10 ans', Vb.get('s10')), ('moyenne 5 ans', Vb.get('s5')), ('actuel', Vb.get('sp'))])
+    return ('<div class="c capital-box"><h3>\U0001f48e Création de valeur — le profit économique progresse-t-il ?</h3>'
+            '<div>%s</div><p style="margin-top:10px">%s</p><div class="grid g4">%s</div>%s<p class="sub">%s</p>'
+            '<div class="sub">Le ROIC dit si chaque euro est bien investi ; l’EVA (profit économique = (ROIC − coût du capital) × capital investi) '
+            'dit si ce profit économique progresse. À capital investi, ROIC et coût du capital constants, l’EVA reste stable. '
+            'La situation actuelle se lit sur le spread actuel ; moyenne et pire historique sont du contexte. '
+            'Lecture seulement : la rentabilité se note dans le pilier Capital. Source : %s.</div></div>') % (
+        bdg(Vb.get('synth'), Vb.get('lvl', 'gris'), 'gros wrap'), esc(Vb.get('txt')), cartes, graph, esc(Vb.get('pire')),
+        esc(Vb.get('source') or 'non nommée'))
+
+
+def triangle_svg(T):
+    W, H = 360, 300
+    top, bl, br = (180, 62), (62, 236), (298, 236)
+    def pct(x):
+        return ('%s %%' % fr(x, 1)) if num(x) else 'n.d.'
+    o = ['<svg viewBox="0 0 %d %d" width="100%%" style="max-width:440px;display:block;margin:0 auto" role="img" '
+         'aria-label="Triangle 15/15/15">' % (W, H)]
+    o.append('<polygon points="%d,%d %d,%d %d,%d" fill="rgba(57,214,224,.10)" stroke="var(--cy2)" stroke-width="2"/>'
+             % (top + bl + br))
+    mono = 'font-family="ui-monospace,Menlo,monospace"'
+    o.append('<text x="180" y="168" text-anchor="middle" fill="var(--cy)" font-size="34" font-weight="600" %s>%s/3</text>'
+             % (mono, T.get('verts', 0) if T.get('connus') == 3 else '?'))
+    o.append('<text x="180" y="190" text-anchor="middle" fill="var(--txt2)" font-size="12" %s>règle 15/15/15</text>' % mono)
+    for (x, y), l in ((top, T['lg']), (bl, T['lq']), (br, T['lp'])):
+        o.append('<circle cx="%d" cy="%d" r="12" fill="%s" stroke="#000" stroke-width="2"/>' % (x, y, _col(l)))
+    o.append('<text x="180" y="22" text-anchor="middle" fill="var(--txt)" font-size="15" font-weight="600" %s>Croissance</text>' % mono)
+    o.append('<text x="180" y="40" text-anchor="middle" fill="var(--txt2)" font-size="13" %s>BPA %s + div. %s = %s · ≥ 15</text>'
+             % (mono, pct(T.get('g')), pct(T.get('rdt') or 0), pct(T.get('moteur'))))
+    o.append('<text x="8" y="268" fill="var(--txt)" font-size="15" font-weight="600" %s>Qualité</text>' % mono)
+    o.append('<text x="8" y="286" fill="var(--txt2)" font-size="13" %s>%s %s ≥ 15</text>'
+             % (mono, esc(T.get('metrique')), pct(T.get('roic'))))
+    o.append('<text x="352" y="268" text-anchor="end" fill="var(--txt)" font-size="15" font-weight="600" %s>Prix</text>' % mono)
+    o.append('<text x="352" y="286" text-anchor="end" fill="var(--txt2)" font-size="13" %s>%s %s ≤ %s</text>'
+             % (mono, esc(T.get('per_lab', 'PER')), fr(T.get('per'), 1), fr(T.get('moteur'), 1)))
+    o.append('</svg>')
+    return ''.join(o)
+
+
+def triangle_html(R):
+    T = R.get('triangle')
+    if not T:
+        return ''
+    verbe = 'réinvestis (net / NOPAT)' if T.get('methode') == 'OPÉRATIONNELLE' else 'retenus (1 \u2212 distribution)'
+    if num(T.get('gmax')):
+        af = ('Méthode %s : %s %s %% × %s %% %s = <b>%s %%/an</b> de croissance %s théoriquement compatible, contre <b>%s</b> '
+              '(%s). Hypothèse de rentabilité constante ; l\u2019autofinancement n\u2019est confirmé que par le pont '
+              'de financement du §7.' % (esc(T['methode'].lower()), esc(T['taux_src']), fr(T['taux'], 1), fr(T['reinv'], 0), verbe,
+                                       fr(T['gmax'], 1), esc(T.get('nature', '')),
+                                       ('%s %%/an' % fr(T['gcomp'], 1)) if num(T.get('gcomp')) else 'une croissance comparable non documentée',
+                                       esc(T.get('gcomp_src') or 'renseigner triangle.croissance_comparable ou triangle.variation_actions')))
+    elif str(T.get('af', '')).startswith('NON APPLICABLE'):
+        af = 'Rentabilité ou réinvestissement non positif : le modèle ne s\u2019applique pas, seul le pont de financement du §7 tranche.'
+    else:
+        af = 'Non mesurée : renseigner triangle.methode (opérationnelle ou fonds propres) et triangle.reinvestissement.'
+    mc = T.get('mult_cst')
+    mc_txt = ('À multiple constant, le moteur donne <b>%s %%/an net</b> au cours du jour, fiscalité belge et flux du dossier compris : '
+              'c\u2019est le rendement net qui compte.' % fr(mc, 1)) if num(mc) else ''
+    return ('<div class="c"><h3>\U0001f53a Le triangle 15/15/15</h3><div class="grid g2"><div>%s</div><div>'
+            '<div>%s</div><p style="margin-top:10px">%s</p><div style="margin:10px 0">%s</div><p>%s</p><p>%s</p>'
+            '<div class="sub">L\u2019équilibre : un actif capable de grandir en s\u2019autofinançant, à prix raisonnable. '
+            'Croissance du BPA + rendement du dividende ≥ 15 %%/an ; %s ≤ croissance + dividende (PEGY %s, il faut ≤ 1 : '
+            'un %s de 20 avec 20 %% de moteur présente le même PEGY qu\u2019un %s de 15 avec 15 %%) ; rentabilité ≥ 15 %% et croissance '
+            'compatible avec le réinvestissement. %s : %s. Dividende : %s. Croissance + dividende est un repère brut, sans conversion '
+            'nette universelle. Lecture seulement : le prix d\u2019achat reste celui du taux exigé de la ligne.%s</div>'
+            '</div></div></div>') % (
+        triangle_svg(T), bdg(T['synth'], T['lvl'], 'gros wrap'), esc(T['txt']),
+        bdg('Croissance ' + T['af'], T['aflvl'], 'wrap'), af, mc_txt,
+        esc(T.get('per_lab', 'PER')), fr(T.get('pegy'), 2), esc(T.get('per_lab', 'PER')), esc(T.get('per_lab', 'PER')),
+        esc(T.get('per_lab', 'PER')), esc(T.get('per_src')), esc(T.get('rdt_src')),
+        (' Réinvestissement : ' + esc(T['reinv_src']) + '.') if T.get('reinv_src') else '')
 
 
 # ------------------------------------------------------------------ ligne NICO
@@ -2251,6 +2828,10 @@ def ligne_nico(D, R):
     v = D.get('verdict') or {}
     st = statut_suivi(D, R)
     note = (v.get('nico_note') or v.get('suivi_condition') or '').replace('|', '/')
+    rouges = [t for l, t, _ in (R.get('flags') or []) if l == 1]  # V23 : red flags visibles dans l'outil de tri
+    if rouges:
+        court = ' + '.join('ÉTAT >50 %' if 'État' in t else 'ÉTHIQUE' for t in rouges)
+        note = ('\U0001f6a9 %s — %s' % (court, note)) if note else '\U0001f6a9 %s' % court
     ch = ['NICO', R.get('ticker') or meta.get('ticker', ''), meta.get('societe', ''), meta.get('devise', ''), st,
           fprix(R.get('PA')), fprix(vv(meta.get('cours'))), fr(R.get('tx'), 1), fr(R.get('retenu'), 1),
           fr(R.get('cap_cours'), 0), fr(R['q']['Q'], 0), v.get('suivi_date', ''), meta.get('date_eval', ''),
@@ -2406,6 +2987,33 @@ def resume(D, R):
             (R.get('baissier') or {}).get('lab', 'n.d.'),
             ' \u00b7 plancher prouv\u00e9 \u22121 pt' if R.get('B_actif') else '',
             ' \u00b7 \U0001f3f0 forteresse' if R.get('forteresse') else ''))
+    # V23 : red flags juste sous le verdict, puis fiche de tri, creation de valeur, triangle
+    fl = R.get('flags') or []
+    if fl:
+        L.insert(2, '\U0001f6a9 Red flags (aucun blocage, \u00e0 toi de trancher) : ' + ' \u00b7 '.join(
+            '%s%s' % (t, (' \u2014 ' + x) if x else '') for _, t, x in fl))
+    P = R.get('profil') or {}
+    if P:
+        fo = P.get('forensique') or {}
+        L.append('\U0001f9ed Fiche de tri : moat %s \u00b7 r\u00e9currence %s \u00b7 cycle %s \u00b7 \u00e9thique %s \u00b7 \u00c9tat %s \u00b7 forensique %s' % (
+            P['moat']['lab'], P['recurrence']['lab'], P['cycle']['lab'], P['ethique']['lab'],
+            ('%s %%' % fr(P.get('etat'), 0)) if num(P.get('etat')) else 'n.d.',
+            ('%s alerte(s) sur %s mesuré(s)%s%s%s' % (len(fo.get('alertes') or []), fo.get('mesures', 0),
+                (' : ' + ' ; '.join(fo['alertes'])) if fo.get('alertes') else '',
+                (' · non documentés : ' + ', '.join(fo['absents'])) if fo.get('absents') else '',
+                (' · non applicables (financière) : ' + ', '.join(fo['exclus'])) if fo.get('exclus') else ''))))
+    Vb = R.get('valeur') or {}
+    if Vb.get('doc'):
+        L.append('\U0001f48e Cr\u00e9ation de valeur : spread %s / 5 ans %s / pire 10 ans %s pts \u00b7 marge EVA %s %% \u00b7 EVA momentum %s %% \u2192 %s' % (
+            fr(Vb.get('sp'), 1, True), fr(Vb.get('s5'), 1, True), fr(Vb.get('s10'), 1, True),
+            fr(Vb.get('em'), 1), fr(Vb.get('emo'), 1, True), Vb.get('synth')))
+    else:
+        L.append('\U0001f48e Cr\u00e9ation de valeur : NON DOCUMENT\u00c9E')
+    T = R.get('triangle') or {}
+    if T:
+        L.append('\U0001f53a Triangle 15/15/15 : %s (%s %s %% \u00b7 croissance %s + dividende %s = %s %%/an \u00b7 %s %s \u00b7 PEGY %s) \u00b7 croissance %s%s' % (
+            T['synth'], T['metrique'], fr(T.get('roic'), 1), fr(T.get('g'), 1), fr(T.get('rdt') or 0, 1), fr(T.get('moteur'), 1), T.get('per_lab', 'PER'), fr(T.get('per'), 1), fr(T.get('pegy'), 2),
+            T['af'], (' (théorique %s %%/an)' % fr(T['gmax'], 1)) if num(T.get('gmax')) else ''))
     if WARN:
         L.append('\u26a0\ufe0f ' + ' \u00b7 '.join(WARN))
     L.append(R['nico'])
@@ -2436,6 +3044,9 @@ def main():
     R = calculer(D)
     calc_pourquoi(D, R)
     calc_avenir(D, R)
+    calc_profil(D, R)     # V23 (A)
+    calc_valeur(D, R)     # V23 (B)
+    calc_triangle(D, R)   # V23 (C)
     nbm, nbp = compter_these(G(D, 'acte0.these.texte'))
     if nbm > 80 or not (3 <= nbp <= 4):
         warn('Th\u00e8se : %s mots / %s phrases \u2014 format 3 \u00e0 4 phrases, 80 mots au plus.' % (nbm, nbp))
