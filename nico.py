@@ -18,8 +18,10 @@ import json, sys, os, re, math, html, copy, hashlib, datetime, statistics as stx
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V23.5.1"
-VERSION_DATE = "04/11/2026"
+VERSION = "V23.6"
+VERSION_DATE = "05/11/2026"
+# V23.6 : lecture simplifiee ROIC / croissance / protection ; preuve de boule de neige.
+# Les calculs financiers et les portes restent inchanges : VERSION_VALORISATION = V23.4.
 # V23.5.1 : repli ROA hors financières, glacière dans le chat, rotation négative n.d. et affichage de la taille.
 # V23.5 : intensite en capital, test de la glaciere, lecture du triangle et allocation du capital (R3).
 # Garder la version financière dans l'empreinte tant que les calculs sont identiques.
@@ -1676,6 +1678,27 @@ background-image:linear-gradient(rgba(57,214,224,.04) 1px,transparent 1px),linea
 .roic-scale .actif{border-color:var(--cy);color:var(--cy)}
 .roic-scale b{position:absolute;top:-24px;transform:translateX(-50%);color:var(--cy);line-height:1;font-size:19px}
 .roic-badges{display:flex;flex-wrap:wrap;gap:7px;margin:14px 0}
+.snow-box{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:linear-gradient(135deg,#101f26,#0b1319 65%);padding:30px}
+.snow-head{display:flex;align-items:center;justify-content:space-between;gap:18px;flex-wrap:wrap}
+.snow-eyebrow{font-size:11px;font-weight:650;letter-spacing:.12em;color:var(--txt2);margin-bottom:7px}
+.snow-box h3{font-size:29px;margin:0;color:var(--txt);letter-spacing:-.025em}
+.snow-intro{font-size:17px;color:var(--txt2);margin:18px 0 25px;max-width:85ch}
+.snow-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-bottom:25px}
+.snow-card{padding:22px;border:1px solid #304650;border-radius:13px;background:#101d24;min-width:0}
+.snow-question{font-weight:650;font-size:16px;line-height:1.4;margin-bottom:18px}
+.snow-number{font-size:35px;font-weight:650;letter-spacing:-.035em;color:var(--txt);line-height:1.15;font-variant-numeric:tabular-nums}
+.snow-caption{font-size:12px;color:var(--txt2);margin-top:6px;margin-bottom:16px}
+.snow-status{margin:12px 0}.snow-box .b{font-family:inherit;line-height:1.35;font-size:13px;padding:6px 11px}
+.snow-card p,.snow-row p{font-size:14px;color:var(--txt2);line-height:1.55;margin:10px 0 0}
+.snow-row{display:grid;grid-template-columns:minmax(170px,27%) 1fr;gap:20px;padding:19px 0;border-top:1px solid #2b3d42;font-size:15px}
+.snow-row strong{max-width:25ch}.snow-box details{margin-top:0;padding:15px 0;border-top:1px solid #2b3d42}
+.snow-box summary{color:var(--txt);font-family:inherit;font-size:14px;font-weight:550}
+.snow-box details p{font-size:15px;margin-top:12px}.snow-proof{margin-top:18px;font-size:14px}.snow-proof p{margin:5px 0 0;color:var(--txt2)}
+.snow-missing{margin-top:20px;font-size:14px}.snow-missing ul{margin-top:10px;padding-left:18px;list-style:disc}.snow-missing li{padding:0;margin:6px 0;font-size:14px}.snow-missing li::before{content:none}
+.snow-box .capital-box{margin-top:20px;background:transparent;border-color:var(--bord)}
+.snow-footnote{font-size:12px;color:var(--txt2);margin:12px 0 0;max-width:95ch}
+@media(max-width:820px){.snow-grid{grid-template-columns:1fr}.snow-row{grid-template-columns:1fr;gap:9px}.snow-box{padding:22px}.snow-box h3{font-size:25px}.snow-card{padding:20px}}
+@media print{.snow-box,.snow-card{background:white;color:black}.snow-number,.snow-box h3,.snow-question,.snow-box summary{color:black}}
 :focus-visible{outline:2px solid var(--cy);outline-offset:2px}
 @media(max-width:820px){.g4,.g3,.g5,.g2{grid-template-columns:1fr 1fr}h1{font-size:32px}.cours{font-size:34px}}
 @media(max-width:480px){.g4,.g3,.g5,.g2{grid-template-columns:1fr}.head{flex-direction:column}
@@ -2058,15 +2081,18 @@ def rendu(D, R):
         graph = '<div class="chart">%s</div><div class="xl">%s</div>' % (
             ''.join('<div style="height:%s%%"></div>' % max(2, 100 * v / mx if mx else 0) for v in vals),
             ''.join('<span>%s</span>' % esc(a) for a in rb['annees']))
-    A('<div class="c"><h3>Rentabilit\u00e9 \u00e9conomique \u2014 niveau et stabilit\u00e9</h3><div>%s</div>%s'
-      '<div class="sub">%s \u00b7 m\u00e9diane %s %% \u00b7 min %s %% \u00b7 derni\u00e8re %s %% \u00b7 %s/%s ann\u00e9es &gt; co\u00fbt du capital %s %% \u00b7 IQR %s pts \u00b7 tendance %s (pente %s pts/an, dispersion autour de la tendance %s pts)</div>'
-      '<p class="sub">%s</p></div></div>' % (
-          bdg(rb['lab'], rb['lvl'], 'gros'), graph, esc(rb.get('metrique', 'ROIC')), fr(rb['med'], 1), fr(rb['min'], 1), fr(rb['last'], 1),
+    A('<div class="c"><h3>Rentabilité historique</h3><div>%s</div>'
+      '<p class="sub">%s médian : <b>%s %%</b> · coût du capital : <b>%s %%</b>.<br>'
+      'Le passé ne prouve pas les possibilités de croissance. Elles se lisent dans « La boule de neige ».</p>'
+      '<details><summary>Voir l’historique et la stabilité</summary>%s'
+      '<div class="sub">%s · médiane %s %% · min %s %% · dernière %s %% · %s/%s années &gt; coût du capital %s %% · IQR %s pts · tendance %s (pente %s pts/an, dispersion %s pts)</div>'
+      '<p class="sub">%s</p></details></div></div>' % (
+          bdg(rb['lab'], rb['lvl'], 'gros'), esc(rb.get('metrique', 'ROIC')), fr(rb['med'], 1), fr(rb['wacc'], 1),
+          graph, esc(rb.get('metrique', 'ROIC')), fr(rb['med'], 1), fr(rb['min'], 1), fr(rb['last'], 1),
           rb['au_dessus'] if rb['au_dessus'] is not None else 'n.d.', rb['n'], fr(rb['wacc'], 1),
           fr(rb['iqr'], 1), esc(rb.get('tend') or 'n.d.'), fr(rb.get('pente'), 1, True), fr(rb.get('iqr_res'), 1),
           esc(G(D, 'rentabilite.definition'))))
 
-    A(encadres_qualite(D, R))
     A(capital_html(D, R))
     A(valeur_html(R))  # V23 : creation de valeur
 
@@ -2538,12 +2564,12 @@ def calc_capital(D, R):
     distribution = _chiffre_capital(c, 'distribution_pct', 0)
     machine = 'NON MESURÉE'
     if c and num(reinv):
-        if reinv >= 50 and num(rendement) and rendement >= 15:
-            machine = 'MACHINE À COMPOSER'
+        if reinv >= 50:
+            machine = 'RÉINVESTISSEMENT IMPORTANT'
         elif reinv < 25 and distribution is not None and distribution >= 70:
-            machine = 'MACHINE À DISTRIBUER'
-        elif (reinv >= 25 and (reinv < 50 or num(rendement))) or (reinv < 25 and distribution is not None):
-            machine = 'ENTRE LES DEUX'
+            machine = 'CASH SURTOUT DISTRIBUÉ'
+        elif reinv >= 25 or (reinv < 25 and distribution is not None):
+            machine = 'ALLOCATION MIXTE'
     R['capital'] = {
         'doc': bool(c), 'intensite': intensite, 'rotation': rotation, 'ca': ca, 'investi': investi, 'origine': origine,
         'note': note, 'glaciere': badge, 'preuve': preuve, 'glaciere_obligatoire': obligatoire,
@@ -2734,6 +2760,71 @@ def calc_triangle(D, R):
         R['triangle']['roic_non_pertinent'] = True
 
 
+def calc_boule_neige(D, R):
+    """V23.6 : preuve de croissance, lecture seule ; jamais un ROIC historique comme preuve future."""
+    b = D.get('boule_neige')
+    b = b if isinstance(b, dict) else {}
+    c, t = R.get('capital') or {}, R.get('triangle') or {}
+    def preuve(cle, labels):
+        x = b.get(cle)
+        if not isinstance(x, list) or len(x) != 2 or not all(isinstance(v, str) for v in x):
+            return 'INCONNUS', '', False
+        lab, txt = x[0].strip().upper(), x[1].strip()
+        ok = (lab in labels and bool(re.search(DATE_PREUVE, txt))
+              and len(re.findall(r'\b\w+\b', txt)) >= 5
+              and not re.search(r'non document|à documenter|à vérifier|à fournir', txt, re.I))
+        return lab if lab in labels else 'INCONNUS', txt, ok
+    deb, deb_txt, deb_doc = preuve('debouches', ('DÉMONTRÉS', 'PLAUSIBLES', 'LIMITÉS', 'INCONNUS'))
+    fin, fin_txt, fin_doc = preuve('financement', ('DÉMONTRÉ', 'PLAUSIBLE', 'INSUFFISANT', 'INCONNU'))
+    voie = str(b.get('voie') or '').strip().upper()
+    voies = ('RÉINVESTISSEMENT', 'SANS CAPITAL IMPORTANT', 'MIXTE')
+    horizon = _chiffre_capital(b, 'horizon_ans', 0, strict=True)
+    h = V(b.get('horizon_ans'))
+    horizon_doc = (horizon is not None and h['prov'] in ('P', 'C', 'E')
+                   and isinstance(h['src'], str) and bool(re.search(DATE_PREUVE, h['src'])))
+    tr = D.get('triangle') if isinstance(D.get('triangle'), dict) else {}
+    financier = est_financier(D)
+    cle = 'roe' if financier and t.get('methode') == 'FONDS PROPRES' else 'rendement_marginal'
+    marginal = _chiffre_capital(tr, cle)
+    m = V(tr.get(cle))
+    cout = (R.get('rentab') or {}).get('wacc')
+    rendement_doc = (num(marginal) and num(cout) and m['prov'] in ('P', 'C', 'E')
+                     and isinstance(m['src'], str) and bool(re.search(DATE_PREUVE, m['src'])))
+    rendement_ok = rendement_doc and marginal > cout
+    scalable_ok = (_note_ctrl(D, 'visibilite', 1) == 1 and _note_ctrl(D, 'cash', 0) == 1)
+    g = R.get('gc')
+    manque = []
+    if voie not in voies: manque.append('Le mécanisme de croissance reste à préciser.')
+    if not (deb == 'DÉMONTRÉS' and deb_doc): manque.append('Les débouchés ne sont pas suffisamment étayés.')
+    if not (horizon_doc and horizon >= 4): manque.append('La durée des débouchés ne couvre pas quatre ans de façon documentée.')
+    if not (fin == 'DÉMONTRÉ' and fin_doc): manque.append('Le financement de la croissance reste à confirmer.')
+    if voie in ('RÉINVESTISSEMENT', 'MIXTE') and not rendement_ok:
+        manque.append('Le rendement des nouveaux investissements reste à établir au-dessus du coût du capital.')
+    if voie in ('SANS CAPITAL IMPORTANT', 'MIXTE') and not scalable_ok:
+        manque.append('Les marges et la conversion en cash ne suffisent pas à étayer une croissance peu consommatrice de capital.')
+    if c.get('glaciere_obligatoire') and not c.get('protection_documentee'):
+        manque.append('La protection du modèle doit être documentée.')
+    if c.get('glaciere') == 'COPIABLE': manque.append('Le modèle est facile à copier : la durée de la croissance est fragile.')
+    if not num(g) or g < 5: manque.append('La croissance centrale par action ne satisfait pas le repère existant de 5 %/an.')
+    if rendement_doc and marginal < cout and voie in ('RÉINVESTISSEMENT', 'MIXTE'):
+        lab, lvl, txt = 'CROISSANCE DESTRUCTRICE', 2, 'Les nouveaux euros rapporteraient moins que leur coût. Grossir ne suffit pas.'
+    elif deb == 'LIMITÉS' and deb_doc:
+        lab, lvl, txt = 'BOULE DE NEIGE LIMITÉE', 3, 'L’activité peut rester très rentable, mais ses possibilités de croissance sont limitées.'
+    elif fin == 'INSUFFISANT' and fin_doc:
+        lab, lvl, txt = 'BOULE DE NEIGE FRAGILE', 3, 'La croissance prévue ne dispose pas encore du financement nécessaire.'
+    elif not manque:
+        lab, lvl, txt = 'BOULE DE NEIGE ÉTAYÉE', 5, 'Le mécanisme, les débouchés et le financement soutiennent la croissance prévue sur quatre ans. Cela reste une prévision.'
+    elif not b:
+        lab, lvl, txt = 'BOULE DE NEIGE À DOCUMENTER', 'gris', 'Un ROIC élevé ne suffit pas. Ce dossier ne documente pas encore les débouchés et leur durée.'
+    else:
+        lab, lvl, txt = 'BOULE DE NEIGE À CONFIRMER', 4, manque[0]
+    R['boule_neige'] = dict(lab=lab, lvl=lvl, txt=txt, voie=voie if voie in voies else 'INCONNUE',
+        debouches=deb, debouches_texte=deb_txt, debouches_documentes=deb_doc,
+        financement=fin, financement_texte=fin_txt, financement_documente=fin_doc,
+        horizon=horizon if horizon_doc else None, marginal=marginal, rendement_documente=rendement_doc,
+        limite=str(b.get('limite') or ''), manques=manque)
+
+
 def _col(l):
     return 'var(--gris)' if l in ('gris', 'doc', None) else 'var(--l%s)' % (5 if l == 6 else l)
 
@@ -2835,7 +2926,7 @@ def valeur_html(R):
     return ('<div class="c capital-box"><h3>\U0001f48e Création de valeur — le profit économique progresse-t-il ?</h3>'
             '<div>%s</div><p style="margin-top:10px">%s</p><div class="grid g4">%s</div>%s<p class="sub">%s</p>'
             '<div class="sub">Le ROIC dit si chaque euro est bien investi ; l’EVA (profit économique = (ROIC − coût du capital) × capital investi) '
-            'dit si ce profit économique progresse. À capital investi, ROIC et coût du capital constants, l’EVA reste stable. '
+            'mesure le profit économique ; sa variation dit s’il progresse. À capital investi, ROIC et coût du capital constants, l’EVA reste stable. '
             'La situation actuelle se lit sur le spread actuel ; moyenne et pire historique sont du contexte. '
             'Lecture seulement : la rentabilité se note dans le pilier Capital. Source : %s.</div></div>') % (
         bdg(Vb.get('synth'), Vb.get('lvl', 'gris'), 'gros wrap'), esc(Vb.get('txt')), cartes, graph, esc(Vb.get('pire')),
@@ -2918,66 +3009,95 @@ def triangle_html(R):
 
 
 def capital_html(D, R):
-    c, t = R['capital'], R['triangle']
-    intensite, rotation = c['intensite'], c['rotation']
-    zones = ('NÉGATIF', 'LOURD', 'NORMAL', 'LÉGER')
-    niveaux = {'NÉGATIF': 4, 'LOURD': 3, 'NORMAL': 5, 'LÉGER': 4, 'LÉGER PROBABLE': 4}
-    # Quatre zones de largeur égale. Les extrêmes ouverts sont comprimés.
-    curseur = ''
-    if intensite in zones:
-        zone = zones.index(intensite)
-        if intensite == 'NÉGATIF':
-            fraction = 0.5  # Marqueur de catégorie, sans rotation chiffrée.
-        elif intensite == 'LOURD':
-            fraction = rotation if rotation is not None else 0.5
-        elif intensite == 'NORMAL':
-            fraction = (rotation - 1) / 3
-        else:
-            fraction = 1 - 4 / rotation if rotation is not None else 1
-        position = 25 * (zone + min(0.97, max(0.03, fraction)))
-        curseur = '<b style="left:%.2f%%" aria-hidden="true">▲</b>' % position
-    reglette = ('<div class="roic-scale" aria-label="Rotation %s">%s%s</div>' % (
-        fr(rotation, 1), curseur, ''.join('<span%s>%s</span>' % (
-            ' class="actif"' if z == intensite else '', z) for z in zones)))
-    machine = c['machine']
-    machine_txt = {
-        'MACHINE À COMPOSER': 'Le ROIC travaille pour toi : chaque euro gardé est réinvesti à haut rendement.',
-        'MACHINE À DISTRIBUER': 'Ton rendement ≈ croissance + dividende. Le ROIC élevé ne se capitalise pas.',
-    }.get(machine, '')
-    message = ('ROIC gonflé par un capital faible : il prouve l’autofinancement, pas le moat. Le moat se prouve ailleurs.'
-               if intensite in CAPITAL_LEGER else '')
-    if intensite == 'NÉGATIF':
-        message += ' Avec un dénominateur nul ou négatif, seuls les flux observés permettent de juger l’autofinancement.'
-    niveau_glaciere = 5 if c['protection_documentee'] else 4 if c['glaciere'] != 'n.d.' else 'gris'
-    intrants = ''
-    if c['doc']:
-        intrants = ('<table><tr><th>CA</th><td>%s</td></tr><tr><th>Capital investi</th><td>%s</td></tr>'
-                    '<tr><th>Définition</th><td>%s</td></tr>'
-                    '<tr><th>Allocation</th><td>Réinvestissement %s · rendement %s · distribution sur 3 ans %s</td></tr></table>' % (
-                        qual_texte(G(D, 'capital.ca_meur')) if c['ca'] is not None else 'n.d.',
-                        qual_texte(G(D, 'capital.capital_investi_meur')) if c['investi'] is not None else 'n.d.',
-                        qual_texte(G(D, 'capital.definition')),
-                        *(fr(c[k], 1) + ' %' if num(c[k]) else 'n.d.' for k in (
-                            'reinvestissement', 'rendement', 'distribution'))))
-    return ('<section class="c capital-box roic-box" id="roic-pertinent"><h3>⚖️ Le ROIC est-il pertinent ?</h3>'
-            '%s <span class="sub">Rotation du capital %s</span>%s'
-            '<div class="roic-badges">%s%s%s</div>%s%s%s'
-            '<p class="sub">Moteur de rendement du triangle (croissance du BPA + dividende) : %s.</p>'
-            '<details><summary>🍋 Le test de la glacière</summary>'
-            '<p class="sub">Léa investit 1 000 € dans une machine et gagne 200 €/an (20 %%). Tom investit 50 € dans une glacière '
-            'et gagne 50 €/an (100 %%). Ses clients et son temps bornent ses ventes.</p>'
-            '<p>Un concurrent bien financé peut-il faire la même chose avec une glacière à 50 € ?</p>%s%s'
-            '</details></section>') % (
-        bdg(intensite, niveaux.get(intensite, 'gris')), fr(rotation, 1), reglette,
-        bdg('🍋 Glacière ' + c['glaciere'], niveau_glaciere),
-        bdg('🔺 ' + (t['af'] if c['doc'] else 'n.d.'), t['aflvl'] if c['doc'] else 'gris'),
-        bdg(machine, 5 if machine.startswith('MACHINE') else 4 if machine == 'ENTRE LES DEUX' else 'gris'),
-        '<p>%s</p>' % esc(message) if message else '',
-        '<p class="sub">%s</p>' % esc(c['note']) if c['note'] else '',
-        '<p>%s</p>' % esc(machine_txt) if machine_txt else '',
-        ('%s %%/an brut' % fr(t['moteur'], 1)) if c['doc'] and num(t.get('moteur')) else 'n.d.',
-        '<p class="sub">%s</p>' % esc(c['preuve']) if c['preuve'] else '',
-        intrants)
+    """V23.6 : trois questions lisibles ; methode et pedagogie a la demande."""
+    c, t, rb = R['capital'], R['triangle'], R['rentab']
+    if 'boule_neige' not in R:
+        calc_boule_neige(D, R)
+    b = R['boule_neige']
+    leger = c['intensite'] in CAPITAL_LEGER
+    med, cout = rb.get('med'), rb.get('wacc')
+    ratio_utile = c.get('origine') != 'RACHATS' and c['intensite'] != 'NÉGATIF'
+    rentable = num(med) and num(cout) and ratio_utile
+    if not ratio_utile:
+        rent_lab, rent_lvl = 'ROIC non interprétable', 'gris'
+        rent_txt = 'Vérifier les flux et reconstituer le capital opérationnel.'
+    elif leger:
+        rent_lab, rent_lvl = 'ROIC à relativiser', 4
+        rent_txt = 'Peu de capital suffit pour fonctionner. Ce ratio ne mesure pas les possibilités de croissance.'
+    elif rentable:
+        rent_lab, rent_lvl = ('Au-dessus de son coût', 5) if med > cout else ('Au coût du capital', 4) if med == cout else ('Sous son coût', 2)
+        rent_txt = 'Rentabilité historique ; les nouveaux investissements peuvent rapporter autrement.'
+    else:
+        rent_lab, rent_lvl = 'Rentabilité à documenter', 'gris'
+        rent_txt = 'Le rendement et son coût doivent être comparables et documentés.'
+    if c['protection_documentee']:
+        prot_lab, prot_lvl = 'Protection documentée', 5
+        prot_txt = c['protection'] or 'Avantage opérationnel documenté.'
+    elif c['glaciere'] == 'COPIABLE':
+        prot_lab, prot_lvl = 'Facile à copier', 2
+        prot_txt = 'Un concurrent peut reproduire le modèle. La rentabilité peut être fragile.'
+    else:
+        prot_lab, prot_lvl = 'Protection à documenter', 'gris'
+        prot_txt = 'La rentabilité seule ne prouve pas un avantage concurrentiel.'
+    croissance = ('%s %%/an' % fr(R.get('gc'), 1)) if num(R.get('gc')) else 'n.d.'
+    metrique = rb.get('metrique', 'ROIC')
+    mesure = ('%s %%' % fr(med, 1)) if num(med) and ratio_utile else 'n.d.'
+    deb_lab = {'DÉMONTRÉS': 'Débouchés étayés', 'PLAUSIBLES': 'Débouchés plausibles', 'LIMITÉS': 'Débouchés limités'}.get(b['debouches'], 'Débouchés à documenter') if b['debouches_documentes'] else 'Débouchés à documenter'
+    deb_lvl = {'DÉMONTRÉS': 5, 'PLAUSIBLES': 4, 'LIMITÉS': 3}.get(b['debouches'], 'gris') if b['debouches_documentes'] else 'gris'
+    horizon = ('Horizon estimé et étayé : %s ans.' % fr(b['horizon'], 0)) if num(b['horizon']) else 'Durée à documenter.'
+    cartes = [
+        ('1', 'Est-elle rentable ?', mesure, metrique + ' médian', rent_lab, rent_lvl, rent_txt),
+        ('2', 'Peut-elle grandir ?', croissance, 'Croissance prévue par action', deb_lab, deb_lvl, horizon),
+        ('3', 'Qu’est-ce qui la protège ?', '', '', prot_lab, prot_lvl, prot_txt),
+    ]
+    cards = ''.join('<article class="snow-card"><div class="snow-question">%s</div>%s%s<div class="snow-status">%s</div><p>%s</p></article>' % (
+        esc(titre), '<div class="snow-number">%s</div>' % esc(valeur) if valeur else '',
+        '<div class="snow-caption">%s</div>' % esc(caption) if caption else '',
+        bdg(lab, lvl, 'wrap'), esc(txt)) for _, titre, valeur, caption, lab, lvl, txt in cartes)
+    allocation_txt = {
+        'RÉINVESTISSEMENT IMPORTANT': 'Une part importante des profits est réinvestie. Il faut encore vérifier ce qu’elle rapportera.',
+        'CASH SURTOUT DISTRIBUÉ': 'Le cash va surtout aux dividendes et aux rachats. Cela n’empêche pas une croissance peu coûteuse en capital.',
+        'ALLOCATION MIXTE': 'Les profits servent à la fois à investir et à rémunérer les actionnaires.',
+    }.get(c['machine'], 'L’utilisation des profits reste à documenter.')
+    mc, objectif = R.get('tri_mult_constant'), R.get('tx')
+    prix_lvl = (5 if mc >= objectif else 3) if num(mc) and num(objectif) else 'gris'
+    prix_txt = ('%s %%/an net estimé' % fr(mc, 1)) if num(mc) else 'Rendement non calculé'
+    prix_note = ('Objectif de la ligne : %s %%/an net.' % fr(objectif, 1)) if num(objectif) else 'Objectif non documenté.'
+    prix_note += ' Trajectoire centrale, avec dividendes et fiscalité du dossier. Les rachats sont déjà dans la croissance par action.'
+    preuves = [('Mécanisme', b['voie']), ('Débouchés', b['debouches_texte'] or 'Non documentés.'),
+        ('Financement', b['financement_texte'] or 'Non documenté.'),
+        ('Ce qui limite la croissance', b['limite'] or 'Limite non documentée.'),
+        ('Protection', c.get('preuve') or 'Non documentée.')]
+    preuves_html = ''.join('<div class="snow-proof"><strong>%s</strong><p>%s</p></div>' % (esc(k), esc(v)) for k, v in preuves)
+    if b['manques']:
+        preuves_html += '<div class="snow-missing"><strong>Ce qui manque pour conclure</strong><ul>%s</ul></div>' % ''.join('<li>%s</li>' % esc(s) for s in b['manques'])
+    technique = ('<div class="scroll"><table><tr><th>Coût du capital</th><td>%s %%</td></tr>'
+        '<tr><th>Capital nécessaire</th><td>%s · rotation %s</td></tr>'
+        '<tr><th>Réinvestissement / rendement retenu / distribution</th><td>%s / %s / %s</td></tr>'
+        '<tr><th>Compatibilité financière du triangle</th><td>%s</td></tr>'
+        '<tr><th>Capital investi</th><td>%s</td></tr><tr><th>Définition</th><td>%s</td></tr></table></div>' % (
+            fr(cout, 1), esc(c['intensite']), fr(c['rotation'], 1),
+            *(('%s %%' % fr(c[k], 1)) if num(c[k]) else 'n.d.' for k in ('reinvestissement', 'rendement', 'distribution')),
+            esc(t['af']), qual_texte(G(D, 'capital.capital_investi_meur')), qual_texte(G(D, 'capital.definition'))))
+    if c.get('note'):
+        technique += '<p class="sub">%s</p>' % esc(c['note'])
+    technique += '<p class="sub">Le rendement retenu par le triangle peut être une approximation historique : ce n’est pas une preuve du rendement futur. Une faible contrainte en capital ne prouve pas les débouchés.</p>'
+    # L'ancien encadre est conserve dans le detail, au lieu de repeter sa table en lecture principale.
+    technique += encadres_qualite(D, R)
+    return ('<section class="c capital-box snow-box" id="roic-pertinent"><div class="snow-head">'
+        '<div><div class="snow-eyebrow">RENTABILITÉ · CROISSANCE · PROTECTION</div><h3>❄️ La boule de neige</h3></div>'
+        '%s</div><p class="snow-intro">%s</p><div class="snow-grid">%s</div>'
+        '<div class="snow-row"><strong>Où va l’argent ?</strong><div>%s<p>%s</p></div></div>'
+        '<div class="snow-row"><strong>À ce prix, sans hausse du multiple</strong><div>%s<p>%s</p></div></div>'
+        '<details><summary>Pourquoi cette conclusion ?</summary>%s</details>'
+        '<details><summary>Chiffres, historique et sources</summary>%s</details>'
+        '<details><summary>Comprendre le ROIC : l’exemple de la glacière</summary>'
+        '<p>Une machine de 1 000 € rapporte 200 €/an : rendement de 20 %%. Une glacière de 50 € rapporte 50 €/an : rendement de 100 %%.</p>'
+        '<p><strong>Mais peut-on vendre dix fois plus ?</strong> Sans nouveaux clients, le rendement de 100 %% ne fait pas grandir les profits. Il faut aussi un modèle protégé des concurrents.</p></details>'
+        '<p class="snow-footnote">Une rentabilité élevée ne garantit pas une hausse du cours. Ce bloc résume les preuves ; le verdict d’achat dépend aussi de la qualité, du prix et des contrôles du dossier.</p></section>') % (
+            bdg(b['lab'], b['lvl'], 'wrap'), esc(b['txt']), cards,
+            bdg(c['machine'], 'gris', 'wrap'), esc(allocation_txt),
+            bdg(prix_txt, prix_lvl, 'wrap'), esc(prix_note), preuves_html, technique)
 
 
 # ------------------------------------------------------------------ ligne NICO
@@ -3253,8 +3373,11 @@ def resume(D, R):
             T['synth'], T['metrique'], fr(T.get('roic'), 1), fr(T.get('g'), 1), fr(T.get('rdt') or 0, 1), fr(T.get('moteur'), 1), T.get('per_lab', 'PER'), fr(T.get('per'), 1), fr(T.get('pegy'), 2),
             T['af'], (' (théorique %s %%/an)' % fr(T['gmax'], 1)) if num(T.get('gmax')) else ''))
     c = R['capital']
-    L.append('⚖️ Capital : %s (rotation %s) · glacière %s · %s' % (
+    L.append('⚖️ Capital : %s (rotation %s) · protection %s · %s' % (
         c['intensite'], fr(c['rotation'], 1), ' '.join(filter(None, (c['glaciere'], c['protection']))), c['machine']))
+    b = R.get('boule_neige')
+    if b:
+        L.append('❄️ %s — %s' % (b['lab'], b['txt']))
     if WARN:
         L.append('\u26a0\ufe0f ' + ' \u00b7 '.join(WARN))
     L.append(R['nico'])
@@ -3289,6 +3412,7 @@ def main():
     calc_valeur(D, R)     # V23 (B)
     calc_capital(D, R)    # V23.5 (D), avant la lecture du triangle
     calc_triangle(D, R)   # V23 (C)
+    calc_boule_neige(D, R)  # V23.6 : lecture des preuves, aucun effet financier
     nbm, nbp = compter_these(G(D, 'acte0.these.texte'))
     if nbm > 80 or not (3 <= nbp <= 4):
         warn('Th\u00e8se : %s mots / %s phrases \u2014 format 3 \u00e0 4 phrases, 80 mots au plus.' % (nbm, nbp))
