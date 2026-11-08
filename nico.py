@@ -15,10 +15,11 @@ Fait tout ce qui est mecanique, pour que le modele n'ecrive que des faits et des
 Aucun appel reseau. Les seuils sont ici ET dans le fichier A : ne jamais modifier l'un sans l'autre.
 """
 import json, sys, os, re, math, html, copy, hashlib, datetime, statistics as stx
+from decimal import Decimal
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V25.3"
+VERSION = "V26.0.1"
 VERSION_DATE = "08/11/2026"
 # Journal des versions archive dans NICO_Historique_Versions.md (hors Projet, sur le PC de Nico).
 # V25.3 : débouchés accessibles et capacité de conquête ; contrôle d’autofinancement conservé.
@@ -89,6 +90,17 @@ def fr(x, d=1, signe=False):
 
 def fprix(p):
     return 'n.d.' if not num(p) else fr(p, 0 if abs(p) >= 100 else 1 if abs(p) >= 10 else 2)
+
+
+def fplafond(p):
+    """Prix limite affichable sans dépasser le seuil calculé."""
+    if not num(p) or p <= 0:
+        return 'n.d.'
+    montant = Decimal(str(p))
+    precision = max(2, 1 - montant.adjusted())
+    entier, _, decimales = format(montant, 'f').partition('.')
+    decimales = decimales[:precision].rstrip('0')
+    return entier + (',' + decimales if decimales else '')
 
 
 # ------------------------------------------------------------------ niveaux
@@ -1035,9 +1047,9 @@ def appliquer_plancher(D, R, Bs, ctx, pmax, _prix, C, mact):
             if num(R[k]):
                 R[k] = min(R[k], R['P60'])
         warn('Prix d’achat ramené de %s à %s par la règle des −40 %% (capital préservé du baissier ≥ 60/100).'
-             % (fprix(R['PA_fond']), fprix(R['PA'])))
+             % (fplafond(R['PA_fond']), fplafond(R['PA'])))
     chk('Règle des −40 % (capital préservé ≥ 60)', 'validé',
-        'prix plancher %s%s' % (fprix(R['P60']), ' — limite le prix d’achat' if R['plancher_limite'] else ' — non contraignant'))
+        'prix plancher %s%s' % (fplafond(R['P60']), ' — limite le prix d’achat' if R['plancher_limite'] else ' — non contraignant'))
 
 
 def calculer(D):
@@ -1187,7 +1199,7 @@ def calculer(D):
     if num(tn0) and tn0 > 0 and num(R.get('PA')):
         pa_ok = R['PA'] >= tn0 - 1e-9
         chk('Prix d\u2019achat \u2265 tr\u00e9sorerie nette par action (V22.7.1)', 'valid\u00e9' if pa_ok else '\u00e9chec',
-            'prix %s, tr\u00e9sorerie nette %s' % (fprix(R['PA']), fprix(tn0)))
+            'prix %s, tr\u00e9sorerie nette %s' % (fplafond(R['PA']), fprix(tn0)))
         if not pa_ok:
             warn('Prix d\u2019achat sous la tr\u00e9sorerie nette par action : v\u00e9rifier que le cash n\u2019est ni '
                  'perdu dans le multiple, ni consid\u00e9r\u00e9 comme inaccessible sans le dire (tresorerie_an4).')
@@ -1503,7 +1515,7 @@ def verdict_final(D, R):
             mot = 'cours au-dessus du prix d\'achat'
             if num(cc_) and cc_ < CAP_MIN:
                 mot = ('r\u00e8gle des \u221240 %% : capital pr\u00e9serv\u00e9 %s/100 au cours, prix plancher %s%s'
-                       % (fr(cc_, 0), fprix(R.get('P60')),
+                       % (fr(cc_, 0), fplafond(R.get('P60')),
                           '' if (not num(pf_) or vv(meta.get('cours')) <= pf_ + 1e-9) else ' (et cours au-dessus du prix au taux exig\u00e9)'))
             E.append((6, 'WATCHLIST %s \u2014 PRIX' % ('PROCHE' if R.get('porte_prix') == 'PROCHE' else 'LOIN'), mot))
         if veut and R.get('unites_suspectes'):
@@ -1522,7 +1534,7 @@ def verdict_final(D, R):
         if ('RENFORCEMENT' in ach and R.get('porte_prix') == 'ouverte' and num(R.get('PR'))
                 and vv(meta.get('cours')) > R['PR'] + 1e-9):
             E.append((8, 'ACHAT COMPL\u00c9MENTAIRE POSSIBLE',
-                      'cours entre le prix de renforcement (%s) et le prix d\'achat' % fprix(R['PR'])))
+                      'cours entre le prix de renforcement (%s) et le prix d\'achat' % fplafond(R['PR'])))
     E.sort(key=lambda e: e[0])
     vf = E[0][1] if E else (prop or 'n.d.')
     motifs = [E[0][2]] if E else []
@@ -1562,18 +1574,40 @@ def prov(p):
     return '<sup class="pv">%s</sup>' % esc(p) if p else ''
 
 
-def publication_resultats_html(D):
-    """Une saisie pour la synthèse du pilote et le détail sourcé de l'épisode 6."""
+def encart_alerte(titre, contenu, niveau='orange'):
+    return ('<aside class="alerte alerte-%s"><h3><span aria-hidden="true">⚠</span> %s</h3>%s</aside>'
+            % (niveau, esc(titre), contenu))
+
+
+def actualite_majeure_html(D):
+    news = G(D, 'resultats.actualite_majeure')
+    if not (isinstance(news, list) and len(news) == 4
+            and all(isinstance(x, str) and x.strip() for x in news)):
+        return ''
+    fait, date, source, effet = news
+    date, date_eval = _date(date), _date(G(D, 'meta.date_eval'))
+    if not date or (date_eval and date > date_eval):
+        return ''
+    return encart_alerte('Actualité majeure', '<p><strong>%s</strong></p><p>%s</p><div class="sub">%s · %s</div>' % (
+        esc(fait), esc(effet), date.strftime('%d/%m/%Y'), esc(source)), 'bleu')
+
+
+def publication_resultats_html(D, R, pastilles=True):
+    """Une saisie pour la synthèse et le détail sourcé des derniers résultats."""
     pub = G(D, 'resultats.publication')
     if not isinstance(pub, dict) or not pub:
-        return '', ''
+        pub = {}
     date = _date(pub.get('date'))
     date_eval = _date(G(D, 'meta.date_eval'))
     periode, source = pub.get('periode'), pub.get('source')
     if not (date and all(isinstance(s, str) and s.strip() for s in (periode, source))):
-        return '', '<p class="sub">Publication à compléter · date, période et source officielle requises.</p>'
-    if date_eval and date > date_eval:
-        return '', '<p class="sub">Publication postérieure à la date du dossier · écartée de la synthèse.</p>'
+        contexte = 'Publication à compléter · date, période et source officielle requises.'
+        pub = {}
+    elif date_eval and date > date_eval:
+        contexte = 'Publication postérieure à la date du dossier · écartée de la synthèse.'
+        pub = {}
+    else:
+        contexte = '%s · publié le %s' % (periode, date.strftime('%d/%m/%Y'))
 
     def lignes(cle, limite):
         brut = pub.get(cle)
@@ -1593,7 +1627,7 @@ def publication_resultats_html(D):
             return fr(publie - base, 2, True) + ' ' + unite
         return fr((publie / base - 1) * 100, 1, True) + ' %'
 
-    points, rows = [], []
+    rows = []
     for row in lignes('chiffres', 3):
         if len(row) < 4:
             continue
@@ -1604,10 +1638,6 @@ def publication_resultats_html(D):
         if not (num(attendu) and isinstance(src, str) and src.strip() and date_cons and date_cons < date):
             attendu = None
         var_an, surprise = ecart(publie, avant, unite), ecart(publie, attendu, unite)
-        points.append('<li><b>%s</b> · %s %s publié · %s · %s</li>' % (
-            esc(nom), chiffre(publie), esc(unite),
-            esc('%s sur un an' % var_an) if num(avant) else 'période comparable n.d.',
-            esc('%s attendu (%s)' % (chiffre(attendu), surprise)) if num(attendu) else 'consensus antérieur n.d.'))
         preuve = '%s · %s' % (src, date_cons.strftime('%d/%m/%Y')) if num(attendu) else 'n.d.'
         rows.append('<tr>' + ''.join('<td>%s</td>' % esc(x) for x in (
             '%s (%s)' % (nom, unite), chiffre(avant), chiffre(attendu), chiffre(publie), var_an, surprise, preuve)) + '</tr>')
@@ -1618,32 +1648,32 @@ def publication_resultats_html(D):
         etat, horizon, ancien, nouveau = (guidance + [''] * 4)[:4]
         if etat in ('RELEVÉE', 'ABAISSÉE', 'MAINTENUE', 'INITIÉE', 'RETIRÉE', 'NON CHIFFRÉE', 'SANS GUIDANCE', 'N.D.'):
             chemin = ' → '.join(x for x in (ancien, nouveau) if isinstance(x, str) and x.strip())
-            direction = '<p><b>Guidance</b> · %s</p>' % esc(' · '.join(
-                x for x in (etat, horizon, chemin) if isinstance(x, str) and x.strip()))
+            texte = esc(' · '.join(x for x in (etat, horizon, chemin) if isinstance(x, str) and x.strip()))
+            direction = (encart_alerte('Guidance sous pression', '<p>%s</p>' % texte, 'rouge')
+                         if etat in ('ABAISSÉE', 'RETIRÉE') else '<p><b>Guidance</b> · %s</p>' % texte)
 
-    annonces = []
+    annonces, majeures = [], []
     for row in lignes('annonces', 2):
         if row and isinstance(row[0], str) and row[0].strip():
-            annonces.append('<li>%s</li>' % esc(' · '.join(x for x in row[:4] if isinstance(x, str) and x.strip())))
-    suites = '<p><b>Ce qui change pour la suite</b></p><ul>%s</ul>' % ''.join(annonces) if annonces else ''
-    these = pub.get('these')
-    impact = ''
-    niveaux = {'RENFORCÉE': 5, 'INCHANGÉE': 'gris', 'FRAGILISÉE': 2}
-    if isinstance(these, list) and len(these) == 2 and all(isinstance(s, str) for s in these) and these[0] in niveaux:
-        impact = '<p><b>Lecture de la thèse</b> · %s%s</p>' % (
-            bdg(these[0], niveaux[these[0]]), ' · ' + esc(these[1]) if these[1].strip() else '')
-
-    if not (points or direction or suites or impact):
-        return '', ''
-    titre = '<p class="sub">%s · publié le %s</p>' % (esc(periode), date.strftime('%d/%m/%Y'))
-    synthese = ('<div class="c"><h3>Que disent les derniers résultats ?</h3>%s%s%s%s%s'
-                '<p class="sub"><a href="#publication-resultats">Chiffres et sources · épisode 6</a></p></div>') % (
-        titre, '<ul>%s</ul>' % ''.join(points) if points else '', direction, suites, impact)
+            annonce = '<li>%s</li>' % esc(' · '.join(x for x in row[:4] if isinstance(x, str) and x.strip()))
+            (majeures if len(row) >= 5 and row[4] is True else annonces).append(annonce)
+    suites = encart_alerte('Annonce majeure', '<ul>%s</ul>' % ''.join(majeures), 'bleu') if majeures else ''
+    if annonces:
+        suites += '<p><b>Ce qui change pour la suite</b></p><ul>%s</ul>' % ''.join(annonces)
     table = ('<div class="scroll"><table><tr><th>Indicateur</th><th>Comparable</th><th>Attendu</th>'
              '<th>Publié</th><th>Écart annuel</th><th>Surprise</th><th>Consensus antérieur</th></tr>%s'
              '</table></div>') % ''.join(rows) if rows else ''
-    detail = '<div id="publication-resultats">%s%s<p class="sub">Source officielle · %s</p></div>' % (titre, table, esc(source))
-    return synthese, detail
+    res = D.get('resultats') or {}
+    confirmations = ' · '.join(' — '.join(str(y) for y in c if y) if isinstance(c, list) else str(c)
+                                for c in (res.get('confirmations') or []) if c)
+    verdict = res.get('verdict') or 'INDÉTERMINÉ'
+    source_html = '<p class="sub">Source officielle · %s</p>' % esc(source) if pub else ''
+    return ('<div class="c" id="publication-resultats"><h3>Derniers résultats et guidance</h3><div>%s</div>'
+            '<p class="sub">%s</p>%s%s%s%s%s%s</div>') % (
+        bdg(verdict, L_LAB('resultats', verdict)), esc(contexte),
+        trimestre_html(R) if pastilles else '', table, direction, suites, source_html,
+        ''.join('<p class="sub">%s</p>' % esc(x) for x in
+                (res.get('guidance') or res.get('commentaire'), confirmations) if x))
 
 
 CSS = """
@@ -1654,8 +1684,7 @@ box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:en
 html{scroll-padding-top:env(safe-area-inset-top,0px)}
 body{margin:0;background:var(--bg);color:var(--txt);
 font-family:"Iowan Old Style","Charter",Georgia,serif;font-size:18px;line-height:1.62;
-background-image:linear-gradient(var(--bord2) 1px,transparent 1px),linear-gradient(90deg,var(--bord2) 1px,transparent 1px);
-background-size:64px 64px;background-position:-1px -1px}
+;background-position:-1px -1px}
 .wrap{max-width:1220px;margin:0 auto;padding:34px 24px 80px}
 h1{font-size:40px;line-height:1.12;margin:0 0 6px;font-weight:600;letter-spacing:-.015em}
 h2{font-size:15px;margin:52px 0 16px;font-weight:600;color:var(--cy);
@@ -1711,8 +1740,7 @@ background:linear-gradient(160deg,rgba(57,214,224,.09),rgba(57,214,224,.015) 55%
 .concl p{font-size:19px;line-height:1.6}
 .nico{border:1px dashed var(--cy2);border-radius:10px;padding:14px 16px;font-size:14px;color:var(--cy);
 word-break:break-all;background:#04100f;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-details{border-top:1px solid var(--bord2);padding-top:12px;margin-top:12px}
-summary{cursor:pointer;color:var(--txt2);font-size:15px}
+.dossier-detail{border-top:1px solid var(--bord2)}
 .chart{display:flex;align-items:flex-end;gap:6px;height:130px;margin-top:12px}
 .chart div{flex:1;background:var(--cy);border-radius:3px 3px 0 0;min-height:1px;position:relative}
 .chart div.e{background:repeating-linear-gradient(45deg,var(--cy2),var(--cy2) 4px,#0c1113 4px,#0c1113 8px)}
@@ -1741,21 +1769,18 @@ background-image:linear-gradient(rgba(57,214,224,.04) 1px,transparent 1px),linea
 .snow-status{margin:12px 0}.snow-box .b{font-family:inherit;line-height:1.35;font-size:13px;padding:6px 11px}
 .snow-card p,.snow-row p{font-size:14px;color:var(--txt2);line-height:1.55;margin:10px 0 0}
 .snow-row{display:grid;grid-template-columns:minmax(170px,27%) 1fr;gap:20px;padding:19px 0;border-top:1px solid #2b3d42;font-size:15px}
-.snow-row strong{max-width:25ch}.snow-box details{margin-top:0;padding:15px 0;border-top:1px solid #2b3d42}
-.snow-box summary{color:var(--txt);font-family:inherit;font-size:14px;font-weight:550}
-.snow-box details p{font-size:15px;margin-top:12px}.snow-proof{margin-top:18px;font-size:14px}.snow-proof p{margin:5px 0 0;color:var(--txt2)}
+.snow-row strong{max-width:25ch}.snow-box .dossier-detail{margin-top:0;padding:15px 0;border-top:1px solid #2b3d42}
+.snow-box .dossier-detail p{font-size:15px;margin-top:12px}.snow-proof{margin-top:18px;font-size:14px}.snow-proof p{margin:5px 0 0;color:var(--txt2)}
 .snow-missing{margin-top:20px;font-size:14px}.snow-missing ul{margin-top:10px;padding-left:18px;list-style:disc}.snow-missing li{padding:0;margin:6px 0;font-size:14px}.snow-missing li::before{content:none}
 .snow-box .capital-box{margin-top:20px;background:transparent;border-color:var(--bord)}
 .snow-footnote{font-size:12px;color:var(--txt2);margin:12px 0 0;max-width:95ch}
 @media(max-width:820px){.snow-grid{grid-template-columns:1fr}.snow-row{grid-template-columns:1fr;gap:9px}.snow-box{padding:22px}.snow-box h3{font-size:25px}.snow-card{padding:20px}}
-@media print{.snow-box,.snow-card{background:white;color:black}.snow-number,.snow-box h3,.snow-question,.snow-box summary{color:black}}
+@media print{.snow-box,.snow-card{background:white;color:black}.snow-number,.snow-box h3,.snow-question,.snow-box h4{color:black}}
 .ep{margin:70px 0 20px;padding-top:24px;border-top:1px solid var(--cy2)}
 .ep-n{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;letter-spacing:.16em;color:var(--cy)}
 .ep h2{font-family:"Iowan Old Style","Charter",Georgia,serif;font-size:31px;line-height:1.2;color:var(--txt);margin:8px 0 10px;letter-spacing:-.01em}
 .ep-c{color:var(--txt2);font-size:18px;max-width:80ch;margin:0}
 .enclair{border-left:3px solid var(--cy);border-radius:0 12px 12px 0;background:rgba(57,214,224,.07);padding:16px 20px;margin:0 0 22px;font-size:19px;line-height:1.6}
-details.coul{margin-top:40px;border:1px dashed var(--bord);border-radius:12px;padding:14px 18px}
-details.coul>summary{color:var(--cy);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px}
 @media(max-width:480px){.ep h2{font-size:25px}}
 .gen{display:grid;grid-template-columns:1fr auto 1fr auto 1fr auto 1fr;gap:10px;align-items:stretch;margin-top:18px}
 .gen-e{border:1px solid var(--bord);border-radius:14px;padding:16px 18px;background:var(--carte)}
@@ -1768,7 +1793,7 @@ details.coul>summary{color:var(--cy);font-family:ui-monospace,SFMono-Regular,Men
 @media(max-width:820px){.g4,.g3,.g5,.g2{grid-template-columns:1fr 1fr}h1{font-size:32px}.cours{font-size:34px}}
 @media(max-width:480px){.g4,.g3,.g5,.g2{grid-template-columns:1fr}.head{flex-direction:column}
 body{font-size:17px}.cours{text-align:left}}
-@media print{body{background:#fff;color:#000;background-image:none}.c,.concl{border-color:#999}.b{border:1px solid #333}}
+@media print{body{background:#fff;color:#000}.c,.concl{border-color:#999}.b{border:1px solid #333}}
 """
 
 
@@ -1793,34 +1818,17 @@ def qual_badge(value):
     return bdg(lab, levels.get(lab, 'gris'))
 
 
-def qual_serie(serie):
-    # Ne pas inventer de points ni convertir une absence en zéro.
-    rows = []
-    for item in (serie or []):
-        if not isinstance(item, (list, tuple)) or len(item) < 2:
-            continue
-        val = vv(item[1])
-        if not num(val) or not math.isfinite(val):
-            val = None
-        rows.append('<tr><td>%s</td><td class="n">%s</td><td>%s</td></tr>' % (
-            esc(item[0]), fr(val) + ' %' if val is not None else 'n.d.',
-            esc(' · '.join(str(x) for x in item[2:] if x is not None))))
-    return ('<div class="scroll"><table><tr><th>Exercice</th><th class="n">Valeur</th>'
-            '<th>Provenance / source</th></tr>%s</table></div>' % ''.join(rows)) if rows else '<p class="sub">Historique non documenté.</p>'
 
 
 def encadres_qualite(D, R):
     rent = D.get('rentabilite') or {}
-    mg = G(D, 'qualite.marge_brute') or {}
-    rb = R['rentab']
     rows = [
-        ('Combien rapporte la machine ?', 'Dernier %s : %s %% · médiane : %s %% · coût du capital : %s %%' % (esc(rb.get('metrique', 'ROIC')), fr(rb['last']), fr(rb['med']), fr(rb['wacc']))),
-        ('Est-elle durable ?', 'Mesurée : ' + qual_badge(rb.get('tend') or 'INCONNUE') + (' pente %s pts/an' % fr(rb.get('pente'), 1, True) if num(rb.get('pente')) else '') + ' · déclarée : ' + qual_badge(rent.get('tendance')) + qual_texte(rent.get('tendance_preuve'))),
+        ('Est-elle durable ?', 'Tendance déclarée · ' + qual_badge(rent.get('tendance')) + qual_texte(rent.get('tendance_preuve'))),
         ('Les nouveaux euros travaillent-ils aussi bien ?', qual_badge(rent.get('nouveaux_investissements')) + qual_texte(rent.get('rendement_incremental'))),
         ('Peut-elle grossir ?', qual_texte(rent.get('reinvestissement'))),
         ('Le chiffre est-il trompeur ?', qual_texte(rent.get('vigilance_comptable'))),
     ]
-    a = '<section class="c capital-box"><h3>La machine à créer du profit</h3><p class="sub">Chaque euro supplémentaire investi crée-t-il suffisamment de profit après impôt, et combien peut-on encore investir ainsi ?</p><table>'
+    a = '<section class="dossier-detail"><h4>La machine à créer du profit</h4><p class="sub">Chaque euro supplémentaire investi crée-t-il suffisamment de profit après impôt, et combien peut-on encore investir ainsi ?</p><table>'
     a += ''.join('<tr><th>%s</th><td>%s</td></tr>' % (esc(k), v) for k, v in rows)
     a += '</table><p class="sub">Source : ' + qual_texte(rent.get('source')) + '</p><p class="sub">ROIC après impôt ; AT ROCE comparable seulement à définition cohérente. Rentabilité économique ≠ rendement boursier.</p></section>'
     # V23.1 : encadre Marge brute retire du dossier (demande de Nico, 30/10/2026) ; le champ reste lu si present, sans affichage.
@@ -1841,7 +1849,13 @@ def inities_html(D, R):
     lvl = I.get('lvl', 'gris')
     bord = {6: 'var(--l5)', 5: 'var(--l5)', 4: 'var(--l4)', 3: 'var(--l3)', 2: 'var(--l2)', 1: 'var(--l1)'}.get(lvl, 'var(--gris)')
     cours = vv((D.get('meta') or {}).get('cours'))
-    o = ['<div class="c" style="border:2px solid %s"><h3>\U0001f454 Initiés — ce que les dirigeants font de leur propre argent</h3>' % bord]
+    actionnariat = V(G(D, 'gouvernance.actionnariat'))['v'] or 'NON DOCUMENTÉ'
+    kpi = V(G(D, 'gouvernance.kpi'))['v'] or 'NON PUBLIÉ'
+    o = ['<div class="c" style="border-color:%s"><h3>👔 Direction, initiés et alignement</h3>%s<div>%s %s</div>%s' % (
+        bord, '<p>%s</p>' % esc(G(D, 'qualite.direction_txt')) if G(D, 'qualite.direction_txt') else '',
+        bdg(actionnariat, L_LAB('actionnariat', actionnariat), 'wrap'),
+        bdg('KPI · ' + str(kpi), L_LAB('kpi', kpi), 'wrap'),
+        '<p class="sub">%s</p>' % esc(G(D, 'gouvernance.synthese')) if G(D, 'gouvernance.synthese') else '')]
     o.append('<div>%s</div>' % bdg(lab, lvl, 'gros'))
     if lab == 'NON VÉRIFIÉ':
         o.append('<p class="sub">Transactions des dirigeants non vérifiées dans ce dossier%s. '
@@ -1872,8 +1886,8 @@ def inities_html(D, R):
             esc(l['date']), esc(l['nom']), esc(l['fonction'] or ''), 5 if l['sens'] == 'ACHAT' else 2, l['sens'],
             esc(l['nature']) + ('' if l['compte'] else ' · non comptée'), _meur(l['montant']), fprix(l['prix']) if num(l['prix']) else 'n.d.')
             for l in sorted(I['lignes'], key=lambda l: l['age'] if l['age'] is not None else 9e9))
-        o.append('<details open><summary>Transactions retenues</summary><div class="scroll"><table>'
-                 '<tr><th>Date</th><th>Qui</th><th>Sens</th><th>Nature</th><th class="n">Montant</th><th class="n">Prix</th></tr>%s</table></div></details>' % rows)
+        o.append('<section class="dossier-detail"><h4>Transactions retenues</h4><div class="scroll"><table>'
+                 '<tr><th>Date</th><th>Qui</th><th>Sens</th><th>Nature</th><th class="n">Montant</th><th class="n">Prix</th></tr>%s</table></div></section>' % rows)
     o.append('<div class="sub">Seuil d’un flux fort : %s nets sur 12 mois (0,10 %% de la capitalisation, 250 k€ au moins), '
              'ou au moins 3 dirigeants dans le même sens en 90 jours. Seuls les achats et ventes de marché comptent : '
              'options, plans, attributions et ventes fiscales sont affichés sans être comptés. Source : %s.</div></div>' % (
@@ -1903,8 +1917,8 @@ def plancher_html(R):
         esc(c[0]), '\u2705' if c[1] else '\u274c', esc(c[2])) for c in R.get('B_cond') or [])
     lim = ''
     if R.get('plancher_limite') and num(R.get('PA')):
-        lim = ('<p><b>Le prix maximum d\u2019achat est limité par la règle des \u221240 %%</b> : %s au lieu de %s au seul taux exigé.</p>'
-               % (fprix(R['PA']), fprix(R.get('PA_fond'))))
+        lim = ('<p><b>La règle des −40 %% fixe le prix maximum d’achat</b>. Le seul taux exigé donnerait %s.</p>'
+               % fplafond(R.get('PA_fond')))
     elif R.get('plancher_limite'):
         lim = '<p><b>Aucun prix ne respecte la règle des \u221240 %</b> dans ce baissier : achat impossible.</p>'
     eff = []
@@ -1923,15 +1937,15 @@ def plancher_html(R):
             '<div class="rl" style="height:120px;margin-top:40px">%s%s%s</div>'
             '<div class="grid g3">%s%s%s</div>%s'
             '<div style="margin:10px 0">%s %s</div>'
-            '<details><summary>Crédibilité du baissier \u2014 les tests</summary><div class="scroll"><table>%s</table></div></details>'
-            '<details><summary>Modificateur « plancher prouvé » (\u22121 pt) \u2014 les conditions</summary><div class="scroll"><table>%s</table></div></details>'
+            '<section class="dossier-detail"><h4>Crédibilité du baissier \u2014 les tests</h4><div class="scroll"><table>%s</table></div></section>'
+            '<section class="dossier-detail"><h4>Modificateur « plancher prouvé » (\u22121 pt) \u2014 les conditions</h4><div class="scroll"><table>%s</table></div></section>'
             '</div>') % (
         seg, lab, cur,
         carte('Capital préservé au cours', '%s /100' % fr(cc, 0), L_CAP(cc), 'si le baissier arrive'),
-        carte('Au prix maximum d\u2019achat', '%s /100' % fr(cpa, 0), L_CAP(cpa), 'si tu achètes au plus haut autorisé (%s)' % fprix(R.get('PA'))),
-        carte('Prix max. sous la règle \u221240 %', fprix(R.get('P60')), 5 if not R.get('plancher_limite') else 3,
+        carte('Au prix maximum d\u2019achat', '%s /100' % fr(cpa, 0), L_CAP(cpa), 'si tu achètes au plus haut autorisé'),
+        carte('Prix max. sous la règle \u221240 %', 'Prix d’achat' if R.get('plancher_limite') else fplafond(R.get('P60')), 5 if not R.get('plancher_limite') else 3,
               'contraignant : il fixe le prix maximum d\u2019achat' if R.get('plancher_limite') else
-              'non contraignant : au-dessus du prix maximum d\u2019achat (%s)' % fprix(R.get('PA'))),
+              'non contraignant : au-dessus du prix maximum d’achat'),
         lim, bdg('Baissier ' + b.get('lab', 'n.d.'), b.get('lvl', 'gris')),
         ' '.join(bdg(e, 4) for e in eff) or '<span class="sub">aucun effet sur le taux ni sur la taille</span>',
         tests or '<tr><td>n.d.</td></tr>', conds or '<tr><td>n.d.</td></tr>')
@@ -1941,7 +1955,9 @@ def rendu(D, R):
     meta = D.get('meta') or {}
     valo = D.get('valo') or {}
     cours = vv(meta.get('cours')); dev = meta.get('devise', '')
-    resultats_pilote, resultats_detail = _sur(publication_resultats_html, D, defaut=('', ''))
+    voie = route_rail(R)
+    arbitre, confiance_arbitree = arbitre_html(D, R)
+    resultats = publication_resultats_html(D, R, pastilles=voie != 'B')
     BK = {}
     _cur = ['tete']
 
@@ -1952,15 +1968,16 @@ def rendu(D, R):
         _cur[0] = nom
     A('<!doctype html><html lang="fr"><head><meta charset="utf-8">')
     A('<meta name="viewport" content="width=device-width,initial-scale=1">')
-    A('<title>Dossier %s \u2014 %s</title><style>%s%s%s</style></head><body><div class="wrap">' % (
-        esc(meta.get('societe')), esc(meta.get('ticker')), CSS, CSS_V24, CSS_V25))
+    A('<title>Dossier %s \u2014 %s</title><style>%s%s%s%s%s%s</style></head><body><div class="wrap">' % (
+        esc(meta.get('societe')), esc(meta.get('ticker')), CSS, CSS_V24, CSS_V25, CSS_V254, CSS_V255, CSS_V26))
 
     # -- en-tete
-    A('<div class="p0">Dossier NICO %s · évalué le %s · cours du %s · %s · <span title="A faits officiels · B solides · C incertitude bornée · D invérifiable">fiabilité %s</span> · taux exigé %s\u00a0%%/an · %s</div>' % (
+    A('<div class="p0">Dossier NICO %s · évalué le %s · cours du %s · %s · <span title="A faits officiels · B solides · C incertitude bornée · D invérifiable">fiabilité %s</span> · %s</div>' % (
         VERSION, esc(meta.get('date_eval')), esc(meta.get('date_cours')), esc(meta.get('bourse')),
-        esc(meta.get('fiabilite')), fr(R.get('tx'), 1), ('ligne détenue (PF)' if R.get('detenue') else esc(meta.get('mode', 'nouvelle position')))))
+        esc(meta.get('fiabilite')), ('ligne détenue (PF)' if R.get('detenue') else esc(meta.get('mode', 'nouvelle position')))))
 
     # -- audit de revision : textes et tableaux fournis avec l'instantane.
+    S_('audit')
     audit = D.get('audit_valorisation') or {}
     if audit:
         A('<div class="c"><h3 style="color:var(--cy)">Valorisation corrigée · hypothèses explicites</h3>')
@@ -1983,26 +2000,21 @@ def rendu(D, R):
                 (' (dont %s mois prolong\u00e9s au rythme prudent)' % fr(al.get('extrapolation_mois'), 0)) if (al.get('extrapolation_mois') or 0) >= 0.5 else '',
                 fr(al['delai_mois'], 0))) if al else
             'exercices non dat\u00e9s \u2014 convention par d\u00e9faut (cl\u00f4tures aux anniversaires de l\u2019\u00e9valuation)'))
-    S_('pilote')
+    S_('prix_avertissement')
     if R.get('calc') and not R.get('valorisation_valide'):
-        A('<div class="c" style="border-color:var(--l2)">Prix indicatifs uniquement : ancrage terminal à corriger avant toute décision.</div>')
-    # -- verdict
+        A('<div class="c" style="border-color:var(--l2)">Prix indicatifs uniquement. Ancrage terminal à corriger avant toute décision.</div>')
     v = D.get('verdict') or {}
-    A(_sur(page1_html, D, R))  # V25 : la page 1 qui se lit comme on parle
-    A('<div class="tdb-titre">📊 LE TABLEAU DE BORD · LES CHIFFRES DERRIÈRE LA PAGE 1</div>')
-    A(_sur(action_html, D, R))  # V24 : que faire (version technique)
-    A('<div class="c"><div class="lab" style="margin-bottom:8px">Verdict de la Voie A (garder 3 à 5 ans) · décision de suivi</div><div>%s &nbsp; %s</div><p style="margin-top:10px;font-size:16px">%s</p>'
-      '<div class="sub">%s%s</div></div>' % (
-          bdg(R.get('verdict_final') or v.get('achat', 'n.d.'), L_LAB('achat', R.get('verdict_final')), 'gros'),
-          bdg(v.get('suivi', 'n.d.'), L_LAB('suivi', v.get('suivi')), 'gros'),
-          esc(v.get('phrase')), esc(v.get('cause')),
-          ' \u00b7 ' + esc(v.get('cause2')) if v.get('cause2') else ''))
-    A(flags_html(R))  # V23 : red flags ethique / Etat / forensique, sans blocage
-    A(resultats_pilote)
-    if not (R.get('recit') or {}).get('chapeau'):
-        A(fait_cle_html(R))  # V24 : le fait qui explique le prix (repris par la page 1 sinon)
-    A(_sur(pilote_html, D, R))  # V23.7 : les trois reponses + capital preserve + phrase en clair
-    A(_sur(pari_html, D, R))  # V24 : asymetrie, esperance, confiance
+    S_('ouverture')
+    A(entete_html(D, R))
+    A(business_html(D))
+    A(verdict_titre_html(R))
+    A(boussole_html(D))
+    S_('alertes')
+    A(actualite_majeure_html(D))
+    A(flags_html(R))
+    risques = [r for r in (G(D, 'risques.registre') or []) if isinstance(r, dict)]
+    A(risques_majeurs_html(risques))
+    S_('controles_decision')
     _B = R.get('voie_b') or {}
     A('<div class="c"><h3>Les portes de l\u2019achat</h3><div>%s</div><div class="sub">Voie A : il faut tout en vert ; '
       '\u26aa = non \u00e9valu\u00e9.</div><div style="margin-top:14px;line-height:2.4">'
@@ -2010,7 +2022,7 @@ def rendu(D, R):
           bdg(('\u2705 ' if e else '\u26aa ' if e is None else '\u274c ') + n, 5 if e else 'gris' if e is None else 2)
           for n, e in portes(D, R)),
           bdg('Voie A (3–5 ans) : %s' % (R.get('verdict_final') or 'n.d.'), L_LAB('achat', R.get('verdict_final')), 'wrap'),
-          bdg('Voie B (12–18 mois) : %s' % (_B.get('lab') or 'n.d.').replace('VOIE B ', '').replace('VOIE A OUVERTE', 'sans objet'),
+          bdg('Voie B (12–24 mois) : %s' % (_B.get('lab') or 'n.d.').replace('VOIE B ', '').replace('VOIE A OUVERTE', 'sans objet'),
               _B.get('lvl', 'gris'), 'wrap') if _B else ''))
     if R.get('verdict_modifie'):
         A('<div class="c" style="border-color:var(--l3)"><b>Verdict corrig\u00e9 par le moteur.</b> '
@@ -2019,18 +2031,18 @@ def rendu(D, R):
               'aussi : ' + x for x in (R.get('verdict_secondaires') or [])]))))
 
     q = R['q']
-    S_('coulisses')
+    S_('taux_exige')
 
     mr = ''.join('<tr><td>%s</td><td class="n t%s">%s pt</td></tr>' % (
         esc(lab), 5 if d < 0 else 3, fr(d, 1, True)) for lab, d in (R.get('tx_mods') or []))
     if not mr:
         mr = '<tr><td>aucun modificateur retenu</td><td class="n">0 pt</td></tr>'
-    A('<div class="c"><h3>Taux exig\u00e9 de la ligne \u2014 %s %%/an</h3>'
+    A('<div class="c"><h3>Taux exig\u00e9 de la ligne</h3>'
       '<div class="sub">Base 15 %%, born\u00e9 12\u201321 %%. Ce taux ne facture que le risque '
       '<b>non mod\u00e9lisable dans les flux</b> (juridiction, liquidit\u00e9, perte irr\u00e9versible) : '
       'ce qui est d\u00e9j\u00e0 chiffr\u00e9 dans le sc\u00e9nario baissier ou dans le multiple terminal n\'y figure pas : un risque ne se paie qu\'une fois.</div>'
       '<div class="scroll"><table>%s<tr><td><b>Taux exig\u00e9 retenu</b></td><td class="n"><b>%s %%</b></td></tr></table></div>%s</div>' % (
-          fr(R.get('tx'), 1), mr, fr(R.get('tx'), 1),
+          mr, fr(R.get('tx'), 1),
           '<div class="sub">Valeur born\u00e9e \u00e0 l\'intervalle 12\u201321 %.</div>' if R.get('tx_borne') else ''))
 
     S_('plancher')
@@ -2039,42 +2051,8 @@ def rendu(D, R):
     A('<div class="sub" style="margin:6px 0 14px">Tri rapide : %s. Les scores sont des conventions de s\u00e9lection en %%, pas des probabilit\u00e9s.</div>' % esc(meta.get('tri')))
 
     S_('ep1')
-    # -- ACTE 0
-    a0 = D.get('acte0') or {}
-    th = a0.get('these') or {}
-    nbm, nbp = compter_these(th.get('texte'))
-    rev = ''.join('<tr><td>%s</td><td class="n">%s</td><td class="n">%s</td><td>%s</td></tr>' % (
-        esc(r[0]), esc(r[1]), esc(r[2] if len(r) > 2 else ''), prov(r[3] if len(r) > 3 else '')) for r in (a0.get('revenus') or []))
-    A('<div class="grid g2">')
-    A('<div class="c"><h3>Ce qu\'elle fait</h3>'
-      '<p><b>Activit\u00e9</b> \u2014 %s</p><p><b>Positionnement</b> \u2014 %s</p><p><b>Perspectives</b> \u2014 %s</p>'
-      '<div class="scroll"><table>%s</table></div><div class="sub">%s %s</div></div>' % (
-          esc(a0.get('activite')), esc(a0.get('positionnement')), esc(a0.get('perspectives')), rev,
-          esc(V(a0.get('ratio_echelle'))['v']), prov(V(a0.get('ratio_echelle'))['prov'])))
-    A('<div class="c"><h3>La th\u00e8se en 80 mots</h3><p>%s</p>'
-      '<div class="sub">%s mots \u00b7 %s phrases%s</div></div>' % (
-          esc(th.get('texte')), nbm, nbp,
-          '' if (nbm <= 80 and 3 <= nbp <= 4) else ' \u2014 <span class="t3">hors format</span>'))
-    A('</div>')
-
-    # -- V22.8 : le probleme existera-t-il encore ?
-    avr = R.get('avenir') or {}
-    if avr.get('doc'):
-        A('<div class="c"><h3>\U0001f52e Le problème existera-t-il encore ?</h3>'
-          '<p><b>Problème résolu</b> — %s</p><div class="grid g3">'
-          '<div><div class="lab">Le besoin demain</div><div>%s</div><div class="sub">%s</div></div>'
-          '<div><div class="lab">La société en gardera-t-elle la valeur ?</div><div>%s</div><div class="sub">%s</div></div>'
-          '<div><div class="lab">Lecture</div><div>%s</div><div class="sub">%s</div></div></div>'
-          '<div class="sub">Lecture seulement : les faits se notent dans Modèle 2 et Modèle 3, '
-          'aucun point ni effet sur le prix. Un besoin croissant ne garantit pas des profits croissants.</div></div>' % (
-              esc(avr.get('probleme') or 'n.d.'),
-              bdg(avr.get('ex'), avr.get('ex_lvl', 'gris')), esc(avr.get('ex_txt')),
-              bdg(avr.get('ca'), avr.get('ca_lvl', 'gris')), esc(avr.get('ca_txt')),
-              bdg(avr.get('synth'), avr.get('lvl', 'gris')), esc(avr.get('txt'))))
-    else:
-        A('<div class="c"><h3>\U0001f52e Le problème existera-t-il encore ?</h3><div>%s</div>'
-          '<div class="sub">Rubrique non renseignée dans ce dossier.</div></div>' % bdg('NON DOCUMENTÉ', 'gris'))
-    A(profil_html(D, R))  # V23 : fiche de tri
+    A(avenir_html(D, R))
+    A(ia_bpa_html(D, R))
 
     # -- bande compacte
     sec = D.get('secteur') or {}
@@ -2092,29 +2070,9 @@ def rendu(D, R):
 
     # ---------------- bloc 1
     S_('resultats')
-    ial = V(G(D, 'risques.ia'))['v']
-    pp = V(G(D, 'qualite.pouvoir_prix'))
-    res = D.get('resultats') or {}
-    rp = res.get('reperes') or {}
-    cells = ''.join('<td class="n">%s %%</td>' % fr(rp.get(k), 1, True) for k in ('ca_n1', 'ca_attentes', 'bpa_n1', 'bpa_attentes'))
-    A('<div class="c"><h3>Derniers r\u00e9sultats et guidance</h3><div>%s</div>'
-      '<div class="scroll"><table><tr><th class="n">CA vs N\u22121</th><th class="n">CA vs attentes</th>'
-      '<th class="n">BPA vs N\u22121</th><th class="n">BPA vs attentes</th></tr><tr>%s</tr></table></div>'
-      '%s<p>%s</p><div class="sub">Confirmations : %s</div></div>' % (
-          bdg(res.get('verdict', 'IND\u00c9TERMIN\u00c9'), L_LAB('resultats', res.get('verdict'))), cells,
-          resultats_detail, esc(res.get('guidance') or res.get('commentaire')), esc(' \u00b7 '.join((' \u2014 '.join(str(y) for y in c if y) if isinstance(c, list) else str(c))
-                                for c in (res.get('confirmations') or []) if c))))
-    rows = ''.join('<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % (
-        esc(r.get('fait')), esc(r.get('mecanisme')), esc(r.get('gravite')), esc(r.get('indicateur')), esc(r.get('hypothese')))
-        for r in (G(D, 'risques.registre') or []))
+    A(resultats)
     S_('registre')
-    A('<div class="c"><h3>Registre des risques</h3><div class="scroll"><table>'
-      '<tr><th>Fait</th><th>M\u00e9canisme</th><th>Gravit\u00e9</th><th>Indicateur avanc\u00e9</th><th>Hypoth\u00e8se</th></tr>%s</table></div>'
-      '<div style="margin-top:10px">%s %s</div><div class="sub">%s</div></div>' % (
-          rows, bdg('IA : %s' % (ial or 'IND\u00c9TERMIN\u00c9'), L_LAB('ia', ial)),
-          bdg('Cycle capex IA : %s' % (V(G(D, 'risques.capex_ia'))['v'] or 'IND\u00c9TERMIN\u00c9'),
-              L_LAB('capex', V(G(D, 'risques.capex_ia'))['v'])),
-          esc(V(G(D, 'risques.ia'))['prov'])))
+    A(registre_html(risques))
 
     # ---------------- bloc 2
     S_('piliers')
@@ -2129,29 +2087,15 @@ def rendu(D, R):
                           '' if p['obs'] == 3 else ' \u2014 %s/3 contr\u00f4les, PARTIEL' % p['obs'],
                           max(0, min(100, p['pct'] or 0)), lvc(lv).replace('l', 'l') if lv != 'gris' else 'gris'))
     inconnus = G(D, 'qualite.inconnus') or []
-    A('<div class="c"><h3>Six piliers</h3>%s<div class="sub">Q = %s %% \u00b7 couverture %s %%%s</div></div>' % (
-        ''.join(barres), fr(q['Q'], 0), fr(q['cov'], 0),
+    A('<div class="c"><h3>Six piliers</h3>%s<div class="sub">Couverture %s %%%s</div></div>' % (
+        ''.join(barres), fr(q['cov'], 0),
         ' \u00b7 contr\u00f4les inconnus : ' + esc(', '.join(inconnus)) if inconnus else ''))
     S_('boule')
-    A(capital_html(D, R))
-    S_('valeur' if (R.get('valeur') or {}).get('doc') else 'masque')  # V24 : bloc vide -> angles morts
-    A(valeur_html(R))  # V23 : creation de valeur
-
-    S_('moatdir')
-    A('<div class="grid g2"><div class="c"><h3>Moat et pouvoir de prix</h3><p>%s</p><div>%s</div><div class="sub">%s</div></div>'
-      '<div class="c"><h3>Direction, initi\u00e9s et alignement</h3><p>%s</p><div>%s %s %s</div><div class="sub">%s</div></div></div>' % (
-          esc(G(D, 'qualite.moat')), bdg('Pouvoir de prix : %s' % (pp['v'] or 'IND\u00c9TERMIN\u00c9'), L_LAB('prix', pp['v'])),
-          esc(pp['prov'] or pp['src'] or G(D, 'qualite.pouvoir_prix_preuve') or ''),
-          esc(G(D, 'qualite.direction_txt')),
-          bdg('Initi\u00e9s : %s' % ((R.get('init') or {}).get('lab') or 'NON V\u00c9RIFI\u00c9'),
-              (R.get('init') or {}).get('lvl', 'gris')),
-          bdg(V(G(D, 'gouvernance.actionnariat'))['v'] or 'NON DOCUMENT\u00c9',
-              L_LAB('actionnariat', V(G(D, 'gouvernance.actionnariat'))['v'])),
-          bdg('KPI : %s' % (V(G(D, 'gouvernance.kpi'))['v'] or 'NON PUBLI\u00c9'),
-              L_LAB('kpi', V(G(D, 'gouvernance.kpi'))['v'])),
-          esc(G(D, 'gouvernance.synthese'))))
-    A(inities_html(D, R))  # V23.1 : rectangle des initiés juste sous « Direction, initiés et alignement »
-
+    A(boule_neige_html(D, R))
+    S_('rentabilite')
+    A(rentabilite_capital_html(D, R))
+    S_('direction')
+    A(inities_html(D, R))
     S_('traj')
     tb = R.get('tableau_aff') or {}
     if tb.get('annees'):
@@ -2171,7 +2115,6 @@ def rendu(D, R):
 
     # ---------------- bloc 3
     S_('prix_tri')
-    tol = R.get('tolerance')
     A('<div class="grid g3">%s%s%s</div>' % (
         carte('Multiple de sortie exig\u00e9 par le cours', ('%s\u00d7' % fr(R.get('mult_exige'), 1)) if num(R.get('mult_exige')) else 'n.d.',
               L_LAB('mult_exige', R.get('mult_exige_lab')),
@@ -2192,23 +2135,26 @@ def rendu(D, R):
     # barrette decisionnelle : seulement les niveaux actionnables au-dessus de l'objectif
     PA, PR, PS = R.get('PA'), R.get('PR'), R.get('PS')
     ta = R.get('tx_action') or (15.0, 18.0, 21.0)
-    if all(num(x) for x in (PA, PR, PS)):
-        hi = max(PA * 1.15, cours * 1.15)
+    pa_montre = num(PA) and voie == 'A' and not confiance_arbitree and not R.get('confiance')
+    if all(num(x) for x in (PA, PR, PS, cours)) and max(PA, cours) > 0:
+        hi = max(PA, cours) * 1.15
         pc = lambda p: max(0.0, min(100.0, 100 * p / hi))
         segs = [(0, pc(PS), '#2dc7c9'), (pc(PS), pc(PR), '#4ede9a'),
                 (pc(PR), pc(PA), '#9edb6b'), (pc(PA), 100, '#f0605f')]
-        sg = ''.join('<div class="seg" style="left:%s%%;width:%s%%;background:%s"></div>' % (a, max(0.4, b - a), c) for a, b, c in segs)
-        tk = ''.join('<div class="tick" style="left:clamp(84px,%s%%,calc(100%% - 84px));top:%spx">%s \u00b7 %s %% \u00b7 %s</div>' %
-                     (pc(p), top, lib, fr(t, 0), fprix(p)) for p, t, lib, top in
-                     ((PS, ta[2], 'Forte marge', 70), (PR, ta[1], 'Renfort', 92),
-                      (PA, ta[0], 'Prix max.' + (' (r\u00e8gle \u221240 %)' if R.get('plancher_limite') else ''), 114)))
-        A('<div class="c"><h3>Barrette de prix (%s)</h3><div class="rl">%s%s'
-          '<div class="cur" style="left:clamp(96px,%s%%,calc(100%% - 96px))">\u25b2 cours %s \u2192 %s %%/an</div></div>'
-          '<div class="sub">Prix maximum d\u2019achat (%s %%/an) : %s \u00b7 renfort %s %% : %s \u00b7 forte marge %s %% : %s. '
-          'Cours du jour : %s \u2192 %s %%/an. Aucun palier sous le prix maximum d\u2019achat n\'est affich\u00e9.</div></div>' % (
-              esc(dev), sg, tk, pc(cours), fprix(cours), fr(R.get('retenu'), 1),
-              fr(ta[0], 0), fprix(PA), fr(ta[1], 0), fprix(PR), fr(ta[2], 0), fprix(PS),
-              fprix(cours), fr(R.get('retenu'), 1)))
+        sg = ''.join('<div class="seg" style="left:%s%%;width:%s%%;background:%s"></div>' %
+                     (a, max(0.4, b - a), c) for a, b, c in segs)
+        pa_txt = ('Prix maximum d’achat <b id="prix-achat">%s %s</b>' % (fplafond(PA), esc(dev))) if pa_montre else 'Prix maximum d’achat'
+        niveaux = [(pa_txt, ta[0])]
+        for lib, seuil, taux in (('Renfort', PR, ta[1]), ('Forte marge', PS, ta[2])):
+            prix_seuil = ('au même plafond' if fplafond(seuil) == fplafond(PA)
+                          else '<b>%s %s</b>' % (fplafond(seuil), esc(dev)))
+            niveaux.append(('%s %s' % (lib, prix_seuil), taux))
+        seuils = ''.join('<li>%s <span class="sub">(%s %%/an)</span></li>' % (lib, fr(t, 1)) for lib, t in niveaux)
+        A('<div class="c"><h3>Barrette de prix (%s)</h3><div class="rail-barrette">%s'
+          '<span class="rail-barrette-cours" style="left:%s%%" aria-label="Cours du jour"></span></div>'
+          '<ul class="rail-seuils">%s</ul></div>' % (esc(dev), sg, pc(cours), seuils))
+    elif pa_montre:
+        A('<p id="prix-achat">Prix maximum d’achat <b>%s %s</b></p>' % (fplafond(PA), esc(dev)))
 
     srows = ''
     for nom in ('baissier', 'central', 'haussier'):
@@ -2231,11 +2177,11 @@ def rendu(D, R):
       '<th class="n">Valeur \u00e0 4 ans</th><th class="n">TRI</th></tr>%s</table></div>'
       '<div class="sub">Base publi\u00e9e %s \u2192 base normalis\u00e9e %s \u00b7 %s</div>'
       '<div style="margin-top:10px">%s %s</div>'
-      '<div class="sub">Multiple exig\u00e9 par le cours pour %s %%/an nets : %s\u00d7 (\u00e0 comparer au multiple central) \u00b7 seconde m\u00e9thode : %s</div></div>' % (
+      '<div class="sub">Seconde méthode : %s</div></div>' % (
           srows, fr(vv(valo.get('base_publiee')), 2), fr(vv(valo.get('base_normalisee')), 2), esc(valo.get('effet')),
           bdg('Multiple exig\u00e9 : %s' % R.get('mult_exige_lab', 'n.d.'), L_LAB('mult_exige', R.get('mult_exige_lab'))),
           bdg('Part du multiple %s %%' % fr(R.get('part_mult'), 0), R.get('niv_part', 'gris')) if num(R.get('part_mult')) else '',
-          fr(R.get('tx'), 1), fr(R.get('mult_exige'), 1), esc(valo.get('seconde_methode') or 'n.d.')))
+          esc(valo.get('seconde_methode') or 'n.d.')))
     # V23.1 : bloc « Robustesse du rendement » retire (demande de Nico, 30/10/2026) ; calculs conserves dans le moteur.
 
     # ---------------- bloc 4
@@ -2257,80 +2203,90 @@ def rendu(D, R):
           ' <span class="sub">%s%s</span>' % (esc((R.get('momentum_lecture') or {}).get('txt', '')),
               ' \u00b7 les tranches 50/25/25 exigent aussi la performance relative 6 mois' if (R.get('momentum') == 'IND\u00c9TERMIN\u00c9' and num((R.get('momentum_lecture') or {}).get('mm'))) else ''),
           fr(R.get('cap_PA'), 0), esc(R.get('priorite') or 'n.d.')))
-    lec = D.get('lecture') or {}
-    A('<div class="c"><h3>Points forts et points faibles</h3><div class="grid g2">'
-      '<ul class="plus">%s</ul><ul class="moins">%s</ul></div></div>' % (
-          ''.join('<li>%s</li>' % esc(x) for x in (lec.get('forces') or [])),
-          ''.join('<li>%s</li>' % esc(x) for x in (lec.get('faiblesses') or []))))
-    pd = lec.get('point_decisif') or {}
-    A('<div class="concl"><h3>Conclusion</h3><p>%s</p>'
-      '<p><b>Point d\u00e9cisif</b><br>Raison du prix : %s<br>Fondement du d\u00e9saccord : %s<br>'
-      'Ce qui nous donnerait tort : %s<br>Marge d\'erreur : %s<br>Pourquoi maintenant : %s</p>'
-      '<p>Action : %s</p><p>Invalidation : %s</p><p class="sub">Prochain catalyseur : %s</p>'
-      '<p>%s \u2014 %s <span class="sub">(\u00e9ch\u00e9ance %s ; non remplie \u2192 \u274c sans nouvelle analyse)</span></p></div>' % (
-          esc(lec.get('these_2p')), esc(pd.get('raison_prix')), esc(pd.get('desaccord')), esc(pd.get('tort')),
-          esc(pd.get('marge_erreur') or ''), pm_html(R), esc(lec.get('action')), esc(lec.get('invalidation')),
-          esc(lec.get('catalyseur')), bdg(v.get('suivi', 'n.d.'), L_LAB('suivi', v.get('suivi')), 'gros'),
-          esc(v.get('suivi_condition')), esc(v.get('suivi_date'))))
-
     # ligne NICO + annexes
     S_('nico')
     A('<h2>Ligne pour l\'outil de tri</h2><div class="nico">%s</div>' % esc(R['nico']))
-    S_('coulisses')
+    S_('sources')
     src = ''.join('<li>%s%s %s</li>' % (
         esc(s[0]), (' \u2014 <a href="%s" style="color:var(--cy)">lien</a>' % esc(s[1])) if (len(s) > 1 and str(s[1]).startswith(('http://', 'https://'))) else '',
         esc(s[2] if len(s) > 2 else '')) for s in (D.get('sources') or []))
+    controles_moteur = []
+    for lib, etat, note in CHK:
+        if lib.startswith('Prix d’achat ≥ trésorerie nette par action'):
+            _, _, tresorerie = note.partition(', trésorerie nette ')
+            if tresorerie:
+                note = 'Trésorerie nette par action ' + tresorerie + '. Voir le plafond dans la lecture de prix.'
+        elif lib.startswith('Règle des −40 %') and R.get('plancher_limite') and num(PA):
+            note = 'Le prix plancher fixe le prix maximum d’achat.'
+        controles_moteur.append([lib, etat, note])
+    alertes_controles = ['Le plancher de perte borne le prix d’achat.' if a.startswith('Prix d’achat ramené de ') else a for a in WARN]
     ctr = ''.join('<tr><td>%s</td><td>%s</td><td>%s</td></tr>' % (esc(c[0]), esc(c[1]), esc(c[2] if len(c) > 2 else ''))
-                  for c in (D.get('controles') or []) + [list(x) for x in CHK])
-    A('<details><summary>Sources, contr\u00f4les et hypoth\u00e8ses</summary><ul>%s</ul>'
+                  for c in (D.get('controles') or []) + controles_moteur)
+    A('<section class="dossier-detail"><h4>Sources, contr\u00f4les et hypoth\u00e8ses</h4><ul>%s</ul>'
       '<div class="scroll"><table><tr><th>Contr\u00f4le</th><th>\u00c9tat</th><th>Note</th></tr>%s</table></div>'
       '<p class="sub">Fiscalit\u00e9 : net selon les hypoth\u00e8ses indiqu\u00e9es \u2014 plus-value 10 %%, TOB 0,35 %% \u00e0 l\'achat et \u00e0 la vente, '
-      'pr\u00e9compte 30 %%, retenue \u00e9trang\u00e8re %s %%. %s</p><p class="sub">%s</p></details>' % (
+      'pr\u00e9compte 30 %%, retenue \u00e9trang\u00e8re %s %%. %s</p><p class="sub">%s</p></section>' % (
           src, ctr, fr(100 * (valo.get('retenue_etrangere') or 0), 0), esc(valo.get('fiscalite_note')),
-          esc(' \u00b7 '.join(WARN))))
+          esc(' \u00b7 '.join(alertes_controles))))
     S_('script')
     src = json.dumps(D.get('_source') or {}, ensure_ascii=False).replace('</', '<\\/')
     A('<script type="application/json" id="nico-source" data-version="%s">%s</script>' % (VERSION, src))
     A('</div></body></html>')
-    # ---------------- V23.7 : assemblage en episodes
-    meta_ = D.get('meta') or {}
-    S7, d7 = R.get('sources_g') or {}, R.get('duree') or {}
-    acc2 = 'Notre central : %s. Le passé : %s. Les analystes : %s.' % (
-        ('%s %%/an de BPA' % fr(R.get('gc'), 1)) if num(R.get('gc')) else 'n.d.',
-        ('%s %%/an' % fr(S7.get('passe'), 1)) if num(S7.get('passe')) else 'n.d.',
-        ('%s %%/an' % fr(S7.get('consensus'), 1)) if num(S7.get('consensus')) else 'non documentés')
-    acc3 = 'Ce qui empêche un concurrent bien financé de prendre clients et profits, et pendant combien d’années.'
-    acc4 = ('Si le mauvais scénario arrive, il te reste %s € sur 100 au cours du jour.' % fr(R.get('cap_cours'), 0)
-            if num(R.get('cap_cours')) else 'Les risques qui pourraient faire mentir la thèse.')
-    acc5 = ('Au cours du jour : %s %%/an pour un seuil de %s %%. Prix maximum d’achat : %s %s.' % (
-        fr(R.get('retenu'), 1), fr(R.get('tx'), 1), fprix(R.get('PA')), esc(meta_.get('devise', '')))
-        if R.get('calc') else 'Valorisation non exécutée : pas de prix d’achat.')
-    acc6 = ('Combien acheter (taille %s), à quel rythme (tranches %s), et ce qui te ferait changer d’avis.' % (taille_txt(R), R.get('tranches') or 'n.d.')
-            if (R.get('taille') or {}).get('statut') != 'sans objet' else
-            'Pourquoi l’achat standard est bloqué, ce qui rouvrirait la porte, la Voie B, et ce qui te ferait changer d’avis.')
-
     def T_(*noms):
         return ''.join(''.join(BK.get(n_, [])) for n_ in noms)
-    pages = [T_('tete', 'pilote'),
-             episode('ÉPISODE 1', 'L’histoire', 'Ce qu’elle fait, le problème qu’elle résout, ce qu’elle apporte au monde, et pourquoi elle pourrait gagner.'),
-             T_('ep1'), _sur(monde_html, R),
-             episode('ÉPISODE 2', 'La croissance : de combien les bénéfices grandissent', acc2),
-             _sur(marche_html, D, R), _sur(croissance_html, D, R, meta_.get('devise', '')),
-             ('<details class="c"><summary>📋 Le tableau des chiffres : CA, marge, BPA, FCF par action</summary>%s</details>' % T_('traj')) if BK.get('traj') else '',
-             T_('vent'),
-             episode('ÉPISODE 3', 'La forteresse : combien de temps ça tient', acc3),
-             _sur(duree_html, R), T_('moatdir', 'piliers', 'boule'),
-             T_('valeur'),
-             episode('ÉPISODE 4', 'Ce qui peut la casser', acc4), T_('registre', 'risq_cartes', 'plancher'),
-             episode('ÉPISODE 5', 'Le prix : combien tu gagnes', acc5), T_('prix', 'prix_tri'),
-             episode('ÉPISODE 6', 'Le plan', acc6), T_('resultats'), _sur(voie_b_html, D, R), _sur(porte_ouverture_html, D, R),
-             T_('plan'), _sur(angles_morts_html, R), T_('nico'),
-             '<details class="coul"><summary>🎬 Coulisses — taux exigé, horizon, contrôles, sources et lexique</summary>%s%s</details>' % (T_('coulisses'), lexique_html()),
-             T_('script')]
-    return ''.join(pages)
+
+    r = R.get('recit') or {}
+    q1, q1_couleur, _ = r.get('q1', ('À documenter.', 'gris', []))
+    q_ok = dict(R.get('portes') or []).get('Qualité')
+    q_couleur = couleur_feu(q_ok, q1_couleur if q1_couleur in ('rouge', 'orange') else 'orange')
+    if q_ok is False and q1_couleur == 'vert':
+        q1 = 'La porte qualité reste fermée.'
+    croissance = (T_('ep1') + marche_html(D, R) + croissance_html(D, R, dev)
+                  + dossier_detail('Historique et projections', T_('traj')) + T_('vent', 'boule'))
+    longevite = duree_html(D, R) + T_('registre', 'risq_cartes')
+    suite_prix = [re.sub(r'(?<=ne tient pas compte )de (le|les) ', lambda m: 'du ' if m[1] == 'le' else 'des ', x)
+                  for x in r.get('suite', [])]
+    note_prix = ''.join('<p>%s</p>' % x for x in r.get('chapeau', []) + suite_prix)
+    q3 = r.get('q3', ('', 'gris', []))[0]
+    regle = regle_html(D, R, afficher_plafond=False)
+    prix = (T_('prix_avertissement', 'audit') + note_prix
+            + ('<h3>Règle des prix</h3>' + regle if regle else '')
+            + T_('prix') + ('<p>%s</p>' % esc(q3) if q3 and voie != 'B' else '')
+            + (pile_face_html(R) if voie != 'B' else '') + T_('plancher', 'prix_tri')
+            + pari_html(D, R, confiance_arbitree or voie != 'A'))
+    qualite = (T_('piliers') + revenus_html(D) + T_('resultats', 'rentabilite', 'direction')
+               + angles_morts_html(R) + monde_html(R))
+    if voie == 'B':
+        qualite += ('<aside class="rail-aiguillage"><h3>🔀 Aiguillage</h3><p>La porte qualité (70 %) n’est pas franchie. '
+                    'La Voie A s’arrête ici. On examine la Voie B, une revalorisation sur 12 à 24 mois.</p></aside>')
+    suivante = ('La porte qualité est franchie. Va-t-elle encore grandir ?' if voie == 'A' else
+                'La Voie A s’arrête ici. La décote justifie-t-elle la Voie B ?' if voie == 'B' else
+                'Les portes requises ne sont pas franchies. Passons à la décision.')
+    stations = [station('qualite', 'Qualité', '🏛️', 'Est-ce une bonne entreprise ?',
+                        '%s %%' % fr(q['Q'], 0) if num(q.get('Q')) else 'n.d.',
+                        q1, q_ok, q_couleur, suivante, qualite)]
+    if voie == 'A':
+        stations.extend(stations_a(R, croissance, longevite, prix))
+    elif voie == 'B':
+        stations.extend(stations_b(D, R))
+    couleurs = ','.join('var(--rail-%s)' % x['couleur'] for x in stations)
+    rail = ('<main class="rail-vertical" style="--rail-degrade:linear-gradient(%s)">%s%s</main>' % (
+        couleurs if len(stations) > 1 else couleurs + ',' + couleurs,
+        ''.join(chapitre_rail(D, i, x) for i, x in enumerate(stations, 1)), terminus_html(D, R, voie)))
+    action = R.get('action') or {}
+    voyants = action.get('voyants') or []
+    suivi = '<div class="c"><h3>🚨 Voyants de suivi</h3><ul>%s</ul></div>' % ''.join(
+        '<li>%s</li>' % esc(x) for x in voyants) if voyants else ''
+    annexe = (dossier_detail('Sources et contrôles', T_('sources'))
+              + dossier_detail('Coulisses', T_('coulisses', 'taux_exige')) + lexique_html())
+    memo = pour_memoire_html(D, R, croissance, longevite, prix, confiance_arbitree) if voie != 'A' else ''
+    tactique = voie_b_html(D, R) if voie != 'B' else ''
+    return (T_('tete', 'ouverture') + sommaire_rail(stations, voie, action) + arbitre + T_('alertes')
+            + rail + T_('controles_decision') + porte_ouverture_html(D, R) + T_('plan') + suivi + tactique
+            + T_('nico') + memo + annexe + T_('script'))
 
 
-# ------------------------------------------------------------------ Fiche de tri, création de valeur et autofinancement
+# ------------------------------------------------------------------ Repères de risque, création de valeur et autofinancement
 # Trois blocs de LECTURE. Aucun point dans Q, aucun veto, aucun effet sur le taux exige, le prix ou la taille (R3).
 L_SPREAD2 = lambda x: cut(x, [0, 2, 4, 8], [2, 3, 4, 5, 6])      # economic spread, pts
 L_EVAM = lambda x: cut(x, [0, 5, 10], [2, 3, 4, 5])               # marge EVA, % du CA
@@ -2369,7 +2325,7 @@ def _note_ctrl(D, pilier, i):
 
 
 def calc_profil(D, R):
-    """(A) Fiche de tri : les criteres du tri 10 par 10, visibles dans le dossier complet.
+    """Repères de risque et de qualité, distribués dans les sections du dossier.
     Ethique contraire et Etat > 50 % = red flags affiches, jamais un blocage (decision de Nico, 30/10/2026)."""
     pr = D.get('profil') if isinstance(D.get('profil'), dict) else {}
     out = {'doc': bool(pr)}
@@ -2416,8 +2372,7 @@ def calc_profil(D, R):
     out['forensique'] = {'z': z, 'm': m, 'f': f, 'sloan': s, 'alertes': alertes, 'mesures': mesures,
                          'absents': absents, 'exclus': exclus, 'financier': financier}
     if len(alertes) >= 2:
-        warn('Double alerte forensique (%s) : investigation requise. Dans le tri 10 par 10, ta règle la plafonne en liste 4 ; '
-             'aucun effet automatique dans le moteur.' % ' ; '.join(alertes))
+        warn('Double alerte forensique (%s) : investigation requise. Voie B fermée.' % ' ; '.join(alertes))
     # red flags : signal seulement
     flags = []
     e = out['ethique']
@@ -2426,13 +2381,12 @@ def calc_profil(D, R):
     elif e['cle'] in ('À TRANCHER', 'A TRANCHER'):
         flags.append((3, '⚠️ Éthique — à trancher', e['txt'] or 'motif non précisé'))
     if num(etat) and etat > 50:
-        flags.append((1, '\U0001f6a9 État actionnaire de contrôle (%s %%)' % fr(etat, 0),
+        flags.append((1, '\U0001f6a9 État actionnaire de contrôle (%s %%)' % fr(etat, 1),
                       out['etat_txt'] or 'contrôle public : intérêt de l’État avant celui des minoritaires possible'))
     elif num(etat) and etat > 10:
-        flags.append((3, '⚠️ État actionnaire à %s %%' % fr(etat, 0), out['etat_txt']))
+        flags.append((3, '⚠️ État actionnaire à %s %%' % fr(etat, 1), out['etat_txt']))
     if len(alertes) >= 2:
         flags.append((3, '⚠️ Double alerte forensique', ' · '.join(alertes)))
-    R['flags'] = flags
     # coherence avec les controles proprietaires (aucune note modifiee)
     m2, v1 = _note_ctrl(D, 'modele', 1), _note_ctrl(D, 'visibilite', 0)
     km, kr, kc = out['moat']['cle'], out['recurrence']['cle'], out['cycle']['cle']
@@ -2445,6 +2399,7 @@ def calc_profil(D, R):
     if kr == 'PONCTUEL' and v1 == 1:
         warn('Revenus déclarés PONCTUELS alors que Visibilité 1 = 1 (contrats ou carnet fiables) : justifier ou corriger.')
     if kc == 'HAUT DE CYCLE':
+        flags.append((3, '⚠️ Haut de cycle probable', out['cycle']['txt'] or 'Fait à documenter.'))
         bp, bn = vv(G(D, 'valo.base_publiee')), vv(G(D, 'valo.base_normalisee'))
         if num(bp) and num(bn) and bp > 0 and bn >= 0.98 * bp:
             warn('Haut de cycle probable mais base normalisée ≈ base publiée : la base est-elle au sommet ? (§7 : milieu de cycle).')
@@ -2452,17 +2407,14 @@ def calc_profil(D, R):
         lab_a = str((anc[0] if isinstance(anc, list) and anc else anc) or '').upper()
         if anc and not any(k in lab_a for k in ('MILIEU DE CYCLE', 'PIRE EXERCICE')):
             warn('Haut de cycle probable : le baissier devrait partir du milieu de cycle ou du pire exercice publié.')
-    manquants = [nom for nom, k in (('moat', 'moat'), ('récurrence', 'recurrence'), ('cycle', 'cycle'),
-                                    ('éthique', 'ethique')) if out[k]['lvl'] == 'gris']
+    R['flags'] = flags
+    manquants = [nom for nom, k in (('moat', 'moat'), ('cycle', 'cycle'), ('éthique', 'ethique'))
+                 if out[k]['lvl'] == 'gris']
     if not num(etat):
         manquants.append('part de l’État')
-    if not num(s):
-        manquants.append('Sloan')
-    if manquants:
-        warn('Fiche de tri incomplète (profil) : %s.' % ', '.join(manquants))
-    chk('Fiche de tri (V23)', 'validé' if not manquants else 'n.d.',
+    chk('Repères de qualité et de risque', 'validé' if not manquants else 'n.d.',
         'complète' if not manquants else 'manque : ' + ', '.join(manquants))
-    chk('Éthique et État : signal sans blocage (V23)', 'validé',
+    chk('Éthique, État, cycle et alertes comptables', 'validé',
         ' ; '.join(t for _, t, _ in flags) if flags else 'aucun red flag')
     R['profil'] = out
 
@@ -2849,60 +2801,121 @@ def calc_boule_neige(D, R):
         limite=str(b.get('limite') or ''), manques=manque)
 
 
-def _col(l):
-    return 'var(--gris)' if l in ('gris', 'doc', None) else 'var(--l%s)' % (5 if l == 6 else l)
 
 
 def flags_html(R):
-    fl = R.get('flags') or []
-    if not fl:
-        return ''
-    pire = min(l for l, _, _ in fl)
-    rows = ''.join('<div style="margin:8px 0">%s<div class="sub" style="margin-top:4px">%s</div></div>' % (
-        bdg(t, l, 'gros wrap'), esc(x)) for l, t, x in fl)
-    return ('<div class="c" style="border:2px solid %s"><h3>Red flags — à toi de trancher</h3>%s'
-            '<div class="sub">Signal seulement : aucun effet sur le verdict, le prix, le taux exigé ni la taille. '
-            'Tu décides en conscience si tu passes outre.</div></div>') % (_col(pire), rows)
+    # L’éthique reste avec l’impact, et les alertes comptables avec les angles morts.
+    alertes = [f for f in R.get('flags') or [] if 'État' in f[1] or 'Haut de cycle' in f[1]]
+    return ''.join(encart_alerte(t.removeprefix('🚩 ').removeprefix('⚠️ '), '<p>%s</p>' % esc(x) if x else '',
+                                 'rouge' if l == 1 else 'orange')
+                   for l, t, x in sorted(alertes, key=lambda f: 'État' not in f[1]))
 
 
-def profil_html(D, R):
-    P = R.get('profil') or {}
-    if not P:
-        return ''
-    fo = P.get('forensique') or {}
+def gravite_risque(valeur):
+    g = set(re.findall(r'[a-z]+', _sans_accent(valeur)))
+    if g & {'critique', 'majeur', 'majeure', 'eleve', 'elevee', 'fort', 'forte', 'high', 'severe', 'material'}:
+        return 2
+    if g & {'modere', 'moderee', 'moyen', 'moyenne', 'intermediaire', 'medium'}:
+        return 3
+    return 5 if g & {'faible', 'mineur', 'mineure', 'bas', 'basse', 'low'} else 'gris'
 
-    def tuile(titre, lab, lvl, txt):
-        return ('<div><div class="lab">%s</div><div style="margin-top:6px">%s</div><div class="sub">%s</div></div>'
-                % (esc(titre), bdg(lab, lvl, 'wrap'), esc(txt)))
-    etat = P.get('etat')
-    ial = V(G(D, 'risques.ia'))['v']
-    f_txt = 'Altman Z %s · Beneish M %s · Piotroski %s/9 · Sloan %s' % (
-        fr(fo.get('z'), 2), fr(fo.get('m'), 2), fr(fo.get('f'), 0), fr(fo.get('sloan'), 2))
-    na = len(fo.get('alertes') or [])
-    nm = fo.get('mesures', 0)
-    f_lab = '%s ALERTE%s SUR %s MESURÉ%s' % (na, 'S' if na > 1 else '', nm, 'S' if nm > 1 else '')
-    f_known = nm > 0
-    f_cov = []
-    if fo.get('absents'):
-        f_cov.append('non documentés : ' + ', '.join(fo['absents']))
-    if fo.get('exclus'):
-        f_cov.append('non applicables au secteur financier : ' + ', '.join(fo['exclus']))
-    tiles = [
-        tuile('\U0001f3f0 Moat', P['moat']['lab'], P['moat']['lvl'], P['moat']['txt']),
-        tuile('\U0001f501 Récurrence des revenus', P['recurrence']['lab'], P['recurrence']['lvl'], P['recurrence']['txt']),
-        tuile('\U0001f504 Cycle', P['cycle']['lab'], P['cycle']['lvl'], P['cycle']['txt']),
-        tuile('\U0001f916 IA', ial or 'INDÉTERMINÉ', L_LAB('ia', ial), V(G(D, 'risques.ia'))['prov'] or ''),
-        tuile('\U0001f331 Éthique', P['ethique']['lab'], P['ethique']['lvl'], P['ethique']['txt']),
-        tuile('\U0001f3db️ Part de l’État', ('%s %%' % fr(etat, 0)) if num(etat) else 'n.d.', P.get('etat_lvl', 'gris'),
-              P.get('etat_txt') or ''),
-        tuile('\U0001f9ea Forensique', f_lab if f_known else 'NON MESURÉ', (3 if na >= 1 else (5 if not fo.get('absents') else 4)) if f_known else 'gris',
-              f_txt + ((' — ' + ' ; '.join(fo['alertes'])) if fo.get('alertes') else '') +
-              ((' · ' + ' · '.join(f_cov)) if f_cov else '')),
-    ]
-    return ('<div class="c"><h3>\U0001f9ed Fiche de tri</h3><div class="grid g3">%s</div>'
-            '<div class="sub" style="margin-top:12px">Les critères du tri 10 par 10, pour que le dossier complet les voie tous. '
-            'Lecture seulement : moat et récurrence se notent dans Modèle 2 et Visibilité 1, le cycle dans la base et le baissier.</div></div>'
-            % ''.join(tiles))
+
+def risques_majeurs_html(risques):
+    liens = ['<li><a href="#risque-%s">%s</a></li>' % (i, esc(r['fait']))
+             for i, r in enumerate(risques, 1) if gravite_risque(r.get('gravite')) == 2 and r.get('fait')]
+    return encart_alerte('Risques majeurs', '<ul>%s</ul>' % ''.join(liens), 'rouge') if liens else ''
+
+
+def registre_html(risques):
+    rows = []
+    for i, r in enumerate(risques, 1):
+        lvl = gravite_risque(r.get('gravite'))
+        rows.append('<tr id="risque-%s" class="%s"><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % (
+            i, 'risque-fort' if lvl == 2 else '', esc(r.get('fait')), esc(r.get('mecanisme')),
+            bdg(r.get('gravite') or 'n.d.', lvl, 'wrap'), esc(r.get('indicateur')), esc(r.get('hypothese'))))
+    return ('<div class="c registre"><h3>Registre des risques</h3><div class="scroll"><table>'
+            '<tr><th>Fait</th><th>Mécanisme</th><th>Gravité</th><th>Indicateur avancé</th><th>Hypothèse</th></tr>'
+            '%s</table></div></div>') % (''.join(rows) or '<tr><td colspan="5">Risques à documenter.</td></tr>')
+
+
+IA_BPA = {
+    'FORTE MENACE': (3, 2), 'MENACE PROBABLE': (25, 3), 'EFFET ÉQUILIBRÉ': (50, 4),
+    'GAIN PROBABLE': (75, 5), 'FORT GAIN PROBABLE': (97, 6),
+}
+
+
+def calc_ia_bpa(D, R):
+    """Lecture prospective. Le curseur décrit le sens probable du BPA, par rapport à un scénario sans effet IA."""
+    brut = G(D, 'risques.ia_bpa')
+    d = brut if isinstance(brut, dict) else {}
+    champs = ('gains', 'menaces', 'captation', 'preuve', 'plan_direction', 'indicateur', 'hypotheses')
+    a = {k: d[k].strip() for k in champs if isinstance(d.get(k), str) and d[k].strip()}
+    niveau = str(d.get('niveau') or '').strip().upper()
+    if niveau and niveau not in IA_BPA and niveau != 'NON DOCUMENTÉ':
+        chk('IA et BPA : position de la réglette', 'alerte', 'libellé inconnu')
+    preuve = str(d.get('solidite') or '').strip().upper()
+    solidite = preuve if a.get('preuve') and preuve in ('HYPOTHÈSE ÉTAYÉE', 'PILOTE', 'DÉPLOYÉ', 'IMPACT MESURÉ') else ''
+    impact = d.get('bpa_pct')
+    if (isinstance(impact, list) and len(impact) == 2 and all(num(v) for v in impact)
+            and impact[0] <= impact[1] and a.get('hypotheses')):
+        a['impact'] = impact
+    elif impact is not None:
+        chk('IA et BPA : sensibilité', 'alerte', 'fourchette finie, ordonnée et hypothèses requises')
+    # Les deux sens sont explorés, même si l’un n’est pas matériel.
+    justifie = solidite and all(a.get(k) for k in ('gains', 'menaces', 'captation', 'indicateur'))
+    if niveau in IA_BPA and not justifie:
+        chk('IA et BPA : position de la réglette', 'n.d.', 'gains, menaces, captation, preuve et indicateur requis')
+        niveau = ''
+    if niveau in IA_BPA:
+        borne = a.get('impact')
+        negatif = niveau in ('FORTE MENACE', 'MENACE PROBABLE')
+        positif = niveau in ('FORT GAIN PROBABLE', 'GAIN PROBABLE')
+        if borne and ((negatif and borne[0] >= 0) or (positif and borne[1] <= 0)
+                      or (niveau == 'EFFET ÉQUILIBRÉ' and not borne[0] <= 0 <= borne[1])):
+            chk('IA et BPA : position de la réglette', 'alerte', 'sensibilité contradictoire avec le sens déclaré')
+            niveau = ''
+        elif niveau in ('FORTE MENACE', 'FORT GAIN PROBABLE') and not (
+                borne and (borne[1] <= -5 if negatif else borne[0] >= 5)
+                and solidite in ('PILOTE', 'DÉPLOYÉ', 'IMPACT MESURÉ')):
+            chk('IA et BPA : position de la réglette', 'alerte', 'extrémité réservée à un effet matériel borné et étayé')
+            niveau = 'MENACE PROBABLE' if negatif else 'GAIN PROBABLE'
+    pos, lvl = IA_BPA.get(niveau, (None, 'gris'))
+    if pos in (3, 25) and not a.get('plan_direction'):
+        chk('IA et BPA : plan de la direction', 'n.d.', 'préciser le plan annoncé ou les sources consultées')
+    a.update(niveau=niveau if pos is not None else 'NON DOCUMENTÉ', position=pos, lvl=lvl, solidite=solidite)
+    R['ia_bpa'] = a
+
+
+def ia_bpa_html(D, R):
+    a = R['ia_bpa']
+    pos = a['position']
+    if pos is None:
+        echelle = '<div class="ia-axe ia-inconnu" aria-hidden="true"></div>'
+    else:
+        echelle = ('<div class="ia-axe" aria-hidden="true"><span class="ia-curseur" style="left:%s%%"></span></div>' % pos)
+    impact = a.get('impact')
+    chiffre = ('<p class="ia-impact"><strong>%s %% à %s %% de BPA</strong> · estimation (E) à l’horizon 2–4 ans</p>'
+               '<p class="sub">%s</p>' % (fr(impact[0], 1, True), fr(impact[1], 1, True), esc(a['hypotheses']))) if impact else ''
+    champs = [('Gains possibles', 'gains'), ('Risque de substitution', 'menaces'),
+              ('Qui garde les gains ?', 'captation'), ('État des preuves', 'preuve'),
+              ('Plan de la direction', 'plan_direction'), ('Ce qui tranchera', 'indicateur')]
+    details = ''.join('<div><h4>%s</h4><p>%s</p></div>' % (esc(lab), esc(a.get(k) or 'n.d.')) for lab, k in champs
+                      if a.get(k) or (k == 'plan_direction' and pos in (3, 25)))
+    ancien = G(D, 'risques.ia')
+    leg = ''
+    if pos is None and not details and ancien:
+        valeurs = [x for x in (ancien if isinstance(ancien, list) else [vv(ancien)])[:3] if isinstance(x, str) and x.strip()]
+        if valeurs:
+            leg = '<p class="sub">Lecture du dossier d’origine · %s</p>' % esc(' · '.join(valeurs))
+    capex, capex_txt = _badge2(G(D, 'risques.capex_ia'))
+    capex_html = '<p class="sub">%s %s</p>' % (bdg('Cycle capex IA · ' + capex, L_LAB('capex', capex), 'wrap'), esc(capex_txt)) if capex else ''
+    return ('<section class="c ia-bpa" id="ia-bpa"><h3>IA et bénéfice par action</h3>'
+            '<p>Dans 2 à 4 ans, l’IA devrait-elle augmenter ou réduire le BPA par rapport à une trajectoire sans effet IA supplémentaire ?</p>'
+            '<div>%s %s</div>%s<div class="ia-extremes"><span>BPA sous pression</span><span>BPA soutenu</span></div>%s%s%s%s'
+            '<p class="sub">Le curseur indique un jugement sur le sens de l’effet net. Les preuves et la fourchette précisent ce jugement.</p></section>') % (
+        bdg(a['niveau'], a['lvl'], 'gros wrap ia-sens'),
+        '<span class="ia-preuve">%s</span>' % esc(a['solidite']) if a['solidite'] else '',
+        echelle, chiffre, '<div class="ia-details">%s</div>' % details if details else '', leg, capex_html)
 
 
 def _barres_h(items, unite='pts'):
@@ -2933,7 +2946,7 @@ def _barres_h(items, unite='pts'):
 def valeur_html(R):
     Vb = R.get('valeur') or {}
     if not Vb.get('doc'):
-        return ('<div class="c capital-box"><h3>\U0001f48e Création de valeur</h3><div>%s</div>'
+        return ('<div class="dossier-detail"><h4>\U0001f48e Création de valeur</h4><div>%s</div>'
                 '<div class="sub">Economic spread et EVA non renseignés dans ce dossier.</div></div>' % bdg('NON DOCUMENTÉ', 'gris'))
     cartes = ''.join([
         carte('Spread actuel', ('%s pts' % fr(Vb.get('sp'), 1, True)) if num(Vb.get('sp')) else 'n.d.', L_SPREAD2(Vb.get('sp')), 'ROIC − coût du capital'),
@@ -2947,7 +2960,7 @@ def valeur_html(R):
         graph = _barres_h([(str(a), v) for a, v in serie]) + '<div class="sub">Spread annuel publié par la source.</div>'
     else:
         graph = _barres_h([('pire 10 ans', Vb.get('s10')), ('moyenne 5 ans', Vb.get('s5')), ('actuel', Vb.get('sp'))])
-    return ('<div class="c capital-box"><h3>\U0001f48e Création de valeur — le profit économique progresse-t-il ?</h3>'
+    return ('<div class="dossier-detail"><h4>\U0001f48e Création de valeur — le profit économique progresse-t-il ?</h4>'
             '<div>%s</div><p style="margin-top:10px">%s</p><div class="grid g4">%s</div>%s<p class="sub">%s</p>'
             '<div class="sub">Le ROIC dit si chaque euro est bien investi ; l’EVA (profit économique = (ROIC − coût du capital) × capital investi) '
             'mesure le profit économique ; sa variation dit s’il progresse. À capital investi, ROIC et coût du capital constants, l’EVA reste stable. '
@@ -2986,7 +2999,7 @@ def marche_html(D, R):
 
 
 def roic_hist_html(D, R):
-    """V24 : serie et stabilite de la rentabilite, deplacees dans le bloc boule de neige (un seul bloc ROIC)."""
+    """Série et stabilité de la rentabilité du capital."""
     rb = R['rentab']
     vals = rb['vals']
     graph = ''
@@ -2995,7 +3008,7 @@ def roic_hist_html(D, R):
         graph = '<div class="chart">%s</div><div class="xl">%s</div>' % (
             ''.join('<div style="height:%s%%"></div>' % max(2, 100 * v / mx if mx else 0) for v in vals),
             ''.join('<span>%s</span>' % esc(a) for a in rb['annees']))
-    return ('<div class="c capital-box"><h3>Rentabilité historique — %s</h3><div>%s</div>%s'
+    return ('<div class="dossier-detail"><h4>Rentabilité historique · %s</h4><div>%s</div>%s'
             '<div class="sub">%s · médiane %s %% · min %s %% · dernière %s %% · %s/%s années &gt; coût du capital %s %% · écart interquartile %s pts · tendance %s (pente %s pts/an, dispersion %s pts)</div>'
             '<p class="sub">%s</p></div>') % (
         esc(rb.get('metrique', 'ROIC')), bdg(rb['lab'], rb['lvl'], 'wrap'), graph, esc(rb.get('metrique', 'ROIC')), fr(rb['med'], 1), fr(rb['min'], 1), fr(rb['last'], 1),
@@ -3004,12 +3017,8 @@ def roic_hist_html(D, R):
         esc(G(D, 'rentabilite.definition')))
 
 
-def capital_html(D, R):
-    """V23.6 : trois questions lisibles ; methode et pedagogie a la demande."""
+def rentabilite_capital_html(D, R):
     c, t, rb = R['capital'], R['autofinancement'], R['rentab']
-    if 'boule_neige' not in R:
-        calc_boule_neige(D, R)
-    b = R['boule_neige']
     leger = c['intensite'] in CAPITAL_LEGER
     med, cout = rb.get('med'), rb.get('wacc')
     ratio_utile = c.get('origine') != 'RACHATS' and c['intensite'] != 'NÉGATIF'
@@ -3026,58 +3035,12 @@ def capital_html(D, R):
     else:
         rent_lab, rent_lvl = 'Rentabilité à documenter', 'gris'
         rent_txt = 'Le rendement et son coût doivent être comparables et documentés.'
-    if c['protection_documentee']:
-        prot_lab, prot_lvl = 'Protection documentée', 5
-        prot_txt = c['protection'] or 'Avantage opérationnel documenté.'
-    elif c['glaciere'] == 'COPIABLE':
-        prot_lab, prot_lvl = 'Facile à copier', 2
-        prot_txt = 'Un concurrent peut reproduire le modèle. La rentabilité peut être fragile.'
-    elif ((R.get('profil') or {}).get('moat') or {}).get('cle') in ('LARGE', 'ÉTROIT', 'ETROIT'):
-        # V24 : une seule lecture du moat dans tout le dossier -- celle de la fiche de tri quand la glaciere n'est pas requise
-        mo = R['profil']['moat']
-        prot_lab, prot_lvl = 'Moat %s (fiche de tri)' % mo['lab'].lower(), 5 if mo['cle'] == 'LARGE' else 4
-        prot_txt = mo['txt'] or 'Source de l’avantage non précisée.'
-    else:
-        prot_lab, prot_lvl = 'Protection à documenter', 'gris'
-        prot_txt = 'La rentabilité seule ne prouve pas un avantage concurrentiel.'
-    croissance = ('%s %%/an' % fr(R.get('gc'), 1)) if num(R.get('gc')) else 'n.d.'
-    metrique = rb.get('metrique', 'ROIC')
-    mesure = ('%s %%' % fr(med, 1)) if num(med) and ratio_utile else 'n.d.'
-    deb_lab = {'DÉMONTRÉS': 'Débouchés étayés', 'PLAUSIBLES': 'Débouchés plausibles', 'LIMITÉS': 'Débouchés limités'}.get(b['debouches'], 'Débouchés à documenter') if b['debouches_documentes'] else 'Débouchés à documenter'
-    deb_lvl = {'DÉMONTRÉS': 5, 'PLAUSIBLES': 4, 'LIMITÉS': 3}.get(b['debouches'], 'gris') if b['debouches_documentes'] else 'gris'
-    horizon = ('Durée visible estimée : ~%s ans (voir « Combien d’années le prix exige-t-il ? »).' % fr(b['horizon'], 0)) if num(b['horizon']) else 'Durée à documenter.'
-    cartes = [
-        ('1', 'Est-elle rentable ?', mesure, metrique + ' médian', rent_lab, rent_lvl, rent_txt),
-        ('2', 'Les débouchés soutiennent-ils la croissance ?', croissance, 'Croissance prévue par action', deb_lab, deb_lvl, horizon),
-        ('3', 'Qu’est-ce qui la protège ?', '', '', prot_lab, prot_lvl, prot_txt),
-    ]
-    cards = ''.join('<article class="snow-card"><div class="snow-question">%s</div>%s%s<div class="snow-status">%s</div><p>%s</p></article>' % (
-        esc(titre), '<div class="snow-number">%s</div>' % esc(valeur) if valeur else '',
-        '<div class="snow-caption">%s</div>' % esc(caption) if caption else '',
-        bdg(lab, lvl, 'wrap'), esc(txt)) for _, titre, valeur, caption, lab, lvl, txt in cartes)
-    allocation_txt = {
-        'RÉINVESTISSEMENT IMPORTANT': 'Une part importante des profits est réinvestie. Il faut encore vérifier ce qu’elle rapportera.',
-        'CASH SURTOUT DISTRIBUÉ': 'Le cash va surtout aux dividendes et aux rachats. Cela n’empêche pas une croissance peu coûteuse en capital.',
-        'ALLOCATION MIXTE': 'Les profits servent à la fois à investir et à rémunérer les actionnaires.',
-    }.get(c['machine'], 'L’utilisation des profits reste à documenter.')
-    mc, objectif = R.get('tri_mult_constant'), R.get('tx')
-    prix_lvl = (5 if mc >= objectif else 3) if num(mc) and num(objectif) else 'gris'
-    prix_txt = ('%s %%/an net estimé' % fr(mc, 1)) if num(mc) else 'Rendement non calculé'
-    prix_note = ('Objectif de la ligne : %s %%/an net.' % fr(objectif, 1)) if num(objectif) else 'Objectif non documenté.'
-    prix_note += ' Trajectoire centrale, avec dividendes et fiscalité du dossier. Les rachats sont déjà dans la croissance par action.'
-    preuves = [('Mécanisme', b['voie']), ('Débouchés', b['debouches_texte'] or 'Non documentés.'),
-        ('Financement', b['financement_texte'] or 'Non documenté.'),
-        ('Ce qui limite la croissance', b['limite'] or 'Limite non documentée.'),
-        ('Protection', c.get('preuve') or (((R.get('profil') or {}).get('moat') or {}).get('txt')) or 'Non documentée.')]
-    preuves_html = ''.join('<div class="snow-proof"><strong>%s</strong><p>%s</p></div>' % (esc(k), esc(v)) for k, v in preuves)
-    if b['manques']:
-        preuves_html += '<div class="snow-missing"><strong>Ce qui manque pour conclure</strong><ul>%s</ul></div>' % ''.join('<li>%s</li>' % esc(s) for s in b['manques'])
-    technique = ('<div class="scroll"><table><tr><th>Coût du capital</th><td>%s %%</td></tr>'
+    technique = ('<div class="scroll"><table>'
         '<tr><th>Capital nécessaire</th><td>%s · rotation %s</td></tr>'
         '<tr><th>Réinvestissement / rendement retenu / distribution</th><td>%s / %s / %s</td></tr>'
         '<tr><th>Autofinancement de la croissance</th><td>%s</td></tr>'
         '<tr><th>Capital investi</th><td>%s</td></tr><tr><th>Définition</th><td>%s</td></tr></table></div>' % (
-            fr(cout, 1), esc(c['intensite']), fr(c['rotation'], 1),
+            esc(c['intensite']), fr(c['rotation'], 1),
             *(('%s %%' % fr(c[k], 1)) if num(c[k]) else 'n.d.' for k in ('reinvestissement', 'rendement', 'distribution')),
             bdg(t['af'], t['aflvl']), qual_texte(G(D, 'capital.capital_investi_meur')), qual_texte(G(D, 'capital.definition'))))
     if num(t.get('gmax')):
@@ -3088,25 +3051,52 @@ def capital_html(D, R):
     if c.get('note'):
         technique += '<p class="sub">%s</p>' % esc(c['note'])
     technique += '<p class="sub">Le test d’autofinancement suppose un rendement constant. Le pont de financement (§7) et les preuves de débouchés complètent ce calcul.</p>'
-    # V24 : un seul bloc ROIC -- serie, stabilite et machine a profit reunies ici (le bloc « Rentabilite historique » est retire)
-    technique += roic_hist_html(D, R)
-    technique += encadres_qualite(D, R)
+    return ('<section class="c capital-box" id="rentabilite-capital"><h3>Rentabilité du capital</h3><div>%s</div>'
+            '<p>%s</p>%s%s%s%s</section>') % (
+        bdg(rent_lab, rent_lvl, 'wrap'), esc(rent_txt), roic_hist_html(D, R),
+        encadres_qualite(D, R), valeur_html(R), technique)
+
+
+def boule_neige_html(D, R):
+    """Preuves des débouchés et de la capacité à réinvestir."""
+    c = R['capital']
+    if 'boule_neige' not in R:
+        calc_boule_neige(D, R)
+    b = R['boule_neige']
+    deb_lab = {'DÉMONTRÉS': 'Débouchés étayés', 'PLAUSIBLES': 'Débouchés plausibles', 'LIMITÉS': 'Débouchés limités'}.get(b['debouches'], 'Débouchés à documenter') if b['debouches_documentes'] else 'Débouchés à documenter'
+    deb_lvl = {'DÉMONTRÉS': 5, 'PLAUSIBLES': 4, 'LIMITÉS': 3}.get(b['debouches'], 'gris') if b['debouches_documentes'] else 'gris'
+    debouches = '<p>%s %s</p>' % (bdg(deb_lab, deb_lvl, 'wrap'), esc(b['debouches_texte']))
+    allocation_txt = {
+        'RÉINVESTISSEMENT IMPORTANT': 'Une part importante des profits est réinvestie. Il faut encore vérifier ce qu’elle rapportera.',
+        'CASH SURTOUT DISTRIBUÉ': 'Le cash va surtout aux dividendes et aux rachats. Cela n’empêche pas une croissance peu coûteuse en capital.',
+        'ALLOCATION MIXTE': 'Les profits servent à la fois à investir et à rémunérer les actionnaires.',
+    }.get(c['machine'], 'L’utilisation des profits reste à documenter.')
+    mc, objectif = R.get('tri_mult_constant'), R.get('tx')
+    prix_lvl = (5 if mc >= objectif else 3) if num(mc) and num(objectif) else 'gris'
+    prix_txt = ('%s %%/an net estimé' % fr(mc, 1)) if num(mc) else 'Rendement non calculé'
+    prix_note = ('Objectif de la ligne : %s %%/an net.' % fr(objectif, 1)) if num(objectif) else 'Objectif non documenté.'
+    prix_note += ' Trajectoire centrale, avec dividendes et fiscalité du dossier. Les rachats sont déjà dans la croissance par action.'
+    preuves = [('Mécanisme', b['voie']),
+        ('Financement', b['financement_texte'] or 'Non documenté.'),
+        ('Ce qui limite la croissance', b['limite'] or 'Limite non documentée.')]
+    preuves_html = ''.join('<div class="snow-proof"><strong>%s</strong><p>%s</p></div>' % (esc(k), esc(v)) for k, v in preuves)
+    if b['manques']:
+        preuves_html += '<div class="snow-missing"><strong>Ce qui manque pour conclure</strong><ul>%s</ul></div>' % ''.join('<li>%s</li>' % esc(s) for s in b['manques'])
     return ('<section class="c capital-box snow-box" id="roic-pertinent"><div class="snow-head">'
         '<div><div class="snow-eyebrow">RENTABILITÉ · CROISSANCE · PROTECTION</div><h3>❄️ La boule de neige</h3></div>'
-        '%s</div><p class="snow-intro">%s</p><div class="snow-grid">%s</div>'
+        '%s</div><p class="snow-intro">%s</p>%s<p><a href="#forteresse">Moat et durée de protection</a></p>'
         '%s%s'
-        '<details><summary>Pourquoi cette conclusion ?</summary>%s</details>'
-        '<details><summary>Chiffres, historique et sources</summary>%s</details>'
-        '<details><summary>Comprendre le ROIC : l’exemple de la glacière</summary>'
+        '<section class="dossier-detail"><h4>Pourquoi cette conclusion ?</h4>%s</section>'
+        '<section class="dossier-detail"><h4>Comprendre le ROIC : l’exemple de la glacière</h4>'
         '<p>Une machine de 1 000 € rapporte 200 €/an : rendement de 20 %%. Une glacière de 50 € rapporte 50 €/an : rendement de 100 %%.</p>'
-        '<p><strong>Mais peut-on vendre dix fois plus ?</strong> Sans nouveaux clients, le rendement de 100 %% ne fait pas grandir les profits. Il faut aussi un modèle protégé des concurrents.</p></details>'
+        '<p><strong>Mais peut-on vendre dix fois plus ?</strong> Sans nouveaux clients, le rendement de 100 %% ne fait pas grandir les profits. Il faut aussi un modèle protégé des concurrents.</p></section>'
         '<p class="snow-footnote">Une rentabilité élevée ne garantit pas une hausse du cours. Ce bloc résume les preuves ; le verdict d’achat dépend aussi de la qualité, du prix et des contrôles du dossier.</p></section>') % (
-            bdg(b['lab'], b['lvl'], 'wrap'), esc(b['txt']), cards,
+            bdg(b['lab'], b['lvl'], 'wrap'), esc(b['txt']), debouches,
             ('<div class="snow-row"><strong>Où va l’argent ?</strong><div>%s<p>%s</p></div></div>' % (
                 bdg(c['machine'], 'gris', 'wrap'), esc(allocation_txt))) if c['machine'] != 'NON MESURÉE' else '',
             ('<div class="snow-row"><strong>À ce prix, sans hausse du multiple</strong><div>%s<p>%s</p></div></div>' % (
                 bdg(prix_txt, prix_lvl, 'wrap'), esc(prix_note))) if num(mc) else '',
-            preuves_html, technique)
+            preuves_html)
 
 
 # ------------------------------------------------------------------ ligne NICO
@@ -3210,11 +3200,16 @@ def ligne_nico(D, R):
         if A.get('plan_tactique'):
             pre += ' · ' + A['plan_tactique'].replace('|', '/')
     elif act in ('ACHAT TACTIQUE (VOIE B)', 'RENFORCER TACTIQUEMENT (VOIE B)') and B.get('statut') == 'OUVERTE':
-        pre = '🎯 VOIE B OUVERTE ≤ %s obj %s stop %s' % (fprix(B.get('plafond')), fprix(B.get('vp')), B.get('sortie_temps') or 'n.d.')
+        pre = '🎯 VOIE B OUVERTE ≤ %s obj %s stop %s' % (fplafond(B.get('plafond')), fprix(B.get('vp')), B.get('sortie_temps') or 'n.d.')
     elif B.get('statut') == 'EN ATTENTE' and num(B.get('declencheur')) and 'taille tactique' not in str((R.get('action') or {}).get('voie_b') or ''):
-        pre = '🎯 VOIE B si > %s puis relancer (≤ %s)' % (fprix(B['declencheur']), fprix(B.get('plafond')))
+        pre = '🎯 VOIE B si > %s puis relancer (≤ %s)' % (fprix(B['declencheur']), fplafond(B.get('plafond')))
     elif B.get('statut') == 'HORS ZONE' and num(B.get('declencheur')):
         pre = '🎯 VOIE B hors zone : relancer si > %s' % fprix(B['declencheur'])
+    if act and not pre.startswith('🧭 '):
+        consigne = '🧭 %s' % act
+        if A.get('ordre') and not A['ordre'].startswith('arbitrage'):
+            consigne += ' · ' + A['ordre'].replace('|', '/')
+        pre = ' · '.join(filter(None, (pre, consigne)))
     if pre:
         note = ('%s — %s' % (pre, note)) if note else pre
     rouges = [t for l, t, _ in (R.get('flags') or []) if l == 1]  # V23 : red flags visibles dans l'outil de tri
@@ -3222,7 +3217,7 @@ def ligne_nico(D, R):
         court = ' + '.join('ÉTAT >50 %' if 'État' in t else 'ÉTHIQUE' for t in rouges)
         note = ('\U0001f6a9 %s — %s' % (court, note)) if note else '\U0001f6a9 %s' % court
     ch = ['NICO', R.get('ticker') or meta.get('ticker', ''), meta.get('societe', ''), meta.get('devise', ''), st,
-          fprix(R.get('PA') if prix_valides else None), fprix(None if A.get('cours_invalide') else vv(meta.get('cours'))),
+          fplafond(R.get('PA') if prix_valides else None), fprix(None if A.get('cours_invalide') else vv(meta.get('cours'))),
           fr(R.get('tx'), 1), fr(R.get('retenu') if prix_valides else None, 1),
           fr(R.get('cap_cours') if prix_valides else None, 0), fr(R['q']['Q'], 0), v.get('suivi_date', ''), meta.get('date_eval', ''),
           meta.get('secteur', ''), meta.get('pays', ''), note]
@@ -3328,12 +3323,6 @@ def calc_pourquoi(D, R):
     chk('Pourquoi maintenant', 'valid\u00e9' if eff != 'NON DOCUMENT\u00c9' else 'n.d.', eff)
 
 
-def pm_html(R):
-    pm = R.get('pm') or {}
-    if not pm:
-        return 'n.d.'
-    return bdg(pm['lab'], pm['lvl']) + (' ' + esc(pm['fait']) if pm.get('fait') else '') + \
-        (' (%s)' % esc(pm['date']) if pm.get('date') else '')
 
 
 def taille_txt(R):
@@ -3350,7 +3339,7 @@ def resume(D, R):
          'Q %s %% (couverture %s %%) \u00b7 C %s %% \u00b7 croissance centrale %s %%/an' % (
              fr(R['q']['Q'], 0), fr(R['q']['cov'], 0), fr(R.get('C'), 0), fr(R.get('gc'), 1)),
          'Taux exig\u00e9 %s %%/an \u00b7 rendement retenu %s %%/an \u00b7 prix max. d\'achat %s \u00b7 capital pr\u00e9serv\u00e9 %s/100' % (
-             fr(R.get('tx'), 1), fr(R.get('retenu'), 1), fprix(R.get('PA')), fr(R.get('cap_cours'), 0)),
+             fr(R.get('tx'), 1), fr(R.get('retenu'), 1), fplafond(R.get('PA')), fr(R.get('cap_cours'), 0)),
          'Central vs historique %s pts \u00b7 sensibilit\u00e9 du prix %s \u00b7 taille %s \u00b7 tranches %s' % (
              fr(R.get('ecart_hist'), 1, True),
              ('\u2212' + fr(R['tolerance'], 0) + ' %') if num(R.get('tolerance')) else 'n.d.', taille_txt(R),
@@ -3371,26 +3360,19 @@ def resume(D, R):
         avr.get('ex', 'n.d.'), avr.get('ca', 'n.d.'), avr.get('synth', 'NON DOCUMENT\u00c9')))
     if R.get('calc'):
         L.insert(6, 'Plancher : capital pr\u00e9serv\u00e9 %s/100 au cours, %s au prix max. d\'achat \u00b7 prix max. sous la r\u00e8gle \u221240 %% %s%s \u00b7 baissier %s%s%s' % (
-            fr(R.get('cap_cours'), 0), fr(R.get('cap_PA'), 0), fprix(R.get('P60')),
+            fr(R.get('cap_cours'), 0), fr(R.get('cap_PA'), 0), fplafond(R.get('P60')),
             ' (limite le prix d\'achat)' if R.get('plancher_limite') else '',
             (R.get('baissier') or {}).get('lab', 'n.d.'),
             ' \u00b7 plancher prouv\u00e9 \u22121 pt' if R.get('B_actif') else '',
             ' \u00b7 \U0001f3f0 forteresse' if R.get('forteresse') else ''))
-    # V23 : red flags juste sous le verdict, puis fiche de tri et création de valeur
+    # Alertes visibles dès le résumé
     fl = R.get('flags') or []
     if fl:
-        L.insert(2, '\U0001f6a9 Red flags (aucun blocage, \u00e0 toi de trancher) : ' + ' \u00b7 '.join(
+        L.insert(2, '⚠️ Alertes : ' + ' \u00b7 '.join(
             '%s%s' % (t, (' \u2014 ' + x) if x else '') for _, t, x in fl))
-    P = R.get('profil') or {}
-    if P:
-        fo = P.get('forensique') or {}
-        L.append('\U0001f9ed Fiche de tri : moat %s \u00b7 r\u00e9currence %s \u00b7 cycle %s \u00b7 \u00e9thique %s \u00b7 \u00c9tat %s \u00b7 forensique %s' % (
-            P['moat']['lab'], P['recurrence']['lab'], P['cycle']['lab'], P['ethique']['lab'],
-            ('%s %%' % fr(P.get('etat'), 0)) if num(P.get('etat')) else 'n.d.',
-            ('%s alerte(s) sur %s mesuré(s)%s%s%s' % (len(fo.get('alertes') or []), fo.get('mesures', 0),
-                (' : ' + ' ; '.join(fo['alertes'])) if fo.get('alertes') else '',
-                (' · non documentés : ' + ', '.join(fo['absents'])) if fo.get('absents') else '',
-                (' · non applicables (financière) : ' + ', '.join(fo['exclus'])) if fo.get('exclus') else ''))))
+    ai = R.get('ia_bpa') or {}
+    L.append('IA et BPA à 2–4 ans : %s%s' % (ai.get('niveau', 'NON DOCUMENTÉ'),
+             ' · ' + ai['solidite'] if ai.get('solidite') else ''))
     Vb = R.get('valeur') or {}
     if Vb.get('doc'):
         L.append('\U0001f48e Cr\u00e9ation de valeur : spread %s / 5 ans %s / pire 10 ans %s pts \u00b7 marge EVA %s %% \u00b7 EVA momentum %s %% \u2192 %s' % (
@@ -3419,18 +3401,19 @@ def resume(D, R):
     _A, _F, _As, _C, _B = (R.get(k) or {} for k in ('action', 'fait_cle', 'asymetrie', 'confiance', 'voie_b'))
     v24 = []
     _Rc = R.get('recit') or {}
-    if _Rc:  # V25 : la page 1 en une ligne
-        v24.append('📖 Page 1 : %s — « %s » → %s' % (_Rc['etiquette'], _Rc['titre'], _Rc['action']))
     if _A:
         v24.append('🧭 Que faire (%s) : %s — %s%s' % ('ligne détenue' if _A.get('detenue') else 'nouvelle position', _A['act'], _A.get('pourquoi', ''),
                                                      ''.join(' · ' + _A[k] for k in ('ordre', 'voie_b', 'plan_tactique') if _A.get(k))))
+    if _Rc:
+        v24.append('📖 Verdict du récit : %s — « %s »' % (_Rc['etiquette'], _Rc['titre']))
     if _F:
         v24.append('🔑 Fait clé : %s' % _F['fait'])
     if _As or _C:
         v24.append('⚖️ Pari : si je me suis trompé %s · si j’ai raison %s · espérance pondérée %s · confiance %s%s' % (
             ('%s %%' % fr(_As.get('perte'), 0, True)) if num(_As.get('perte')) else 'n.d.',
             ('×%s' % fr(_As.get('fois'), 1)) if num(_As.get('fois')) else 'n.d.', _pa(_As.get('esp')),
-            ('%s %%' % fr(_C.get('pct'), 0)) if _C else 'n.d.', (' → ' + _As['lab']) if _As.get('lab') else ''))
+            ('%s %% %s' % (fr(_C.get('pct'), 0), contexte_confiance(D, R))) if _C else 'n.d.',
+            (' → ' + _As['lab']) if _As.get('lab') else ''))
     if _B and _B.get('statut') not in ('', 'NON ÉVALUÉE', 'EN SUIVI'):
         v24.append('🎯 %s — %s%s' % (_B['lab'], _B['txt'], (' · objectif %s, stop temps %s' % (fprix(_B.get('vp')), _B.get('sortie_temps') or 'n.d.'))
                                     if _B.get('statut') in ('OUVERTE', 'EN ATTENTE') else ''))
@@ -3945,11 +3928,23 @@ def calc_duree(D, R):
     out.update(lab=lab, lvl=lvl, lab_m=lab_m, lvl_m=lvl_m, txt=txt)
 
 
-def duree_html(R):
-    """V24 : une seule question -- combien d'annees de croissance le prix exige-t-il, et combien en voit-on ?"""
+def duree_html(D, R):
+    """Réunit les protections concurrentielles et le temps pendant lequel elles soutiennent la croissance."""
+    mo = G(R, 'profil.moat') or {}
+    pp = V(G(D, 'qualite.pouvoir_prix'))
+    c = R.get('capital') or {}
+    faits = dict.fromkeys(x for x in (G(D, 'qualite.moat'), mo.get('txt'), c.get('protection'), c.get('preuve'))
+                          if isinstance(x, str) and x.strip())
+    moat = ('<div class="forteresse-moat"><h4>Moat et pouvoir de prix</h4><div>%s %s %s</div>%s%s</div>' % (
+        bdg('Moat · ' + mo.get('lab', 'NON DOCUMENTÉ'), mo.get('lvl', 'gris'), 'wrap'),
+        bdg('Pouvoir de prix · ' + str(pp['v'] or 'INDÉTERMINÉ'), L_LAB('prix', pp['v']), 'wrap'),
+        bdg('Modèle copiable', 2, 'wrap') if c.get('glaciere') == 'COPIABLE' else '',
+        ''.join('<p>%s</p>' % esc(f) for f in faits),
+        '<p class="sub">%s</p>' % esc(pp['src'] or pp['prov'] or G(D, 'qualite.pouvoir_prix_preuve') or '')))
+    ouverture = '<section class="c capital-box forteresse" id="forteresse"><h3>🏰 Ce qui la protège, et pour combien de temps</h3>' + moat
     d = R.get('duree') or {}
     if not d:
-        return ''
+        return ouverture + '<p class="sub">Durée à documenter.</p></section>'
     L = R.get('longevite') or {}
     H, tc, tm = d.get('horizon'), d.get('tot_c'), d.get('tot_m')
     mx = max([x for x in (H, tc, tm, 10) if num(x)]) * 1.1
@@ -3974,7 +3969,7 @@ def duree_html(R):
     if num(tm) and num(H):
         tete = ('Pour gagner ton seuil de %s %%/an au cours du jour, il faut que les bénéfices grandissent encore <b>~%s ans</b>%s, puis plus rien. '
                 'On voit de quoi tenir <b>~%s ans</b>%s. %s') % (
-            fr(R.get('tx'), 0), fr(tm, 0), jusqu(tm), fr(H, 0), jusqu(H),
+            fr(R.get('tx'), 1), fr(tm, 0), jusqu(tm), fr(H, 0), jusqu(H),
             ('Écart : %s an%s à croire sans preuve.' % (fr(L['gap'], 0), 's' if L['gap'] >= 1.5 else '')) if num(L.get('gap')) and L['gap'] > 0
             else 'Le prix ne te demande pas de croire plus loin que ce qu’on voit.')
     elif num(tm):
@@ -3990,47 +3985,23 @@ def duree_html(R):
                     H, 'var(--txt2)', 'débouchés, contrats et protection documentés dans la boule de neige', 'à documenter'))
     sens = d.get('sens') or {}
     notes = ''.join('<li>%s</li>' % esc(n_) for n_ in d.get('notes') or [])
-    det = ('<details><summary>Notre multiple de sortie, les conventions et les limites</summary>%s<p class="sub">Le multiple de sortie paie les années '
+    det = ('<section class="dossier-detail"><h4>Notre multiple de sortie, les conventions et les limites</h4>%s<p class="sub">Le multiple de sortie paie les années '
            'de croissance après l’horizon de 4 ans. Conventions : l’acheteur de l’an 4 exige %s %%/an ; une fois la croissance terminée, '
            'la société vaut %s× ses bénéfices. Pendant la croissance, la part distribuable vaut %s. Sensibilité de notre multiple (durée totale, 4 ans '
            'modélisés compris) : %s.</p>%s<p class="sub">C’est une traduction du multiple sous ces conventions, pas une mesure du moat ni une '
-           'prévision du marché. Lecture seulement : aucun effet sur le prix, le taux exigé ni le verdict.</p></details>') % (
+           'prévision du marché. Lecture seulement : aucun effet sur le prix, le taux exigé ni le verdict.</p></section>') % (
         barre('Ce que suppose notre multiple de sortie (%s×)' % fr(d.get('mc'), 1), tc, 'var(--txt2)',
               '4 ans modélisés + %s ans à %s %%/an' % (fr(d.get('n_c'), 0), fr(g, 1)) if num(tc) else 'multiple %s×' % fr(d.get('mc'), 1), vide(d.get('e_c'))),
         fr(d['r'], 0), fr(d['m0'], 0), esc(d.get('p_txt') or 'n.d.'),
         ' · '.join('acheteur à %s %% → %s' % (fr(r_, 0), ('~%s ans' % fr(n_, 0)) if num(n_) else 'n.d.') for r_, n_ in sorted(sens.items())),
         ('<ul class="sub">%s</ul>' % notes) if notes else '')
-    return ('<div class="c capital-box"><h3>⏳ Combien d’années de croissance le prix exige-t-il ?</h3>'
-            '<div>%s %s</div><p style="margin-top:12px">%s</p>%s%s</div>') % (
+    return ouverture + ('<h4>Durée exigée par le cours et durée visible</h4>'
+            '<div>%s %s</div><p style="margin-top:12px">%s</p>%s%s</section>') % (
         bdg(L.get('lab', 'n.d.'), L.get('lvl', 'gris'), 'gros wrap'),
         bdg('Preuves de durée : %s' % L.get('preuve', 'n.d.'), L.get('preuve_lvl', 'gris'), 'wrap'), tete, bars, det)
 
 
 # ---------------------------------------------------------------- (A) pilote
-def _phrase_prix(D, R):
-    """La phrase de prix suit les portes reellement calculees, jamais le seul rendement."""
-    meta = D.get('meta') or {}
-    dev = esc(meta.get('devise', ''))
-    cours = _nb(meta.get('cours'))
-    vf = str(R.get('verdict_final') or '').upper()
-    if not R.get('calc'):
-        return 'Le dossier s’arrête avant la valorisation : pas de prix d’achat calculé.'
-    rt, tx = R.get('retenu'), R.get('tx')
-    base = 'Au cours de %s %s, rendement net estimé %s %%/an pour un seuil de %s %%' % (fprix(cours), dev, fr(rt, 1), fr(tx, 0))
-    if not R.get('valorisation_valide'):
-        return base + ', mais la valorisation n’est pas validée (ancrage du multiple ou clause) : aucun prix d’achat retenu.'
-    if not num(R.get('PA')):
-        return base + ', mais aucun prix ne respecte la règle des −40 % : achat impossible.'
-    if R.get('porte_prix') == 'ouverte':
-        ph = base + ' : le cours est dans ta zone d’achat (sous le prix maximum d’achat de %s %s).' % (fprix(R['PA']), dev)
-        if not vf.startswith(('ACHAT', 'RENFORCEMENT')):
-            ph += ' L’achat reste suspendu au verdict : %s.' % esc(R.get('verdict_final') or 'n.d.')
-        return ph
-    if num(rt) and num(tx) and rt >= tx and R.get('plancher_limite'):
-        return base + ', mais la règle des −40 %% limite le prix maximum d’achat à %s %s : patience.' % (fprix(R['PA']), dev)
-    return base + ' : patience jusqu’au prix maximum d’achat de %s %s.' % (fprix(R['PA']), dev)
-
-
 QUALITE_PALIERS = ((85, 'ENTREPRISE EXCEPTIONNELLE', 6), (80, 'ENTREPRISE DE GRANDE QUALITÉ', 5), (75, 'ENTREPRISE DE QUALITÉ', 5),
                    (70, 'BONNE ENTREPRISE', 4), (65, 'ENTREPRISE DE QUALITÉ MOYENNE', 3), (60, 'ENTREPRISE DONT LA QUALITÉ EST À SURVEILLER', 3),
                    (-1e9, 'ENTREPRISE RISQUÉE', 2))
@@ -4075,74 +4046,6 @@ def calc_longevite(R):
         lab, lvl, txt = 'LE PRIX PARIE TROP LOIN', 2, 'le prix exige ~%s ans, on en voit ~%s : %s ans à croire sans preuve' % (fr(tm, 0), fr(H, 0), fr(gap, 0))
     R['longevite'] = dict(lab=lab, lvl=lvl, txt=txt, gap=gap, H=H, tm=tm, preuve=preuve[0], preuve_lvl=preuve[1],
                           feu=bool(num(gap) and gap <= 1e-9 and lab != 'PAS CRÉDIBLE'))
-
-
-def pilote_html(D, R):
-    """V23.7.2 : le generique (Qualite -> Rendement -> Croissance -> Longevite) puis le bandeau des feux."""
-    meta = D.get('meta') or {}
-    dev = esc(meta.get('devise', ''))
-    S, d = R.get('sources_g') or {}, R.get('duree') or {}
-    calc_longevite(R)
-    L = R['longevite']
-    q = R.get('q') or {}
-    Q, gc, H = q.get('Q'), R.get('gc'), d.get('horizon')
-    P = dict(portes(D, R))
-    qlab, qlvl = lab_qualite(Q)
-    # etapes du generique
-    f_q = P.get('Qualité')
-    f_r = P.get('Prix')
-    f_c = P.get('Croissance')
-    f_l = L['feu']
-    rt = R.get('retenu')
-    if not R.get('calc'):
-        r_et, r_lvl = 'valorisation non exécutée', 'gris'
-    elif f_r:
-        r_et, r_lvl = 'dans ta zone d’achat', 5
-    elif num(rt) and num(R.get('tx')) and rt >= R['tx']:
-        r_et, r_lvl = 'seuil atteint, prix bloqué', 3
-    else:
-        r_et, r_lvl = 'patience jusqu’à %s %s' % (fprix(R.get('PA')), dev) if num(R.get('PA')) else 'aucun prix d’achat', R.get('niv_retenu', 'gris')
-    lab_c = S.get('lab', '')
-    c_et = ('plus prudent que les analystes' if lab_c.startswith('PLUS PRUDENT') else 'comme les analystes' if lab_c.startswith('ALIGNÉ')
-            else 'plus optimiste que les analystes' if lab_c.startswith('PLUS OPTIMISTE') else 'BPA par action, scénario central')
-    def etape(icone, titre, valeur, lvl, etiquette, sous=''):
-        return ('<div class="gen-e"><div class="lab">%s %s</div><div class="gen-v t%s">%s</div>%s%s</div>') % (
-            icone, esc(titre), lvl, valeur, bdg(etiquette, lvl, 'wrap'), ('<div class="lab" style="margin-top:6px">%s</div>' % sous) if sous else '')
-    fl_, fp_ = _pilier_faible(R)
-    e1 = etape('🏛️', 'Qualité', ('%s %%' % fr(Q, 0)) if num(Q) else 'n.d.', qlvl,
-               qlab + (' (PROVISOIRE)' if q.get('provisoire') else ''),
-               ('point faible : %s (%s %%)' % (esc(fl_.lower()), fr(fp_, 0))) if fl_ else '')
-    e2 = etape('💶', 'Rendement', ('%s %%/an' % fr(rt, 1)) if R.get('calc') else 'n.d.', r_lvl, r_et,
-               'seuil %s %% · si ça tourne mal : %s € sur 100 préservés' % (fr(R.get('tx'), 0), fr(R.get('cap_cours'), 0) if num(R.get('cap_cours')) else 'n.d.'))
-    e3 = etape('📈', 'Croissance', ('%s %%/an' % fr(gc, 1)) if num(gc) else 'n.d.', _lvl_g(gc), c_et,
-               'passé %s · analystes %s' % (('%s %%' % fr(S.get('passe'), 1)) if num(S.get('passe')) else 'n.d.',
-                                           ('%s %%' % fr(S.get('consensus'), 1)) if num(S.get('consensus')) else 'n.d.'))
-    tm_ = L.get('tm')
-    v4 = ('%s exigés<br>%s vus' % (('~%s ans' % fr(tm_, 0)) if num(tm_) else 'n.d.', ('~%s ans' % fr(H, 0)) if num(H) else 'n.d.'))
-    e4 = etape('⏳', 'Longévité', '<span style="font-size:22px;line-height:1.3;display:block">%s</span>' % v4, L['lvl'], L['lab'],
-               esc(L['txt']) + ' · preuves de durée : %s' % esc(str(L.get('preuve', 'n.d.')).lower()))
-    fl = '<div class="gen-f">➜</div>'
-    gen = '<div class="gen">%s%s%s%s%s%s%s</div>' % (e1, fl, e2, fl, e3, fl, e4)
-    # bandeau des feux
-    feux = [('la qualité', f_q), ('le prix', f_r), ('la croissance', f_c), ('la longévité', f_l)]
-    n_v = sum(1 for _, f in feux if f)
-    manque = [n for n, f in feux if not f]
-    def coul(lvl):
-        return 'var(--gris)' if lvl == 'gris' or lvl is None else 'var(--l%s)' % lvl
-    # V24 : la pastille suit le feu (vert = feu allume), sinon la couleur de l'etape
-    pastilles = ''.join('<span class="feu" style="background:%s" title="%s"></span>' % (coul(5 if f else (lv if lv not in (5, 6) else 4)), esc(nom))
-                        for nom, f, lv in (('qualité', f_q, qlvl), ('prix', f_r, r_lvl), ('croissance', f_c, _lvl_g(gc)), ('longévité', f_l, L['lvl'])))
-    if n_v == 4:
-        msg = '4 feux sur 4 : tout est au vert.'
-    else:
-        msg = '%s %s sur 4 : il manque %s.' % (n_v, 'feux' if n_v > 1 else 'feu', ', '.join(manque[:-1]) + (' et ' if len(manque) > 1 else '') + manque[-1])
-    autres = [n_ for n_, e in P.items() if n_ not in ('Qualité', 'Prix', 'Croissance') and e is False]
-    if autres:
-        msg = msg.replace(' : tout est au vert.', ',') if n_v == 4 else msg
-        msg += ' %s l’achat reste bloqué par la porte %s.' % ('mais' if n_v == 4 else 'Et', ', '.join(autres))
-    band = '<div class="feux"><div>%s</div><b>🚦 %s</b></div>' % (pastilles, esc(msg))
-    # la phrase en clair : le prix suit les portes
-    return '%s%s<div class="enclair">%s</div>' % (gen, band, esc(_phrase_prix(D, R)))
 
 
 # ---------------------------------------------------------------- V23.7.1 : 🌍 ce que l'entreprise apporte au monde
@@ -4235,21 +4138,25 @@ def monde_html(R):
             '<div><div class="lab" style="color:var(--l5)">➕ De positif</div>%s</div>'
             '<div style="text-align:center">%s<div style="margin-top:8px">%s</div></div>'
             '<div><div class="lab" style="color:var(--l2)">➖ De négatif</div>%s</div></div>'
-            '%s<p class="sub">Poids : ● marginal · ●● notable · ●●● cœur du business. Lecture seulement : aucun effet sur le prix ni le verdict ; '
-            'la ligne éthique 🚩 reste ta décision.</p></div>') % (
+            '%s%s<p class="sub">Poids de l’impact · ● marginal · ●● notable · ●●● cœur du business.</p></div>') % (
         liste(M['pos'], '+', 'var(--l5)'), balance_svg(M) if M.get('score') is not None else '',
         bdg(M.get('lab', 'n.d.'), M.get('lvl', 'gris'), 'gros wrap'), liste(M['neg'], '−', 'var(--l2)'),
-        ('<p style="margin-top:14px">%s</p>' % esc(M['synthese'])) if M.get('synthese') else '')
+        ('<p style="margin-top:14px">%s</p>' % esc(M['synthese'])) if M.get('synthese') else '', ethique_html(R))
 
 
-def episode(n, titre, accroche):
-    return ('<div class="ep"><div class="ep-n">%s</div><h2>%s</h2>%s</div>' % (
-        esc(n), esc(titre), ('<p class="ep-c">%s</p>' % esc(accroche)) if accroche else ''))
+def ethique_html(R):
+    e = G(R, 'profil.ethique') or {}
+    if e.get('cle') == 'CONTRAIRE' or e.get('lvl') == 3:
+        return encart_alerte('Éthique · ' + e['lab'], '<p>%s</p>' % esc(e['txt'] or 'Motif à documenter.'),
+                             'rouge' if e['cle'] == 'CONTRAIRE' else 'orange')
+    return '<div class="ethique"><h4>Éthique</h4>%s%s</div>' % (
+        bdg(e.get('lab', 'NON DOCUMENTÉ'), e.get('lvl', 'gris'), 'wrap'),
+        '<p>%s</p>' % esc(e['txt']) if e.get('txt') else '')
 
 
 # ===================================================================== V24.0 : decider
 # Le dossier ne s'arrete plus a l'analyse : il dit QUOI FAIRE (ligne detenue ou nouvelle), ouvre une seconde voie
-# d'achat tactique (Voie B, revalorisation a 12-18 mois) et met en tete le fait qui explique le prix.
+# d'achat tactique (Voie B, revalorisation a 12-24 mois) et met en tete le fait qui explique le prix.
 # R3 : la Voie A (verdict, prix d'achat, taux exige, taille, tranches) est inchangee. La Voie B est une decision
 # distincte, avec ses propres regles, sa taille plafonnee et sa sortie ecrite ; elle ne modifie aucun calcul de la Voie A.
 VOIE_B_HAUSSE_MIN = 30.0   # potentiel minimal vers la valeur prudente, %
@@ -4584,7 +4491,7 @@ def these_tactique_invalidee(D):
 
 
 def calc_voie_b(D, R):
-    """V24 : Voie B -- opportunite de revalorisation a 12-18 mois, pour une societe qui ne merite pas la Voie A
+    """V24 : Voie B -- opportunite de revalorisation a 12-24 mois, pour une societe qui ne merite pas la Voie A
     (garder 3-5 ans) mais dont le prix, un catalyseur date et le cours lui-meme annoncent une revalorisation.
     Sept regles, une sortie ecrite le jour de l'achat. Aucun effet sur la Voie A (R3)."""
     meta, valo = D.get('meta') or {}, D.get('valo') or {}
@@ -4769,7 +4676,7 @@ def calc_voie_b(D, R):
             statut, lab, lvl = 'HORS ZONE', 'VOIE B : SIGNAL HORS ZONE D’ACHAT', 3
             txt = ('le signal (%s %s, MM200) arriverait au-dessus du plafond d’entrée de %s %s : à ce prix, le potentiel tomberait à %s %% '
                    'et le capital préservé à %s/100. L’alerte sert à relancer l’analyse, pas à acheter' % (
-                       fprix(dec), dev, fprix(plaf), dev, fr(au_sig.get('hausse'), 0, True), fr(au_sig.get('cap'), 0)))
+                       fprix(dec), dev, fplafond(plaf), dev, fr(au_sig.get('hausse'), 0, True), fr(au_sig.get('cap'), 0)))
         if not places_connues:
             txt += ' Le registre reste à vérifier avant tout ordre.'
     out.update(statut=statut, lab=lab, lvl=lvl, txt=txt, vp=vp, vp_src=vp_src, hausse=hausse, ech=ech, mois=mois,
@@ -4777,6 +4684,19 @@ def calc_voie_b(D, R):
                places_verifiees=places_connues,
                sortie_objectif=vp, sortie_temps=(ech.strftime('%d/%m/%Y') if ech else None), sortie_these=inv)
     chk('Voie B — opportunité de revalorisation (V24)', 'validé' if statut in ('OUVERTE', 'EN ATTENTE', 'FERMÉE', 'HORS ZONE') else 'n.d.', lab)
+
+
+def obstacles_alerte_a(R):
+    portes_fermees = [n for n, ok in R.get('portes') or [] if ok is False and n not in ('Prix', 'Plancher −40 %')]
+    if num(R.get('part_mult')) and R['part_mult'] > 50:
+        portes_fermees.append('dépendance à la revalorisation')
+    return portes_fermees
+
+
+def alerte_prix_a(R, cours):
+    pa = R.get('PA')
+    return (R.get('valorisation_valide') and num(pa) and num(cours) and 0 < pa < cours
+            and not obstacles_alerte_a(R))
 
 
 def calc_action(D, R):
@@ -4819,10 +4739,10 @@ def calc_action(D, R):
             b_txt = ('alerte à %s %s (MM200) : s’il y remonte, relancer le dossier ; renfort tactique seulement si tout tient encore à ce prix '
                      '(plafond d’entrée %s %s), ligne plafonnée à %s %% au total.' if det else
                      'alerte à %s %s (MM200) : s’il y remonte, relancer le dossier ; achat tactique seulement si tout tient encore à ce prix '
-                     '(plafond d’entrée %s %s), %s %% au plus.') % (fprix(B['declencheur']), dev, fprix(B.get('plafond')), dev, fr(VOIE_B_TAILLE, 0))
+                     '(plafond d’entrée %s %s), %s %% au plus.') % (fprix(B['declencheur']), dev, fplafond(B.get('plafond')), dev, fr(VOIE_B_TAILLE, 0))
     elif B.get('statut') == 'HORS ZONE':
         b_txt = ('signal hors zone d’achat : la MM200 (%s %s) est au-dessus du plafond d’entrée (%s %s). Alerte à la MM200 = relancer l’analyse, pas %s.'
-                 % (fprix(B.get('declencheur')), dev, fprix(B.get('plafond')), dev, 'renforcer' if det else 'acheter'))
+                 % (fprix(B.get('declencheur')), dev, fplafond(B.get('plafond')), dev, 'renforcer' if det else 'acheter'))
     TL = (R.get('pf') or {}).get('tactique_ligne') or {}
     lpf = (R.get('pf') or {}).get('ligne') or {}
     poids_registre = _nb(lpf.get('poids_pct'))
@@ -4902,7 +4822,7 @@ def calc_action(D, R):
             pq = 'rendement attendu %s %%/an pour un seuil de %s %% et toutes les portes ouvertes' % (fr(rt, 1), fr(tx, 0))
             if num(tl.get('max')):
                 ordre = 'jusqu’à %s %% du portefeuille%s, au plus %s %s' % (fr(tl['max'], 1), (' (aujourd’hui %s %%)' % fr(pos, 1)) if num(pos) else '',
-                                                                       fprix(R.get('PA')), dev)
+                                                                       fplafond(R.get('PA')), dev)
         else:
             act, lvl = 'GARDER, NE PAS RENFORCER', 4
             pq = ('le prix paie (%s %%/an pour un seuil de %s %%, %s pts d’avance), mais %s'
@@ -4912,7 +4832,7 @@ def calc_action(D, R):
             act, lvl = 'RENFORCER TACTIQUEMENT (VOIE B)', 5
             pq = pq + ' ; la Voie B est ouverte : renfort tactique permis'
             ordre = 'porter la ligne de %s %% à %s %% au plus, sous %s %s · objectif %s %s · stop temps %s · stop thèse écrit' % (
-                fr(pos, 1), fr(VOIE_B_TAILLE, 0), fprix(B.get('plafond')), dev, fprix(B.get('vp')), dev, B.get('sortie_temps') or 'n.d.')
+                fr(pos, 1), fr(VOIE_B_TAILLE, 0), fplafond(B.get('plafond')), dev, fprix(B.get('vp')), dev, B.get('sortie_temps') or 'n.d.')
             b_txt = ''
         elif act == 'GARDER, NE PAS RENFORCER' and registre_a_verifier:
             act, lvl, pq = 'VÉRIFIER LE REGISTRE', 'gris', 'vérifie les places et le poids de ta ligne avant tout renfort tactique'
@@ -4927,16 +4847,19 @@ def calc_action(D, R):
         if vf.startswith(('ACHAT', 'RENFORCEMENT')):
             act, lvl = 'ACHETER', 6
             pq = 'toutes les portes sont ouvertes et le cours est sous le prix maximum d’achat'
-            ordre = 'tranche 1 (%s) à %s %s au plus · taille %s' % (R.get('tranches') or 'n.d.', fprix(R.get('PA')), dev, taille_txt(R))
+            ordre = 'tranche 1 (%s) à %s %s au plus · taille %s' % (R.get('tranches') or 'n.d.', fplafond(R.get('PA')), dev, taille_txt(R))
         elif B.get('statut') == 'OUVERTE':
             act, lvl = 'ACHAT TACTIQUE (VOIE B)', 5
             pq = 'pas une société à garder des années, mais un prix, un catalyseur et un cours qui annoncent une revalorisation'
             ordre = '%s %% du portefeuille au plus, sous %s %s · vendre à %s %s, au %s au plus tard, ou si le stop thèse tombe' % (
-                fr(VOIE_B_TAILLE, 0), fprix(B.get('plafond')), dev, fprix(B.get('vp')), dev, B.get('sortie_temps') or 'n.d.')
+                fr(VOIE_B_TAILLE, 0), fplafond(B.get('plafond')), dev, fprix(B.get('vp')), dev, B.get('sortie_temps') or 'n.d.')
         elif 'PRIX' in vf:
             act, lvl = 'ATTENDRE LE PRIX', 4
             pq = 'bonne société, prix trop élevé : %s %%/an au cours pour un seuil de %s %%' % (fr(rt, 1), fr(tx, 0))
-            ordre = 'alerte à %s %s (prix maximum d’achat), puis relancer le dossier' % (fprix(R.get('PA')), dev) if num(R.get('PA')) else ''
+            if alerte_prix_a(R, cours):
+                ordre = 'alerte à %s %s (prix maximum d’achat), puis relancer le dossier' % (fplafond(R['PA']), dev)
+            else:
+                ordre = 'réévaluer les conditions avant toute entrée'
         elif 'CONFIRMATION' in vf or 'GUIDANCE' in vf:
             act, lvl = 'ATTENDRE LA CONFIRMATION', 4
             pq = '; '.join(R.get('verdict_motifs') or []) or 'confirmations insuffisantes'
@@ -4945,7 +4868,7 @@ def calc_action(D, R):
             pq = 'trop fragile pour la garder des années (%s), mais candidate à un achat tactique dès que le cours confirme' % (
                 ' ; '.join(bloque()) or vf.lower())
             ordre = ('alerte de cours à %s %s (MM200), puis relancer le dossier · plafond d’entrée %s %s · %s %% au plus' % (
-                fprix(B.get('declencheur')), dev, fprix(B.get('plafond')), dev, fr(VOIE_B_TAILLE, 0))) if num(B.get('declencheur')) else ''
+                fprix(B.get('declencheur')), dev, fplafond(B.get('plafond')), dev, fr(VOIE_B_TAILLE, 0))) if num(B.get('declencheur')) else ''
         elif B.get('statut') == 'FERMÉE' and [n for n, o, _ in B.get('tests') or [] if o is not True] == ['Place tactique libre']:
             act, lvl = 'PAS DE PLACE TACTIQUE', 3
             pq = 'la Voie B serait ouverte, mais tes %s places tactiques sont occupées' % VOIE_B_PLACES
@@ -4954,7 +4877,7 @@ def calc_action(D, R):
             act, lvl = 'SURVEILLER (VOIE B HORS ZONE)', 3
             pq = 'candidate à un achat tactique, mais le signal du marché arriverait au-dessus du prix où la Voie B tient encore'
             ordre = 'alerte à %s %s pour relancer l’analyse (plafond d’entrée aujourd’hui %s %s)' % (
-                fprix(B.get('declencheur')), dev, fprix(B.get('plafond')), dev)
+                fprix(B.get('declencheur')), dev, fplafond(B.get('plafond')), dev)
         elif registre_a_verifier:
             act, lvl, pq = 'VÉRIFIER LE REGISTRE', 'gris', 'vérifie les places disponibles avant tout achat tactique'
         elif 'DOCUMENTER' in vf:
@@ -4997,10 +4920,6 @@ def calc_angles_morts(D, R):
     am = []
     def add(quoi, change, comment):
         am.append((quoi, change, comment))
-    fo = ((R.get('profil') or {}).get('forensique') or {})
-    if fo.get('absents'):
-        add('Forensique : ' + ', '.join(fo['absents']), 'OUI, si alerte',
-            'une double alerte abaisserait la fiabilité et fermerait la Voie B ; Sloan calculable depuis les comptes (risques.forensique.sloan_entrees)')
     if not (R.get('valeur') or {}).get('doc'):
         add('Création de valeur (spread, EVA)', 'NON', 'lecture du profit économique ; la rentabilité est déjà notée par la série ROIC')
     S7 = R.get('sources_g') or {}
@@ -5016,80 +4935,38 @@ def calc_angles_morts(D, R):
     if (R.get('autofinancement') or {}).get('af') in ('NON MESURÉE', 'COMPARAISON NON DOCUMENTÉE'):
         add('Autofinancement de la croissance', 'NON', 'renseigner autofinancement.reinvestissement ; le pont de financement du §7 tranche déjà')
     if not num((R.get('profil') or {}).get('etat')):
-        add('Part de l’État au capital', 'OUI, si > 50 %', 'red flag (ta règle du 28/10) ; sans effet automatique')
+        add('Part de l’État au capital', 'OUI, selon le contrôle', 'vérifier le registre des actionnaires et les droits des minoritaires')
+    if (R.get('ia_bpa') or {}).get('position') is None:
+        add('Effet net de l’IA sur le BPA', 'OUI, si matériel', 'documenter les gains captés, la substitution et le plan de la direction')
     if (R.get('capital') or {}).get('machine') == 'NON MESURÉE':
         add('Où va l’argent (distribution sur 3 ans)', 'NON', 'lecture de l’allocation ; capital.distribution_pct')
     R['angles_morts'] = am
 
 
-def action_html(D, R):
-    A_ = R.get('action') or {}
-    if not A_:
-        return ''
-    dev = esc((D.get('meta') or {}).get('devise', ''))
-    bord = 'var(--gris)' if A_['lvl'] == 'gris' else 'var(--l%s)' % (5 if A_['lvl'] == 6 else A_['lvl'])
-    lignes = []
-    if A_.get('ordre'):
-        lignes.append('<div class="act-row"><span>%s</span><b>%s</b></div>' % (
-            '⚖️ Arbitrage' if A_['ordre'].startswith('arbitrage') else '📌 Ordre', esc(A_['ordre'][:1].upper() + A_['ordre'][1:])))
-    if A_.get('voie_b'):
-        lignes.append('<div class="act-row"><span>🎯 Voie B</span><b>%s</b></div>' % esc(A_['voie_b']))
-    if A_.get('plan_tactique'):
-        lignes.append('<div class="act-row"><span>🎯 Plan enregistré</span><b>%s</b></div>' % esc(A_['plan_tactique']))
-    if A_.get('rdv') or A_.get('rdv_txt'):
-        lignes.append('<div class="act-row"><span>📅 Rendez-vous</span><b>%s%s</b></div>' % (
-            esc(A_.get('rdv') or 'date à fixer'), (' — ' + esc(A_['rdv_txt'])) if A_.get('rdv_txt') else ''))
-    if A_.get('voyants'):
-        lignes.append('<div class="act-row"><span>🚨 Voyants</span><ol>%s</ol></div>' % ''.join('<li>%s</li>' % esc(v) for v in A_['voyants']))
-    _pf = R.get('pf') or {}
-    qui = ('Tu détiens cette ligne%s%s' % ((' (%s %% du portefeuille)' % fr(A_['pos'], 1)) if num(A_.get('pos')) else '',
-                                          (' · registre du %s' % esc(_pf.get('maj'))) if _pf.get('ligne') else '')) if A_.get('detenue') else (
-        'Nouvelle position' + (' · absente de ton registre du %s' % esc(_pf.get('maj')) if _pf.get('registre') else ''))
-    return ('<div class="action" style="border-color:%s"><div class="act-l"><div class="lab">🧭 Que faire · %s</div>'
-            '<div class="act-v" style="color:%s">%s</div><p>%s.</p></div><div class="act-r">%s</div></div>') % (
-        bord, esc(qui), bord, esc(A_['act']), esc(A_['pourquoi'][:1].upper() + A_['pourquoi'][1:]) if A_.get('pourquoi') else '', ''.join(lignes))
-
-
-def fait_cle_html(R):
-    F = R.get('fait_cle') or {}
-    if not F:
-        return ''
-    return ('<div class="fk"><div class="lab">🔑 Le fait qui explique le prix%s</div><p class="fk-f">%s</p>'
-            '<div class="grid g2" style="gap:10px 28px">%s%s</div></div>') % (
-        ' · détecté par le moteur' if F.get('auto') else '', esc(F['fait']),
-        ('<div><div class="lab">Pourquoi le marché doute</div><p class="sub" style="margin-top:4px">%s</p></div>' % esc(F['doute'])) if F.get('doute') else '',
-        ('<div><div class="lab">Ce qui ferait basculer l’opinion</div><p class="sub" style="margin-top:4px">%s</p></div>' % esc(F['bascule'])) if F.get('bascule') else '')
-
-
-def pari_html(D, R):
-    """V24 : asymetrie, esperance ponderee et confiance, en quatre cartes."""
+def pari_html(D, R, confiance_affichee):
+    """Espérance pondérée et confiance, après le pile/face du récit."""
     As, C = R.get('asymetrie') or {}, R.get('confiance') or {}
     if not As and not C:
         return ''
     cartes = []
     if As:
-        p = As.get('perte')
-        cartes.append(carte('Si je me suis trompé', ('%s %%' % fr(p, 0, True)) if num(p) else 'n.d.',
-                            L_CAP(100 + p) if num(p) else 'gris', 'baissier à 4 ans, dividendes compris'))
-        cartes.append(carte('Si j’ai raison', ('×%s' % fr(As.get('fois'), 1)) if num(As.get('fois')) else 'n.d.',
-                            5 if num(As.get('fois')) and As['fois'] >= 2 else 4 if num(As.get('fois')) else 'gris',
-                            'haussier : %s %%/an sur 4 ans' % fr(As.get('tri_h'), 1)))
         cartes.append(carte('Espérance pondérée', ('%s %%/an' % fr(As.get('esp'), 1)) if num(As.get('esp')) else 'n.d.',
                             L_RDT_TX(As.get('esp'), R.get('tx')) if num(As.get('esp')) else 'gris',
                             'TRI des flux pondérés 25/50/25'))
-    if C:
+    if C and not confiance_affichee:
         cartes.append(carte('Confiance', '%s %%' % fr(C['pct'], 0), C['lvl'],
-                            'convention, pas une probabilité · %s' % ('calculée' if C['src'] == 'calculée' else 'déclarée')))
+                            '%s · convention %s' % (esc(contexte_confiance(D, R)),
+                                                    'calculée' if C['src'] == 'calculée' else 'déclarée')))
     det = ''
     if C and C.get('pts'):
-        det = ('<details><summary>D’où vient la confiance de %s %%</summary><div class="scroll"><table>%s'
-               '<tr><td><b>Base 50 + indices = %s, bornée 30–95</b></td><td class="n"><b>%s %%</b></td></tr></table></div>'
+        det = ('<section class="dossier-detail"><h4>D’où vient la confiance</h4><div class="scroll"><table>%s'
+               '<tr><td colspan="2"><b>Base 50 + indices = %s avant bornage entre 30 et 95</b></td></tr></table></div>'
                '<p class="sub">Réponse à ta question : si j’achète au prix maximum d’achat, ce trade a-t-il un avenir sain ? Catalyseurs, '
-               'signaux qui ne faiblissent pas, vents porteurs montent la note ; preuves manquantes et signaux contraires la baissent. %s</p></details>') % (
-            fr(C['pct'], 0), ''.join('<tr><td>%s</td><td class="n t%s">%s</td></tr>' % (esc(l), 5 if p_ > 0 else 2, fr(p_, 0, True)) for l, p_ in C['pts']),
-            fr(C['brut'], 0), fr(C['pct'], 0), ('Valeur %s.' % esc(C['src'])) if C['src'] != 'calculée' else '')
+               'signaux qui ne faiblissent pas, vents porteurs montent la note ; preuves manquantes et signaux contraires la baissent. %s</p></section>') % (
+            ''.join('<tr><td>%s</td><td class="n t%s">%s</td></tr>' % (esc(l), 5 if p_ > 0 else 2, fr(p_, 0, True)) for l, p_ in C['pts']),
+            fr(C['brut'], 0), ('Valeur %s.' % esc(C['src'])) if C['src'] != 'calculée' else '')
     return ('<div class="c pari"><h3 style="margin:0">⚖️ Le pari <span style="margin-left:12px;vertical-align:middle">%s</span></h3>'
-            '<div class="grid g4" style="margin-top:14px">%s</div>%s</div>') % (
+            '<div class="grid g2" style="margin-top:14px">%s</div>%s</div>') % (
         bdg(As.get('lab', ''), As.get('lvl', 'gris'), 'gros wrap') if As.get('lab') else '', ''.join(cartes), det)
 
 
@@ -5103,7 +4980,7 @@ def voie_b_html(D, R):
     sortie = ''
     if B.get('statut') in ('OUVERTE', 'EN ATTENTE', 'HORS ZONE'):
         sortie = ('<div class="grid g4" style="margin-top:16px">%s%s%s%s</div>') % (
-            carte('🚪 Plafond d’entrée', '%s %s' % (fprix(B.get('plafond')), dev), 4,
+            carte('🚪 Plafond d’entrée', '%s %s' % (fplafond(B.get('plafond')), dev), 4,
                   'au-dessus : potentiel < %s %% ou capital préservé < %s/100' % (fr(VOIE_B_HAUSSE_MIN, 0), fr(VOIE_B_CAP_MIN, 0))),
             carte('🎯 Objectif de sortie', '%s %s' % (fprix(B.get('vp')), dev), 5, '%s %% de potentiel · vendre quand il est atteint' % fr(B.get('hausse'), 0, True)),
             carte('⏱️ Stop temps', esc(B.get('sortie_temps') or 'n.d.'), 4, 'catalyseur passé sans revalorisation → vendre'),
@@ -5115,7 +4992,7 @@ def voie_b_html(D, R):
                 'puis <b>relance le dossier</b> : tous les critères se revérifient au prix d’exécution. Au signal, avec les chiffres d’aujourd’hui : potentiel %s, '
                 'capital préservé %s/100%s.</p>') % (fprix(B['declencheur']), dev, (fr(sg.get('hausse'), 0, True) + ' %') if num(sg.get('hausse')) else 'n.d.',
                                                    fr(sg.get('cap'), 0), ' → hors zone d’achat' if B.get('statut') == 'HORS ZONE' else '')
-    return ('<div class="c voieb"><h3 style="margin:0">🎯 Voie B — opportunité de revalorisation (12–18 mois)</h3><div style="margin-top:10px">%s</div>'
+    return ('<div class="c voieb"><h3 style="margin:0">🎯 Voie B — opportunité de revalorisation (12–24 mois)</h3><div style="margin-top:10px">%s</div>'
             '<p style="margin-top:12px">%s.</p>%s<div class="scroll"><table>%s</table></div>%s'
             '<p class="sub">La Voie A répond à « puis-je la garder 3 à 5 ans sans trembler ? ». La Voie B répond à « le marché va-t-il corriger un mauvais prix '
             'dans l’année ? ». Elle exige moins de qualité, mais plus de preuves de prix, un catalyseur daté et un cours qui confirme. Taille : %s %% au plus, '
@@ -5126,19 +5003,46 @@ def voie_b_html(D, R):
 
 def angles_morts_html(R):
     am = R.get('angles_morts') or []
-    if not am:
+    fo = G(R, 'profil.forensique') or {}
+    if not am and not fo:
         return ''
     rows = ''.join('<tr><td>%s</td><td>%s</td><td class="sub" style="margin:0">%s</td></tr>' % (
         esc(q), bdg(c, 3 if c.startswith('OUI') else 4 if c == 'RYTHME' else 'gris'), esc(t)) for q, c, t in am)
-    return ('<div class="c"><h3>🕳️ Angles morts — ce que ce dossier n’a pas pu vérifier</h3><div class="scroll"><table>'
-            '<tr><th>Donnée absente</th><th>Peut changer la décision ?</th><th>Pourquoi</th></tr>%s</table></div>'
-            '<p class="sub">Les blocs vides ne s’affichent plus dans le dossier : ils sont regroupés ici.</p></div>') % rows
+    table = ('<div class="scroll"><table><tr><th>Donnée absente</th><th>Peut changer la décision ?</th>'
+             '<th>Pourquoi</th></tr>%s</table></div>') % rows if rows else ''
+    forensique = ''
+    if fo:
+        alertes, n = fo['alertes'], fo['mesures']
+        couverture = '%s alerte(s) sur %s indicateur(s) mesuré(s)' % (len(alertes), n) if n else 'Aucun indicateur mesuré'
+        valeurs = [('Altman Z', fo['z'], 2), ('Beneish M', fo['m'], 2), ('Sloan', fo['sloan'], 2), ('Piotroski', fo['f'], 0)]
+        mesures = ' · '.join('%s %s' % (nom, fr(v, d)) for nom, v, d in valeurs if nom not in fo['exclus'] and num(v))
+        notes = [mesures] if mesures else []
+        if fo['absents']:
+            notes.append('Non documentés · ' + ', '.join(fo['absents']))
+        if fo['exclus']:
+            notes.append('Non applicables · ' + ', '.join(fo['exclus']))
+        forensique = '<div class="forensique"><h4>Vigilance comptable</h4><p>%s</p>%s%s</div>' % (
+            bdg(couverture, 3 if alertes else 5 if n and not fo['absents'] else 'gris', 'wrap'),
+            '<p class="sub">%s</p>' % esc(' · '.join(notes)) if notes else '',
+            encart_alerte('Double alerte forensique', '<p>%s</p><p>Voie B fermée.</p>' % esc(' · '.join(alertes)), 'rouge')
+            if len(alertes) >= 2 else '<p class="t3">%s</p>' % esc(alertes[0]) if alertes else '')
+    return '<div class="c angles-morts"><h3>🕳️ Angles morts et vigilance comptable</h3>%s%s</div>' % (table, forensique)
+
+
+def prix_affiche(valeur, devise, limite=False, precis=False):
+    if not num(valeur) or valeur <= 0:
+        return ''
+    chiffre = fplafond(valeur) if limite else fprix(valeur)
+    if precis:
+        montant = Decimal(str(valeur))
+        precision = max(2, 1 - montant.adjusted())
+        chiffre = format(montant, '.%df' % precision).rstrip('0').rstrip('.').replace('.', ',')
+    return '<strong class="concl-prix">%s</strong>' % esc(' '.join(filter(None, (chiffre, devise))))
 
 
 def porte_ouverture_html(D, R):
     """V24 : quand l'achat est bloque, l'episode « Le plan » dit ce qui rouvrirait la porte."""
     P = dict(R.get('portes') or [])
-    dev = esc((D.get('meta') or {}).get('devise', ''))
     Q = (R.get('q') or {}).get('Q')
     fl, fp = _pilier_faible(R)
     items = []
@@ -5151,7 +5055,7 @@ def porte_ouverture_html(D, R):
     if P.get('Croissance') is False:
         items.append('📈 <b>Croissance</b> : %s %%/an au central, il faut 5 %%.' % fr(R.get('gc'), 1))
     if P.get('Prix') is False and num(R.get('PA')):
-        items.append('💶 <b>Prix</b> : le cours doit revenir sous %s %s.' % (fprix(R['PA']), dev))
+        items.append('💶 <b>Prix</b> : le cours doit revenir sous le prix maximum d’achat indiqué dans la lecture de prix.')
     for n in ('Guidance', 'Ancrage', 'Unités', 'Plancher −40 %'):
         if P.get(n) is False:
             items.append('🚪 <b>%s</b> : porte fermée, voir les coulisses.' % esc(n))
@@ -5195,12 +5099,12 @@ LEXIQUE = [
     ('BFR', 'besoin en fonds de roulement : stocks + créances clients − dettes fournisseurs. Quand il gonfle, le bénéfice ne devient pas du cash.'),
     ('Multiple hors cash', '(cours − trésorerie nette) / (BPA − produits financiers) : ce que coûte le business seul.'),
     ('ROIC', 'rentabilité du capital investi après impôt : chaque euro mis dans le business rapporte-t-il plus que son coût ?'),
-    ('Voie A / Voie B', 'A : société à garder 3 à 5 ans (porte qualité 70 %). B : achat tactique de 12 à 18 mois sur une revalorisation datée, 2 % au plus.'),
+    ('Voie A / Voie B', 'A : société à garder 3 à 5 ans (porte qualité 70 %). B : achat tactique de 12 à 24 mois sur une revalorisation datée, 2 % au plus.'),
 ]
 
 
 def lexique_html():
-    return '<details class="c"><summary>📖 Petit lexique du dossier</summary><dl class="lexique">%s</dl></details>' % ''.join(
+    return '<section class="c dossier-detail"><h4>📖 Petit lexique du dossier</h4><dl class="lexique">%s</dl></section>' % ''.join(
         '<dt>%s</dt><dd>%s</dd>' % (esc(t), esc(d)) for t, d in LEXIQUE)
 
 
@@ -5268,7 +5172,7 @@ def _minus(t, D=None):
     t = str(t or '').strip()
     if not t:
         return t
-    mot = re.split(r'[\s,;:’\']', t, 1)[0]
+    mot = re.split(r'[\s,;:’\']', t, maxsplit=1)[0]
     soc = _sans_accent((D or {}).get('meta', {}).get('societe') if D else '')
     if len(mot) > 1 and (mot[1:2].isupper() or (soc and _sans_accent(mot) in soc.split())):
         return t
@@ -5310,6 +5214,9 @@ def calc_recit(D, R):
     q = R.get('q') or {}
     Q = q.get('Q')
     As, B, A_ = R.get('asymetrie') or {}, R.get('voie_b') or {}, R.get('action') or {}
+    act = A_.get('act', '')
+    attente_b = act in ('ATTENDRE LE SIGNAL (VOIE B)', 'SURVEILLER (VOIE B HORS ZONE)')
+    alerte_a = act == 'ATTENDRE LE PRIX' and alerte_prix_a(R, cours)
     vf = str(R.get('verdict_final') or '').upper()
     P = dict(R.get('portes') or [])
     det = R.get('detenue')
@@ -5320,6 +5227,8 @@ def calc_recit(D, R):
         typ = 'A CORRIGER'  # V25.1 : des chiffres faux ne racontent pas d'histoire
     elif 'PÉRIMÈTRE' in vf or 'PERIMETRE' in vf:
         typ = 'HORS PERIMETRE'
+    elif act in ('ACHAT TACTIQUE (VOIE B)', 'RENFORCER TACTIQUEMENT (VOIE B)'):
+        typ = 'ASYMETRIQUE'
     elif vf.startswith(('ACHAT', 'RENFORCEMENT')) and not A_.get('plan_tactique') and not A_.get('act', '').startswith(('VENDRE', 'ALLÉGER', 'SORTIR')):
         typ = 'BON PRIX'
     elif det and A_.get('act', '').startswith(('VENDRE', 'ALLÉGER')):
@@ -5382,7 +5291,7 @@ def calc_recit(D, R):
     elif F.get('doute'):
         chap.append(esc(_phrase(F['doute'])))
     if not mp:
-        warn('V25 : lecture.marche_pense absent — la page 1 reprend le point décisif. Écrire une inquiétude du marché, sans lui prêter de certitude.')
+        warn('lecture.marche_pense absent — la lecture du prix reprend le point décisif. Écrire une inquiétude du marché, sans lui prêter de certitude.')
     if not nv:
         warn('V25 : lecture.ne_voit_pas absent — écrire ce que le prix ne voit pas, avec le test observable qui le confirmera.')
     suite = []
@@ -5411,9 +5320,6 @@ def calc_recit(D, R):
     if num(Q) and (q.get('provisoire') or (num(q.get('cov')) and q['cov'] < 80)):  # V25.1 : pas d'« Exceptionnelle » sur 5 % des controles
         q1, q1c = 'Impossible à dire pour l’instant.', 'gris'
         t1.append('La note de %s %% ne repose que sur %s %% des contrôles : elle est provisoire.' % (fr(Q, 0), fr(q.get('cov'), 0)))
-    act0 = _premiere_phrase(G(D, 'acte0.activite'), 240)
-    if act0:
-        t1.append(esc(act0))
     pil = [(p.get('pct'), p.get('lab')) for p in (q.get('pil') or {}).values() if num(p.get('pct'))]
     if pil:
         fort, faible = max(pil, key=lambda t: t[0]), min(pil, key=lambda t: t[0])
@@ -5448,9 +5354,9 @@ def calc_recit(D, R):
         if typ == 'EVITER':
             t2.append('Mais un prix bas ne suffit pas : c’est l’entreprise elle-même qui pose problème.' if pp == 'ouverte' else
                       'Et même plus bas, l’entreprise resterait trop fragile pour toi.')
-        elif (pp != 'ouverte' or typ in ('TROP CHERE', 'CORRECTE CHERE')) and num(PA) and num(cours) and cours > 0 and PA < cours:
-            t2.append('Le multiple est trop haut aujourd’hui : crée une alerte à <b class="chiffre cyan">%s %s</b> (%s par rapport au cours actuel). À ce prix-là, le rendement atteint ton seuil sans trop t’exposer à la baisse.'
-                      % (fprix(PA), esc(dev), _pct(100 * (PA / cours - 1))))
+        elif alerte_a:
+            t2.append('Le prix maximum d’achat est de <b class="chiffre cyan">%s %s</b> (%s par rapport au cours actuel). À ce prix-là, le rendement atteint ton seuil et la règle des −40 %% est respectée.'
+                      % (fplafond(PA), esc(dev), _pct(100 * (PA / cours - 1))))
     # -- question 3 : gagner / perdre
     perte = As.get('perte')
     lab_as = As.get('lab', '')
@@ -5477,15 +5383,14 @@ def calc_recit(D, R):
         face_v, face_t = 'n.d.', 'scénario défavorable non chiffré.'
     # V25.1 : si l'entree se fait a un autre prix (alerte), montrer le meme pari a ce prix-la
     entree, ent_lib = None, ''
-    if B.get('statut') in ('EN ATTENTE', 'HORS ZONE') and num(B.get('declencheur')) and not str(A_.get('act', '')).startswith(('VENDRE', 'ALLÉGER', 'SORTIR')):
+    if attente_b and num(B.get('declencheur')):
         entree, ent_lib = B['declencheur'], 'au prix du signal'
-    elif not det and num(PA) and num(cours) and PA < cours and str(A_.get('act', '')) in ('ATTENDRE LE PRIX', 'NE PAS ACHETER') \
-            and typ in ('TROP CHERE', 'CORRECTE CHERE'):
+    elif alerte_a:
         entree, ent_lib = PA, 'au prix de ton alerte'
     q3_apres = ''
     if num(entree) and num(cours) and abs(entree / cours - 1) > 0.01:
         cap_e = cap_au_prix(R, entree)
-        if num(B.get('vp')) and B.get('statut') in ('EN ATTENTE', 'HORS ZONE'):
+        if num(B.get('vp')) and attente_b:
             pile_e = 100 * (B['vp'] / entree - 1)
         elif num(V4.get('haussier')):
             pile_e = 100 * (V4['haussier'] / entree - 1)
@@ -5494,7 +5399,8 @@ def calc_recit(D, R):
         horiz = 'l’objectif tactique' if ent_lib == 'au prix du signal' else 'le cours haussier à quatre ans'
         q3_apres = ('%s (<b class="chiffre cyan">%s %s</b>), potentiel vers %s <b class="chiffre vert">%s</b> et '
                     'baissier à quatre ans, dividendes compris, <b class="chiffre rouge">%s</b>.' % (
-                        ent_lib.capitalize(), fprix(entree), esc(dev), horiz, _pct(pile_e), _pct(cap_e - 100 if num(cap_e) else None)))
+                        ent_lib.capitalize(), fplafond(entree) if alerte_a else fprix(entree),
+                        esc(dev), horiz, _pct(pile_e), _pct(cap_e - 100 if num(cap_e) else None)))
     t3 = []
     if num(As.get('esp')):
         t3.append('En pondérant les trois scénarios, tu peux espérer environ <b class="chiffre">%s</b> %% par an. Score de confiance : %s %%.'
@@ -5506,30 +5412,20 @@ def calc_recit(D, R):
         face_v, face_t = 'n.d.', 'Scénario défavorable à recalculer.'
         q3_apres = ''
     # -- question 4 : que faire -- V25.1 : la page 1 TRADUIT l'action du moteur, elle n'en invente aucune
-    act = A_.get('act', '')
     pq = str(A_.get('pourquoi') or '')
     titre_act = ACTIONS_HUMAINES.get(act, _phrase(act.lower()))
     pos_ = vv(meta.get('position_pct'))
     tl = R.get('taille') or {}
     plaf = B.get('plafond')
     inv = _premiere_phrase(G(D, 'lecture.invalidation'), 240)
-    taille_b_ok = not (det and num(pos_) and pos_ >= VOIE_B_TAILLE)
-    if typ in ('TROP CHERE', 'CORRECTE CHERE') and not det and act in ('NE PAS ACHETER', 'ATTENDRE LE PRIX'):
-        titre_act = 'N’achète pas encore : attends le bon prix.'
-    if act == 'GARDER, NE PAS RENFORCER':
-        if B.get('statut') == 'EN ATTENTE' and taille_b_ok:
-            titre_act = 'Garde ta ligne, et attends le signal pour renforcer.'
-        elif B.get('statut') == 'HORS ZONE':
-            titre_act = 'Garde ta ligne, sans renforcer pour l’instant.'
-        elif B.get('statut') in ('OUVERTE', 'EN ATTENTE') and not taille_b_ok:
-            titre_act = 'Garde ta ligne : elle a déjà sa taille tactique.'
-        elif B.get('statut') == 'OUVERTE' and not num(pos_):
-            titre_act = 'Garde ta ligne : indique son poids avant de renforcer.'
+    if act == 'ATTENDRE LE PRIX' and not alerte_a:
+        titre_act = 'Réévalue les conditions avant toute entrée.'
     elif act == 'RENFORCER TACTIQUEMENT (VOIE B)':
         titre_act = 'Porte ta ligne à %s %%, en renfort tactique.' % fr(VOIE_B_TAILLE, 0)
     elif act == 'ACHAT TACTIQUE (VOIE B)':
         titre_act = 'Prends une petite ligne tactique de %s %%.' % fr(VOIE_B_TAILLE, 0)
-    D_ = lambda x: '<b class="chiffre cyan">%s %s</b>' % (fprix(x), esc(dev))
+    def D_(x, limite=False):
+        return '<b class="chiffre cyan">%s %s</b>' % (fplafond(x) if limite else fprix(x), esc(dev))
     etapes = []
     engage = det or act in ('ACHETER', 'RENFORCER', 'ACHAT TACTIQUE (VOIE B)', 'RENFORCER TACTIQUEMENT (VOIE B)')
     tactique = act in ('ACHAT TACTIQUE (VOIE B)', 'RENFORCER TACTIQUEMENT (VOIE B)')
@@ -5543,42 +5439,42 @@ def calc_recit(D, R):
         etapes.append(esc(_phrase(pq)))
     elif act.startswith('VENDRE'):
         etapes.append('Vends la ligne : %s.' % esc(pq))
-        etapes.append(('Garde le dossier sous le coude : sous %s, il redevient intéressant.' % D_(PA)) if num(PA)
-                      else 'Garde le dossier sous le coude, au cas où le prix retomberait.')
     elif act == 'ALLÉGER':
         etapes.append('Allège la ligne : %s.' % esc(pq))
     elif act == 'ACHETER':
         etapes.append('Achète la première tranche (répartition %s), au plus à %s. Taille maximale de la ligne : %s %% du portefeuille.'
-                      % (esc(R.get('tranches') or 'n.d.'), D_(PA), fr(tl.get('max'), 1)))
+                      % (esc(R.get('tranches') or 'n.d.'), D_(PA, limite=True), fr(tl.get('max'), 1)))
     elif act == 'RENFORCER':
         etapes.append('Renforce jusqu’à %s %% du portefeuille%s, au plus à %s.'
-                      % (fr(tl.get('max'), 1), (' (aujourd’hui %s %%)' % fr(pos_, 1)) if num(pos_) else '', D_(PA)))
+                      % (fr(tl.get('max'), 1), (' (aujourd’hui %s %%)' % fr(pos_, 1)) if num(pos_) else '', D_(PA, limite=True)))
     elif tactique:
         etapes.append('%s, sans payer plus de %s : au-dessus, le potentiel ou la protection ne tiennent plus.'
                       % (('Porte la ligne de %s %% à %s %% au plus' % (fr(pos_, 1), fr(VOIE_B_TAILLE, 0))) if det
-                         else 'Prends une ligne de %s %% au plus' % fr(VOIE_B_TAILLE, 0), D_(plaf)))
+                         else 'Prends une ligne de %s %% au plus' % fr(VOIE_B_TAILLE, 0), D_(plaf, limite=True)))
         etapes.append('Ta sortie, écrite dès aujourd’hui : vends à <b class="chiffre vert">%s %s</b> (objectif), au plus tard le <b>%s</b> (stop temps), '
                       'ou tout de suite si %s (stop thèse).' % (fprix(B.get('vp')), esc(dev), esc(B.get('sortie_temps') or 'n.d.'),
                                                                 esc(_minus(inv, D)) if inv else 'la thèse tombe'))
-    elif B.get('statut') == 'EN ATTENTE' and num(B.get('declencheur')) and num(cours) and taille_b_ok:
+    elif act == 'ATTENDRE LE SIGNAL (VOIE B)' and num(B.get('declencheur')) and num(cours):
         etapes.append('Pose une alerte à %s (%s). S’il y remonte, relance le dossier : %s n’est permis que si tout tient encore à ce prix '
                       '(plafond d’entrée aujourd’hui %s).' % (D_(B['declencheur']), _pct(100 * (B['declencheur'] / cours - 1)),
-                                                            'le renfort à %s %%' % fr(VOIE_B_TAILLE, 0) if det else 'l’achat tactique', D_(plaf)))
-    elif B.get('statut') == 'HORS ZONE' and num(B.get('declencheur')) and num(cours):
+                                                            'le renfort à %s %%' % fr(VOIE_B_TAILLE, 0) if det else 'l’achat tactique', D_(plaf, limite=True)))
+    elif act == 'SURVEILLER (VOIE B HORS ZONE)' and num(B.get('declencheur')) and num(cours):
         sg = B.get('au_signal') or {}
         etapes.append('Pose une alerte à %s, mais pour relancer l’analyse, pas pour %s. Avec les chiffres d’aujourd’hui, à ce prix le potentiel tomberait à '
                       '<b class="chiffre">%s</b> et le capital préservé à <b class="chiffre">%s</b>/100 : la Voie B se fermerait. Elle ne tient que sous %s.'
-                      % (D_(B['declencheur']), 'renforcer' if det else 'acheter', _pct(sg.get('hausse')), fr(sg.get('cap'), 0), D_(plaf)))
-    elif not det and num(PA) and num(cours) and PA < cours and (act == 'ATTENDRE LE PRIX' or typ in ('TROP CHERE', 'CORRECTE CHERE')):
+                      % (D_(B['declencheur']), 'renforcer' if det else 'acheter', _pct(sg.get('hausse')), fr(sg.get('cap'), 0), D_(plaf, limite=True)))
+    elif alerte_a:
         etapes.append('Crée une alerte à %s (%s par rapport au cours actuel). Quand elle sonne, relance le dossier avant d’acheter.'
-                      % (D_(PA), _pct(100 * (PA / cours - 1))))
+                      % (D_(PA, limite=True), _pct(100 * (PA / cours - 1))))
     elif act == 'PAS DE PLACE TACTIQUE':
         etapes.append('Tes %s places sont prises. Attends qu’une place se libère, puis relance ce dossier.' % VOIE_B_PLACES)
     elif typ == 'A CORRIGER':
         etapes.append('Ne décide rien sur ce dossier : fais corriger les chiffres (unités, ancrage) puis relance-le.')
-    elif not det and (act == 'NE PAS ACHETER' or typ in ('EVITER', 'HORS PERIMETRE')):
+    elif act == 'NE PAS ACHETER':
         etapes.append('Rien à faire. Ne la remets sur ta liste que si les comptes changent vraiment l’histoire.')
-    if B.get('statut') in ('EN ATTENTE', 'HORS ZONE') and not B.get('places_verifiees') and etapes and not act.startswith(('VENDRE', 'ALLÉGER', 'SORTIR')):
+    elif A_.get('ordre') or pq:
+        etapes.append(esc(_phrase(A_.get('ordre') or pq)))
+    if attente_b and not B.get('places_verifiees') and etapes:
         etapes[0] += ' Vérifie le registre avant tout ordre tactique.'
     rdv = A_.get('rdv')
     cond = _premiere_phrase(G(D, 'verdict.suivi_condition'), 240)
@@ -5598,7 +5494,7 @@ def calc_recit(D, R):
                       action=titre_act, etapes=etapes, v4=V4, q3_apres=q3_apres)
 
 
-def regle_html(D, R):
+def regle_html(D, R, afficher_plafond=True):
     """La regle des prix : du pire au meilleur cas, sur une echelle logarithmique resserree."""
     meta = D.get('meta') or {}
     cours = vv(meta.get('cours'))
@@ -5608,30 +5504,32 @@ def regle_html(D, R):
     B = R.get('voie_b') or {}
     pts = []
     if num(V4.get('baissier')):
-        pts.append((V4['baissier'], 'rouge', 'si je me trompe<br>dans 4 ans'))
-    pts.append((cours, 'cyan', 'aujourd’hui'))
+        pts.append((V4['baissier'], 'rouge', 'si je me trompe<br>dans 4 ans', False))
+    pts.append((cours, 'cyan', 'aujourd’hui', False))
     PA = R.get('PA')
     if (R.get('porte_prix') != 'ouverte' or (R.get('recit') or {}).get('type') in ('TROP CHERE', 'CORRECTE CHERE')) and num(PA) and PA < cours:
-        pts.append((PA, 'jaune', '🔔 alerte Voie A<br>prix max. d’achat'))
+        libelle = ('🔔 alerte Voie A' if G(R, 'action.act') == 'ATTENDRE LE PRIX' and alerte_prix_a(R, cours)
+                   else 'seuil théorique Voie A')
+        pts.append((PA, 'jaune', libelle + '<br>prix max. d’achat', True))
     elif B.get('statut') == 'EN ATTENTE' and num(B.get('declencheur')):
-        pts.append((B['declencheur'], 'jaune', '🔔 alerte Voie B<br>signal → relancer'))
+        pts.append((B['declencheur'], 'jaune', 'signal Voie B<br>→ réexaminer', False))
     elif B.get('statut') == 'HORS ZONE' and num(B.get('declencheur')):
-        pts.append((B['declencheur'], 'jaune', '🔔 alerte<br>relancer l’analyse'))
+        pts.append((B['declencheur'], 'jaune', 'signal hors zone<br>→ réexaminer', False))
     if num(B.get('plafond')) and B.get('statut') in ('OUVERTE', 'EN ATTENTE', 'HORS ZONE') and not any(abs(p[0] - B['plafond']) < 1e-9 for p in pts):
-        pts.append((B['plafond'], 'orange', 'plafond d’entrée<br>tactique'))
+        pts.append((B['plafond'], 'orange', 'plafond d’entrée<br>tactique', True))
     if num(B.get('vp')) and B.get('statut') in ('OUVERTE', 'EN ATTENTE', 'HORS ZONE'):
-        pts.append((B['vp'], 'vert', 'objectif à 1 ou 2 ans'))
+        pts.append((B['vp'], 'vert', 'objectif à 1 ou 2 ans', False))
     if num(V4.get('central')):
-        pts.append((V4['central'], 'vert', 'scénario central<br>dans 4 ans'))
+        pts.append((V4['central'], 'vert', 'scénario central<br>dans 4 ans', False))
     if num(V4.get('haussier')):
-        pts.append((V4['haussier'], 'vert', 'si tout va bien<br>dans 4 ans'))
+        pts.append((V4['haussier'], 'vert', 'si tout va bien<br>dans 4 ans', False))
     pts = [p for p in pts if p[0] > 0]
     if len(pts) < 3:
         return ''
     pts.sort(key=lambda p: p[0])
     lo, hi = math.log(pts[0][0]), math.log(pts[-1][0])
     span = (hi - lo) or 1.0
-    pos = [4 + 92 * (math.log(v) - lo) / span for v, _, _ in pts]
+    pos = [4 + 92 * (math.log(v) - lo) / span for v, _, _, _ in pts]
     gap = min(16.0, 92.0 / max(1, len(pts) - 1))
     for i in range(1, len(pos)):  # ecart minimal pour la lisibilite
         pos[i] = max(pos[i], pos[i - 1] + gap)
@@ -5643,56 +5541,461 @@ def regle_html(D, R):
     pc = pos[[p[0] for p in pts].index(cours)]
     rail = ('linear-gradient(90deg,rgba(240,96,95,.8) 0%%,rgba(240,96,95,.8) %.1f%%,#2a3a40 %.1f%%,#2a3a40 %.1f%%,rgba(78,222,154,.45) %.1f%%,rgba(78,222,154,.95) 100%%)'
             % (max(2.0, pos[0] + 2), max(2.0, pos[0] + 2), pc, pc))
-    o = ['<div class="p1-regle"><div class="p1-axe" style="background:%s"></div>' % rail]
-    for i, ((v, c, t), x) in enumerate(zip(pts, pos)):
+    o = ['<div class="p1-regle-scroll"><div class="p1-regle"><div class="p1-axe" style="background:%s"></div>' % rail]
+    for i, ((v, c, t, limite), x) in enumerate(zip(pts, pos)):
         haut = (i % 2 == 1)
         o.append('<div class="p1-pt %s" style="left:%.1f%%"><div class="p1-dot" style="background:var(--p1-%s)"></div>'
                  '<div class="p1-lbl"><div class="p1-px p1-%s">%s</div><div class="p1-t">%s</div></div></div>' % (
-                     'haut' if haut else 'bas', x, c, c, fprix(v), t))
-    o.append('</div><div class="p1-echelle">Échelle resserrée pour la lisibilité · valeurs en %s · « dans 4 ans » = valeur estimée de l’action, hors dividendes.</div>'
+                     'haut' if haut else 'bas', x, c, c, ('' if v == PA and not afficher_plafond else fplafond(v)) if limite else fprix(v), t.replace('<br>', '<br> ')))
+    o.append('</div></div><div class="p1-echelle">Échelle resserrée pour la lisibilité · valeurs en %s · « dans 4 ans » = valeur estimée de l’action, hors dividendes.</div>'
              % esc(meta.get('devise', '')))
     return ''.join(o)
 
 
-def _nbsp_pct(h):
-    """Espace insecable avant %, : et ? pour eviter les orphelins en fin de ligne."""
-    h = h.replace(' %', '\u00a0%').replace(' ?', '\u00a0?').replace(' :', '\u00a0:')
-    return re.sub(r'(\(?[+\-−]?\d[\d,.]*)\u00a0%(\)?)', '<span class="nw">\\1\u00a0%\\2</span>', h)
 
 
-def page1_html(D, R):
-    """V25 : la page 1, fusion des maquettes A (editorial), B (regle des prix) et C (quatre questions)."""
-    Rc = R.get('recit') or {}
-    if not Rc:
-        return ''
+def business_html(D):
+    a0 = D.get('acte0') or {}
+    champs = [('Activité', 'activite', ('activite', 'modele_economique')),
+              ('Positionnement', 'positionnement', ('positionnement',))]
+    blocs = []
+    for titre, classe, cles in champs:
+        phrases = dict.fromkeys(_phrase(a0.get(cle)) for cle in cles)
+        paragraphes = ''.join('<p>%s</p>' % esc(phrase) for phrase in phrases if phrase)
+        if paragraphes:
+            blocs.append('<div class="histoire-bloc"><h2 class="%s">%s</h2>%s</div>' % (classe, titre, paragraphes))
+    return ('<section class="histoire rail-activite" id="modele" aria-label="Modèle économique">%s</section>'
+            % (''.join(blocs) or '<p>Modèle économique à documenter.</p>'))
+
+
+def revenus_html(D):
+    a0 = D.get('acte0') or {}
+    revenus = ''.join('<tr><td>%s</td><td class="n">%s</td><td class="n">%s</td><td>%s</td></tr>' % (
+        esc(r[0]), esc(r[1]), esc(r[2] if len(r) > 2 else ''), prov(r[3] if len(r) > 3 else ''))
+        for r in (a0.get('revenus') or []) if isinstance(r, list) and len(r) >= 2)
+    ratio = V(a0.get('ratio_echelle'))
+    detail = '<div class="scroll"><table>%s</table></div>' % revenus if revenus else ''
+    if ratio['v']:
+        detail += '<p class="sub">%s %s</p>' % (esc(ratio['v']), prov(ratio['prov']))
+    return dossier_detail('Répartition des revenus', detail)
+
+
+def avenir_html(D, R):
+    avr = R.get('avenir') or {}
+    if avr.get('doc'):
+        lecture = (
+            '<p><b>Problème résolu</b> — %s</p><div class="grid g3">'
+            '<div><div class="lab">Le besoin demain</div><div>%s</div><div class="sub">%s</div></div>'
+            '<div><div class="lab">La société en gardera-t-elle la valeur ?</div><div>%s</div><div class="sub">%s</div></div>'
+            '<div><div class="lab">Lecture</div><div>%s</div><div class="sub">%s</div></div></div>'
+            '<div class="sub">Lecture seulement : les faits se notent dans Modèle 2 et Modèle 3, '
+            'aucun point ni effet sur le prix. Un besoin croissant ne garantit pas des profits croissants.</div>' % (
+                esc(avr.get('probleme') or 'n.d.'),
+                bdg(avr.get('ex'), avr.get('ex_lvl', 'gris')), esc(avr.get('ex_txt')),
+                bdg(avr.get('ca'), avr.get('ca_lvl', 'gris')), esc(avr.get('ca_txt')),
+                bdg(avr.get('synth'), avr.get('lvl', 'gris')), esc(avr.get('txt'))))
+    else:
+        lecture = '<div>%s</div><p class="sub">La durabilité du besoin reste à documenter.</p>' % bdg('NON DOCUMENTÉ', 'gris')
+    perspectives = _phrase(G(D, 'acte0.perspectives'))
+    suite = '<div class="avenir-perspectives"><h4>Perspectives</h4><p>%s</p></div>' % esc(perspectives) if perspectives else ''
+    return '<section class="c"><h3>🔮 Le problème existera-t-il encore ?</h3>%s%s</section>' % (lecture, suite)
+
+
+def entete_html(D, R):
     meta = D.get('meta') or {}
-    pf = R.get('pf') or {}
-    pos = vv(meta.get('position_pct'))
-    det_txt = ('tu détiens %s de ton portefeuille' % (('%s %%' % fr(pos, 1)) if num(pos) else 'cette ligne')) if R.get('detenue') else 'nouvelle position'
+    cap = vv(meta.get('capitalisation_musd'))
+    vol = vv(meta.get('volume_median_eur_jour'))
+    repere = []
+    if num(cap) and cap > 0:
+        repere.append('%s M$ de capitalisation%s' % (fr(cap, 0), ' · Zone prioritaire' if 100 <= cap <= 1000 else ''))
+    if num(vol) and vol > 0:
+        repere.append('%s €/jour de volume médian · un ordre de 20 000 € représente %s %% de ce volume'
+                      % (fr(vol, 0), fr(100 * (20000 / vol), 1)))
+    infos = ' · '.join(str(x) for x in (R.get('ticker') or meta.get('ticker'), meta.get('secteur'), meta.get('pays')) if x)
+    action = R.get('action') or {}
+    cours = None if action.get('cours_invalide') else vv(meta.get('cours'))
+    return ('<header class="dossier-entete"><h1>%s</h1><p class="sub">%s</p>%s%s</header>') % (
+        esc(meta.get('societe') or 'Dossier NICO'), esc(infos),
+        '<p class="sub">%s</p>' % esc(' · '.join(repere)) if repere else '',
+        '<p class="dossier-cours">%s</p>' % prix_affiche(cours, str(meta.get('devise') or ''), precis=True) if num(cours) and cours > 0 else '')
 
-    def question(n, intitule, rep, t, extra=''):
-        r, c, txts = rep
-        return ('<section class="p1-q"><div class="p1-n">%s · %s</div><div class="p1-r p1-%s">%s</div>%s%s</section>' % (
-            n, intitule, c, esc(r), ''.join('<p>%s</p>' % x for x in ([' '.join(txts)] if txts else [])), extra))
-    duo = ('<div class="p1-duo"><div class="p1-pf p1-pile"><div class="p1-l">PILE · SI J’AI RAISON</div><div class="p1-v">%s</div><p>%s</p></div>'
-           '<div class="p1-pf p1-face"><div class="p1-l">FACE · SI JE ME TROMPE</div><div class="p1-v">%s</div><p>%s</p></div></div>') % (
-        Rc['pile'][0], Rc['pile'][1], Rc['face'][0], Rc['face'][1]) + (
-        ('<p class="p1-entree">%s</p>' % Rc['q3_apres']) if Rc.get('q3_apres') else '')
-    etapes = ''.join('<div class="p1-etape"><div class="p1-num">%s</div><p>%s</p></div>' % (i + 1, e) for i, e in enumerate(Rc['etapes']))
-    return _nbsp_pct(('<div class="p1"><div class="p1-nom">%s</div><div class="p1-meta">%s · %s · %s · %s</div><div class="p1-cours">%s %s</div>'
-            '<span class="p1-etiq p1-e-%s">%s</span><h1 class="p1-titre">%s</h1>%s%s'
-            '%s%s%s%s'
-            '<p class="p1-fin">↓ Le tableau de bord, puis le dossier détaillé : l’histoire, la croissance, la forteresse, les risques, le prix et le plan.</p></div>') % (
-        esc(meta.get('societe')), esc(meta.get('secteur')), esc(meta.get('pays')), esc(R.get('ticker') or meta.get('ticker')), esc(det_txt),
-        fprix(vv(meta.get('cours'))), esc(meta.get('devise', '')),
-        Rc['couleur'], esc(Rc['etiquette']), esc(Rc['titre']),
-        ('<p class="p1-chapeau">%s</p>' % ' '.join(Rc['chapeau'])) if Rc['chapeau'] else '',
-        ''.join('<p>%s</p>' % s_ for s_ in Rc['suite']),
-        question(1, 'EST-CE UNE BONNE ENTREPRISE ?', Rc['q1'], None),
-        question(2, 'EST-CE QUE LE PRIX EST INTÉRESSANT ?', Rc['q2'], None, regle_html(D, R)),
-        question(3, 'COMBIEN JE PEUX GAGNER, COMBIEN JE PEUX PERDRE ?', Rc['q3'], None, duo),
-        '<section class="p1-q"><div class="p1-n">4 · QU’EST-CE QUE JE FAIS ?</div><div class="p1-action"><div class="p1-av">%s</div>%s</div></section>' % (
-            esc(Rc['action']), etapes)))
+
+def pile_face_html(R, entree=True, tactique=False):
+    recit = R.get('recit') or {}
+    if not (recit.get('pile') and recit.get('face')):
+        return ''
+    pile_v, pile_t = recit['pile']
+    if tactique:
+        hausse = G(R, 'voie_b.hausse')
+        pile_v = ('%s %%' % fr(hausse, 0, True)) if num(hausse) else 'n.d.'
+        pile_t = 'vers la valeur prudente de la station Décote, en 12 à 24 mois.'
+    elif num(G(R, 'asymetrie.tri_h')):
+        pile_t = re.sub(r'\([^)]* % par an, dividendes compris\)',
+                        '(%s %% par an, dividendes compris)' % fr(G(R, 'asymetrie.tri_h'), 1), pile_t)
+    apres = recit.get('q3_apres') if entree else ''
+    if apres and apres.startswith('Au prix de ton alerte'):
+        apres = re.sub(r'^Au prix de ton alerte \(.*?\),', 'Au prix de ton alerte,', apres)
+    return ('<div class="p1-duo"><div class="p1-pf p1-pile"><div class="p1-l">PILE · SI J’AI RAISON</div>'
+            '<div class="p1-v">%s</div><p>%s</p></div><div class="p1-pf p1-face"><div class="p1-l">FACE · SI JE ME TROMPE</div>'
+            '<div class="p1-v">%s</div><p>%s</p></div></div>%s') % (
+        pile_v, pile_t, *recit['face'], '<p class="p1-entree">%s</p>' % apres if apres else '')
+
+
+def dossier_detail(titre, contenu):
+    return '<section class="dossier-detail"><h4>%s</h4>%s</section>' % (esc(titre), contenu) if contenu else ''
+
+
+def route_rail(R):
+    portes_a = dict(R.get('portes') or [])
+    if portes_a.get('Qualité') is True:
+        return 'A'
+    b, q = R.get('voie_b') or {}, R.get('q') or {}
+    recevable = any(n == 'Dossier recevable' and ok is True for n, ok, _ in b.get('tests', []))
+    if recevable and num(q.get('Q')) and q['Q'] >= VOIE_B_Q_MIN and not q.get('provisoire'):
+        if b.get('statut') in ('OUVERTE', 'EN ATTENTE', 'HORS ZONE', 'À DOCUMENTER'):
+            return 'B'
+    return 'fin'
+
+
+def verdict_titre_html(R):
+    recit = R.get('recit') or {}
+    if not recit:
+        return ''
+    return '<div class="rail-verdict"><span class="p1-etiq p1-e-%s">%s</span><h2>%s</h2></div>' % (
+        recit['couleur'], esc(recit['etiquette']), esc(recit['titre']))
+
+
+CHAMPS_THESE = (
+    ('texte', 'Thèse'),
+    ('pour_que_ca_marche', '✅ Pour que ça marche'),
+    ('risque_principal', '🛑 Ce qui la tuerait'),
+)
+
+
+def boussole_html(D):
+    vals = []
+    for cle, _ in CHAMPS_THESE:
+        texte = G(D, 'acte0.these.' + cle)
+        vals.append(esc(texte.strip()) if isinstance(texte, str) and texte.strip() else '<em>à écrire</em>')
+    conditions = ''.join('<div><b>%s</b><p>%s</p></div>' % (esc(titre), valeur)
+                         for (_, titre), valeur in zip(CHAMPS_THESE[1:], vals[1:]))
+    return ('<section class="rail-these"><h2>🧭 La thèse, notre boussole</h2><p>%s</p>'
+            '<div class="rail-these-tests">%s</div></section>') % (vals[0], conditions)
+
+
+def couleur_feu(etat, echec='orange'):
+    return 'vert' if etat is True else echec if etat is False else 'gris'
+
+
+def contexte_confiance(D, R):
+    pa = R.get('PA')
+    if not num(pa) or pa <= 0:
+        return 'prix d’achat à documenter'
+    return 'au prix d’achat de ' + ' '.join(filter(None, (fplafond(pa), str(G(D, 'meta.devise') or ''))))
+
+
+def arbitre_html(D, R):
+    """Explique les écarts entre signaux existants, dans leur ordre de priorité."""
+    messages = []
+    l = R.get('longevite') or {}
+    q = G(R, 'q.Q')
+    if num(q) and q >= 75 and l.get('lvl') in (1, 2, 3):
+        if num(l.get('tm')) and num(l.get('H')):
+            messages.append(('durée', 'La société obtient %s %%, mais le prix exige environ %s ans de croissance et on en voit %s. '
+                             'C’est la durée étayée qui fixe ce que le cours peut justifier.' %
+                             (fr(q, 0), fr(l['tm'], 0), fr(l['H'], 0))))
+        else:
+            messages.append(('durée', 'La société obtient %s %%, mais %s. La durée étayée prime pour juger le prix.' %
+                             (fr(q, 0), str(l.get('txt') or 'la durée reste à documenter').rstrip('.'))))
+    c, rt, tx = G(R, 'confiance.pct'), R.get('retenu'), R.get('tx')
+    if num(c) and c >= 70 and dict(R.get('portes') or []).get('Prix') is False:
+        ecart = tx - rt if num(rt) and num(tx) else None
+        manque = ('Au cours du jour, il te manque %s %s de rendement.' %
+                  (fr(ecart, 1), 'point' if ecart <= 1 else 'points')
+                  if num(ecart) and ecart > 0 else
+                  'Le rendement atteint le seuil, mais le plafond de prix ou le plancher de perte reste contraignant.'
+                  if num(ecart) else 'Le rendement au cours reste à vérifier.')
+        messages.append(('confiance', 'La confiance de %s %% vaut %s. %s' % (fr(c, 0), contexte_confiance(D, R), manque)
+                         if num(R.get('PA')) else
+                         'Le score de confiance est de %s %%. Le prix d’achat reste à documenter. %s' % (fr(c, 0), manque)))
+    past = {nom: (ok, x) for nom, ok, x in G(R, 'pastilles.liste', [])}
+    ca, bpa = (past.get(n, (None, None)) for n in ('CA vs N−1', 'BPA vs N−1'))
+    guidance = G(D, 'resultats.publication.guidance')
+    pub_date = _date(G(D, 'resultats.publication.date'))
+    eval_date = _date(G(D, 'meta.date_eval'))
+    abaissee = (G(R, 'pastilles.abaissee') or (isinstance(guidance, list) and bool(guidance)
+                and guidance[0] == 'ABAISSÉE' and pub_date and (not eval_date or pub_date <= eval_date)))
+    if ca[0] is True and bpa[0] is True and abaissee:
+        evolution = ' La direction passe de %s à %s.' % tuple(guidance[2:4]) if (
+            isinstance(guidance, list) and len(guidance) >= 4 and guidance[0] == 'ABAISSÉE'
+            and pub_date and (not eval_date or pub_date <= eval_date) and all(guidance[2:4])) else ''
+        messages.append(('guidance', 'Le CA progresse de %s %% et le BPA de %s %% sur un an.%s '
+                         'La guidance abaissée prime sur le bon trimestre.' % (fr(ca[1], 1), fr(bpa[1], 1), evolution)))
+    s = R.get('sources_g') or {}
+    if s.get('lab') == 'PLUS OPTIMISTE QUE LE CONSENSUS — SANS MOTIF' and s.get('comp'):
+        central, consensus, _ = s['comp']
+        messages.append(('consensus', 'Le scénario central attend %s %%/an contre %s %%/an pour le consensus comparable. '
+                         'Il faut une preuve écrite pour retenir cet écart.' % (fr(central, 1), fr(consensus, 1))))
+    b = R.get('voie_b') or {}
+    tests = {n: ok for n, ok, _ in b.get('tests', [])}
+    if (tests.get('Décote prouvée') is True and tests.get('Catalyseur à ≤ %s mois' % VOIE_B_MOIS) is True
+            and tests.get('Le cours confirme') is False):
+        messages.append(('signal', 'Le potentiel de %s %% s’appuie sur un catalyseur attendu le %s. '
+                         'Le cours n’a pas encore tourné. Le signal technique reste nécessaire.' %
+                         (fr(b.get('hausse'), 1, True), b.get('sortie_temps') or 'jour à préciser')))
+    eth = _sans_accent(G(R, 'profil.ethique.lab') or '')
+    impact = G(R, 'monde.score')
+    if num(impact) and (('contraire' in eth and impact >= .15) or ('conforme' in eth and impact <= -.15)):
+        messages.append(('éthique', 'La balance d’impact est %s (%s). Le dossier classe l’éthique « %s ». '
+                         'Ton critère éthique tranche séparément du bilan d’impact.' %
+                         ('positive' if impact > 0 else 'négative', fr(impact, 2, True), G(R, 'profil.ethique.lab'))))
+    init = R.get('init') or {}
+    act = G(R, 'action.act') or ''
+    if str(init.get('lab') or '').startswith('VENTES FORTES') and act.startswith(('ACHETER', 'ACHAT', 'RENFORCER')):
+        messages.append(('initiés', 'Les initiés ont vendu %s en 12 mois alors que le moteur autorise l’entrée ou le renfort. '
+                         'Les portes d’achat gouvernent la décision. Le signal des initiés reste à surveiller.' % _meur(init.get('v12'))))
+    retenus = messages[:2]
+    contenu = (''.join('<p>%s</p>' % esc(texte) for _, texte in retenus) or
+               '<p>✅ Tous les signaux vont dans le même sens.</p>')
+    return ('<aside class="rail-arbitre%s"><h2>⚖️ L’arbitre</h2>%s</aside>' %
+            ('' if retenus else ' rail-arbitre-ok', contenu), any(cle == 'confiance' for cle, _ in retenus))
+
+
+def station(cle, titre, icone, question, valeur, reponse, etat, couleur, suite, contenu):
+    return dict(cle=cle, titre=titre, icone=icone, question=question, valeur=valeur, reponse=reponse,
+                etat=etat, couleur=couleur, suite=suite, contenu=contenu)
+
+
+def stations_a(R, croissance, longevite, prix):
+    p = dict(R.get('portes') or [])
+    r = R.get('recit') or {}
+    s, l = R.get('sources_g') or {}, R.get('longevite') or {}
+    c, lp, pp = p.get('Croissance'), l.get('feu'), p.get('Prix')
+    lab = s.get('lab') or ''
+    lecture = ('Le central est plus prudent que le consensus.' if lab.startswith('PLUS PRUDENT') else
+               'Le central est aligné sur le consensus.' if lab.startswith('ALIGNÉ') else
+               'Le central est plus optimiste que le consensus.' if lab.startswith('PLUS OPTIMISTE') else
+               'Les prévisions restent à comparer.' if num(R.get('gc')) else 'La croissance reste à documenter.')
+    tm, h = l.get('tm'), l.get('H')
+    ans = '%s exigés · %s vus' % (('~%s ans' % fr(tm, 0)) if num(tm) else 'n.d.',
+                                  ('~%s ans' % fr(h, 0)) if num(h) else 'n.d.')
+    couleur_l = {1: 'rouge', 2: 'rouge', 3: 'orange', 4: 'jaune', 5: 'vert', 6: 'vert'}.get(l.get('lvl'), 'gris')
+    rt = R.get('retenu')
+    rdt = '%s / %s %%/an' % (fr(rt, 1), fr(R.get('tx'), 1)) if num(rt) else 'n.d.'
+    q2, c2, _ = r.get('q2', ('À documenter.', 'gris', []))
+    return [
+        station('croissance', 'Croissance', '📈', 'Va-t-elle grandir ?', '%s %%/an' % fr(R['gc'], 1) if num(R.get('gc')) else 'n.d.',
+                lecture, c, couleur_feu(c),
+                'Reste à savoir combien de temps cette croissance peut tenir.' if c else
+                'Le rythme reste à démontrer. Combien de temps les protections actuelles peuvent-elles tenir ?', croissance),
+        station('longevite', 'Longévité', '⏳', 'Combien de temps ça tient ?', ans,
+                _phrase(str(l.get('lab') or 'À documenter').lower()), lp, couleur_l,
+                'La durée visible couvre ce que demande le cours. À quel prix le rendement suit-il ?' if lp else
+                'La durée visible ne suffit pas à valider le cours. À quel prix cela paie-t-il ?', longevite),
+        station('prix', 'Prix', '💶', 'À quel prix ça paie ?', rdt, q2, pp, couleur_feu(pp, c2),
+                'Le prix passe. Voyons si les autres portes autorisent l’achat.' if pp else
+                'Le prix au cours du jour ne passe pas. Le terminus précise la conduite à tenir.' if pp is False else
+                'Le prix reste à documenter. Passons à la décision du dossier.', prix),
+    ]
+
+
+def pastilles_html(lignes):
+    return '<div class="rail-pastilles">%s</div>' % ''.join(
+        '<span class="rail-pill rail-%s">%s %s</span>' % (
+            couleur_feu(ok, 'rouge'), '✓' if ok is True else '✕' if ok is False else '○', esc(texte))
+        for texte, ok in lignes)
+
+
+def trimestre_html(R):
+    return pastilles_html([
+        ('%s · %s' % (nom, fr(x, 1, True) + ' %' if num(x) else 'n.d.'), ok)
+        for nom, ok, x in G(R, 'pastilles.liste', [])
+    ])
+
+
+def stations_b(D, R):
+    b = R['voie_b']
+    tests = {n: (ok, texte) for n, ok, texte in b['tests']}
+    dk, dk_txt = tests['Décote prouvée']
+    ck, ck_txt = tests['Catalyseur à ≤ %s mois' % VOIE_B_MOIS]
+    sk, sk_txt = tests['Le cours confirme']
+    tk, tk_txt = tests['Le trimestre confirme']
+    pk, _ = tests['Capital préservé ≥ %s/100' % fr(VOIE_B_CAP_MIN, 0)]
+    signal = True if sk is True and tk is True else False if sk is False or tk is False else None
+    dev = G(D, 'meta.devise') or ''
+    ref = V(G(D, 'voie_b.valeur_prudente'))
+    origine = ' · '.join(str(x) for x in (ref['note'], ref['src']) if x) or b.get('vp_src') or dk_txt
+    hausse, cc = b.get('hausse'), R.get('cap_cours')
+    potentiel = fr(hausse, 1, True) + ' %' if num(hausse) else 'n.d.'
+    protection = fr(cc, 0) + ' / 100' if num(cc) else 'n.d.'
+    cas = b.get('au_signal') or {}
+    signal_txt = ('<p>Au signal, avec les hypothèses actuelles, le potentiel serait de %s %% et le capital préservé de %s/100.</p>' %
+                  (fr(cas.get('hausse'), 1, True), fr(cas.get('cap'), 0))) if cas else ''
+    confirmation = ('<p>%s.</p>%s%s%s' % (esc(sk_txt.rstrip('.')), trimestre_html(R), pastilles_html([
+        ('Guidance abaissée' if G(R, 'pastilles.abaissee') else
+         'Guidance à vérifier' if G(R, 'guidance_cas') in (None, '', 'NON DOCUMENTÉE') else 'Guidance sans baisse signalée',
+         False if G(R, 'pastilles.abaissee') else None if G(R, 'guidance_cas') in (None, '', 'NON DOCUMENTÉE') else True),
+        ('Le trimestre confirme', tk),
+    ]), signal_txt))
+    if tk is False and G(R, 'pastilles.abaissee'):
+        confirmation += '<p class="sub">%s.</p>' % esc(tk_txt.rstrip('.'))
+    cout = ('<p>Avec une ligne de %s %%, le scénario baissier coûte <b>%s %% du portefeuille</b>.</p>' %
+            (fr(VOIE_B_TAILLE, 0), fr(VOIE_B_TAILLE * max(0, 100 - cc) / 100, 2))) if num(cc) else ''
+    garde = ('Dossier recevable', 'Comptes fiables', 'Stop thèse', 'Place tactique libre')
+    gardes = pastilles_html([(n, tests[n][0]) for n in garde if n in tests])
+    notes = ''.join('<li>%s</li>' % esc(tests[n][1]) for n in garde if n in tests and tests[n][1])
+    return [
+        station('decote', 'Décote', '🏷️', 'Le prix est-il anormalement bas ?', potentiel,
+                'La décote est étayée.' if dk else 'La décote reste à prouver.', dk, couleur_feu(dk),
+                'Quel événement révélera cette valeur ?', '<p>Valeur prudente <b class="chiffre">%s %s</b> · seuil de potentiel +%s %%.</p><p>%s</p>' %
+                (fprix(b.get('vp')), esc(dev), fr(VOIE_B_HAUSSE_MIN, 0), esc(origine))),
+        station('catalyseur', 'Catalyseur', '📅', 'Qu’est-ce qui va le révéler ?', b.get('sortie_temps') or 'n.d.',
+                'Un événement est attendu dans les douze mois.' if ck else 'L’événement reste à dater.', ck, couleur_feu(ck),
+                'Le marché commence-t-il à intégrer ce catalyseur ?', '<p>%s.</p><p class="sub">Stop temps à cette échéance si le catalyseur ne s’est pas produit. L’objectif de sortie peut être atteint jusqu’à 24 mois.</p>' %
+                esc(ck_txt.rstrip('.'))),
+        station('signal', 'Le cours confirme', '📈', 'Le marché commence-t-il à y croire ?',
+                'Oui' if signal else 'Pas encore' if signal is False else 'n.d.',
+                'Le cours et le trimestre confirment.' if signal else 'La confirmation reste incomplète.', signal, couleur_feu(signal, 'jaune'),
+                'Que reste-t-il du capital si le scénario ne se réalise pas ?', confirmation),
+        station('protection', 'Protection', '🛡️', 'Que perds-tu si ça rate ?', protection,
+                'Le plancher tactique tient dans le baissier.' if pk else 'La protection tactique reste insuffisante ou à vérifier.',
+                pk, couleur_feu(pk, 'rouge'), 'La décote, le signal et le plancher conduisent à la décision tactique.',
+                '<p>Seuil tactique de capital préservé · %s/100.</p>%s%s%s%s' %
+                (fr(VOIE_B_CAP_MIN, 0), pile_face_html(R, entree=False, tactique=True), cout, gardes,
+                 ('<ul class="sub">%s</ul>' % notes) if notes else '')),
+    ]
+
+
+def sommaire_rail(stations, voie, action):
+    feu = sum(s['etat'] is True for s in stations)
+    etat = ('LE TRAJET DU DOSSIER · VOIE A · %s FEUX SUR 4' % feu if voie == 'A' else
+            '🔀 BIFURCATION VERS LA VOIE B · %s FEUX SUR 5' % feu if voie == 'B' else
+            'LE TRAJET DU DOSSIER · ARRÊT À LA QUALITÉ')
+    niv = action.get('lvl')
+    c = {1: 'rouge', 2: 'rouge', 3: 'orange', 4: 'jaune', 5: 'vert', 6: 'vert'}.get(niv, 'gris')
+    act = action.get('act') or ''
+    valeur = 'Fin' if voie == 'fin' else act.split(' ', 1)[0].rstrip(',').capitalize()
+    if act == 'NE PAS ACHETER' and voie != 'fin':
+        valeur = 'Écarter'
+    finale = dict(cle='decision', titre='Décision', icone='🧭', valeur=valeur, couleur=c)
+    liens = ''.join('<a class="rail-lien rail-%s" href="#%s"><span class="rail-rond" aria-hidden="true">%s</span>'
+                    '<b>%s</b><span>%s</span></a>' %
+                    (s['couleur'], s['cle'], s['icone'], esc(s['valeur']), esc(s['titre'])) for s in [*stations, finale])
+    couleurs = ','.join('var(--rail-%s)' % s['couleur'] for s in [*stations, finale])
+    return ('<div class="rail-sommaire"><p>%s</p><nav aria-label="Le trajet du dossier" style="--rail-degrade:linear-gradient(90deg,%s)">'
+            '%s</nav></div>') % (etat, couleurs, liens)
+
+
+def chapitre_rail(D, numero, s):
+    suite = G(D, 'lecture.donc.' + s['cle'])
+    suite = _phrase(suite) if isinstance(suite, str) and suite.strip() else s['suite']
+    return ('<section class="rail-chap rail-%s" id="%s"><span class="rail-point" aria-hidden="true">%s</span>'
+            '<div class="rail-kicker">CHAPITRE %s · %s</div><h2>%s</h2>'
+            '<p class="rail-reponse">%s <b>%s</b></p><div class="rail-preuves">%s</div>'
+            '<p class="rail-donc"><b>donc ➜</b> %s</p></section>') % (
+        s['couleur'], s['cle'], s['icone'], numero, esc(s['titre'].upper()), esc(s['question']),
+        esc(s['reponse']), esc(s['valeur']), s['contenu'], esc(suite))
+
+
+def these_etat_html(D, R):
+    act = G(R, 'action.act') or ''
+    pub = G(D, 'resultats.publication')
+    pub = pub if isinstance(pub, dict) else {}
+    date = _date(pub.get('date'))
+    evaluation = _date(G(D, 'meta.date_eval'))
+    t = pub.get('these') if date and (not evaluation or date <= evaluation) else None
+    etat, motif = (t + [''])[:2] if isinstance(t, list) and t else ('', '')
+    vf = str(R.get('verdict_final') or '')
+    if act == 'SORTIR — STOP THÈSE':
+        phrase = 'La thèse est invalidée. Le stop thèse est déclenché.'
+    elif etat == 'FRAGILISÉE':
+        phrase = 'La thèse est fragilisée.' + (' ' + _phrase(motif) if motif else '')
+    elif vf.startswith('REJET'):
+        phrase = 'Le verdict de rejet écarte la thèse d’investissement.'
+    elif vf.startswith(('HORS SÉLECTION', 'HORS PÉRIMÈTRE')) and act == 'NE PAS ACHETER':
+        phrase = 'La thèse ne remplit pas les critères d’investissement du dossier.'
+    elif act == 'DOSSIER À CORRIGER':
+        phrase = 'La thèse reste à réexaminer après correction du dossier.'
+    elif etat in ('INCHANGÉE', 'RENFORCÉE'):
+        phrase = 'La dernière publication renforce la thèse.' if etat == 'RENFORCÉE' else 'La thèse tient.'
+        if act == 'ATTENDRE LE PRIX':
+            phrase += ' Le prix, pas encore.'
+        elif act in ('ATTENDRE LE SIGNAL (VOIE B)', 'SURVEILLER (VOIE B HORS ZONE)'):
+            phrase += ' Le cours, pas encore.'
+        if motif:
+            phrase += ' À surveiller : ' + _phrase(motif[:1].lower() + motif[1:])
+    else:
+        phrase = 'L’état de la thèse reste à documenter à partir des derniers résultats.'
+    return '<p class="rail-etat-these">🧭 %s</p>' % esc(phrase)
+
+
+def terminus_html(D, R, voie):
+    action = R.get('action') or {}
+    act = action.get('act') or ''
+    recit = R.get('recit') or {}
+    v = D.get('verdict') or {}
+    suivi = v.get('suivi') or 'n.d.'
+    rdv = v.get('suivi_date')
+    etapes = []
+    for texte in recit.get('etapes', [])[:3]:
+        if rdv and texte.startswith(('Rendez-vous le ', 'Prochain point le ')):
+            d_ = _date(rdv)
+            texte = 'Rendez-vous le <b>%s</b> : la condition de réexamen est rappelée ci-dessous.' % esc(d_.strftime('%d/%m/%Y') if d_ else rdv)
+        if act in ('ACHAT TACTIQUE (VOIE B)', 'RENFORCER TACTIQUEMENT (VOIE B)'):
+            texte = re.sub(r'au plus tard le (<b>[^<]+</b>) \(stop temps\)',
+                           r'à l’échéance du \1 si le catalyseur ne s’est pas produit (stop temps)', texte)
+        etapes.append(texte)
+    steps = ''.join('<li><span>%s</span><p>%s</p></li>' % (i, e) for i, e in enumerate(etapes, 1))
+    just = G(D, 'lecture.justification_action')
+    if isinstance(just, dict):
+        just = just.get(act)
+    elif isinstance(just, list) and len(just) == 2 and just[0] == act:
+        just = just[1]
+    else:
+        just = ''
+    raison = _phrase(just) if isinstance(just, str) and just.strip() else _phrase(action.get('pourquoi'))
+    if act == 'ATTENDRE LE PRIX' and not (isinstance(just, str) and just.strip()):
+        obstacles = obstacles_alerte_a(R)
+        if obstacles:
+            raison = 'Le prix seul ne suffit pas. Le dossier reste bloqué par %s.' % ', '.join(obstacles).lower()
+        elif num(R.get('retenu')) and num(R.get('tx')):
+            raison = 'Le rendement estimé au cours est de %s %%/an pour un taux exigé de %s %%/an.' % (
+                fr(R['retenu'], 1), fr(R['tx'], 1))
+    condition = v.get('suivi_condition')
+    suivi_html = ('<div class="rail-suivi"><h3>Décision de watchlist</h3>%s%s%s</div>' %
+                  (bdg(suivi, L_LAB('suivi', suivi), 'wrap'),
+                   '<p>%s</p>' % esc(condition) if condition else '',
+                   '<p>Réexamen le %s.</p>' % esc(rdv) if rdv else ''))
+    titre = 'Fin du trajet' if voie == 'fin' else 'Ma décision'
+    niv = action.get('lvl')
+    couleur = {1: 'rouge', 2: 'rouge', 3: 'orange', 4: 'jaune', 5: 'vert', 6: 'vert'}.get(niv, 'gris')
+    return ('<section class="rail-chap rail-%s" id="decision"><span class="rail-point" aria-hidden="true">🧭</span>'
+            '<div class="rail-kicker">TERMINUS</div><h2>%s</h2><div class="rail-decision">%s'
+            '<p class="rail-act">%s</p>%s%s%s%s</div></section>') % (
+        couleur, titre, bdg(act, niv, 'gros wrap') if act else '',
+        esc(recit.get('action') or ACTIONS_HUMAINES.get(act, _phrase(act))),
+        '<ol class="rail-plan">%s</ol>' % steps if steps else '',
+        '<p class="rail-raison">%s</p>' % esc(raison) if raison else '', these_etat_html(D, R), suivi_html)
+
+
+def pour_memoire_html(D, R, croissance, longevite, prix, confiance_arbitree):
+    l = R.get('longevite') or {}
+    c = G(R, 'confiance.pct')
+    pa = R.get('PA')
+    if confiance_arbitree:
+        pa_affiche = 'Voir l’arbitre'
+    elif num(c):
+        pa_affiche = 'Confiance de %s %% · %s' % (fr(c, 0), contexte_confiance(D, R))
+    elif num(pa):
+        pa_affiche = '%s %s' % (fplafond(pa), G(D, 'meta.devise') or '')
+    else:
+        pa_affiche = 'n.d.'
+    return ('<aside class="rail-memo"><h2>Pour mémoire · la lecture long terme (Voie A)</h2>'
+            '<div class="grid g3"><p><b>Croissance</b><br>%s %%/an</p><p><b>Longévité</b><br>%s exigés · %s vus</p>'
+            '<p><b>Prix maximum d’achat</b><br>%s</p></div>%s%s%s</aside>') % (
+        fr(R.get('gc'), 1), ('~%s ans' % fr(l['tm'], 0)) if num(l.get('tm')) else 'n.d.',
+        ('~%s ans' % fr(l['H'], 0)) if num(l.get('H')) else 'n.d.',
+        esc(pa_affiche), croissance, longevite, prix)
 
 
 CSS_V25 = """
@@ -5754,7 +6057,173 @@ font-family:ui-monospace,monospace;font-weight:700;font-size:18px;margin-bottom:
 .p1-entree{margin-top:22px!important;padding:16px 20px;border:1px dashed rgba(242,207,91,.5);border-radius:14px;font-size:19px;max-width:none!important}
 .tdb-titre{font-family:ui-monospace,monospace;letter-spacing:.2em;color:var(--cy);font-size:14px;margin:30px 0 16px}
 @media(max-width:720px){body{font-size:18px}.p1{padding:40px 18px;font-size:18px}.p1-nom{font-size:32px}.p1-titre{font-size:28px}
-.p1-duo{grid-template-columns:1fr}.p1-v{font-size:44px}.p1-regle,.p1-echelle{display:none}.p1-r,.p1-av{font-size:25px}.p1-chapeau{font-size:20px}}
+.p1-duo{grid-template-columns:1fr}.p1-v{font-size:44px}.p1-r,.p1-av{font-size:25px}.p1-chapeau{font-size:20px}}
+"""
+
+
+CSS_V254 = """
+:root{--titre:#83dfed;--sous-titre:#c5a7ff;--miel:#ffcc79;--vert-vif:#94ff36;--alerte-rouge:#ff828b}
+a{color:var(--titre);text-underline-offset:.18em}
+h1,h2,h3,.c h3,.snow-box h3,.ep h2,.p1-titre{color:var(--titre)}
+h4{color:var(--sous-titre)}
+h4{margin:0 0 8px;font-size:18px;line-height:1.3}
+.histoire .activite{color:#7ce6db}.histoire .positionnement{color:var(--miel)}
+.alerte{--signal:var(--miel);margin:16px 0;padding:18px 22px;border:1px solid var(--signal);
+  border-left-width:5px;border-radius:12px;background:color-mix(in srgb,var(--signal) 8%,var(--carte));text-align:left}
+.alerte-rouge{--signal:var(--alerte-rouge)}.alerte-bleu{--signal:#9bc5ff}
+.alerte h3,.c .alerte h3,.alerte a{color:var(--signal);font-size:clamp(20px,2.3vw,26px);margin-bottom:7px}
+.alerte p,.alerte li{font-size:clamp(19px,2.15vw,23px);line-height:1.45;max-width:none;margin:0 0 6px}
+.alerte ul{display:block;padding-left:1.35em;margin:0}.alerte p:last-child,.alerte li:last-child{margin-bottom:0}
+.alerte .sub{margin-left:0}
+.registre .risque-fort td{background:#2b151a;font-size:18px}
+.registre .risque-fort td:first-child{color:var(--alerte-rouge);font-size:20px;font-weight:700}
+.registre .risque-fort .b{font-size:16px}.registre td:target,.registre tr:target td{outline:1px solid var(--alerte-rouge)}
+.ia-bpa{border-color:#466d5e;background:linear-gradient(145deg,#152728,var(--carte) 57%)}
+.ia-bpa h3{font-size:clamp(23px,3vw,32px);color:#a9f5d7}
+.ia-sens{font-size:18px}.ia-sens.l6{background:var(--vert-vif)}.ia-sens.l2{background:var(--alerte-rouge)}
+.ia-preuve{display:inline-block;color:var(--titre);border:1px solid var(--bord);border-radius:20px;padding:4px 12px;
+  font:600 13px/1.4 ui-monospace,monospace;vertical-align:middle}
+.ia-axe{position:relative;height:14px;border-radius:12px;margin:24px 10px 10px;
+  background:linear-gradient(90deg,#ff485a 0%,#ff9e55 26%,#ffe16a 50%,#6be092 76%,var(--vert-vif) 100%)}
+.ia-axe.ia-inconnu{background:repeating-linear-gradient(135deg,#2b3c43 0 7px,#3c5058 7px 14px)}
+.ia-curseur{position:absolute;top:50%;transform:translate(-50%,-50%);width:17px;height:29px;border-radius:5px;
+  background:#fff;border:2px solid #132022;box-shadow:0 0 0 1px #fff}
+.ia-extremes{display:flex;justify-content:space-between;gap:1rem;margin:0 10px 22px;color:var(--txt2);font-size:15px}
+.ia-impact{color:var(--titre);margin-bottom:4px}
+.ia-details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;text-align:left;margin:16px 0}
+.ia-details>div{border:1px solid var(--bord);border-radius:12px;padding:15px 18px;background:rgba(0,0,0,.16)}
+.ia-details p{margin:0;font-size:18px;line-height:1.5;overflow-wrap:anywhere}
+.forteresse-moat,.ethique,.forensique{margin:16px 0;padding:16px 18px;border:1px solid var(--bord);border-radius:12px}
+.forteresse-moat p,.ethique p,.forensique p{margin:9px auto 0}
+.concl{margin:22px 0;background:linear-gradient(155deg,#1d1b30,var(--carte) 65%);border-color:#74629b}
+.concl h3{font-size:clamp(25px,3vw,35px);color:var(--sous-titre)}
+.concl p.concl-these{font-size:clamp(20px,2.3vw,25px);line-height:1.5}
+@media(max-width:680px){.ia-details{grid-template-columns:1fr}
+  .ia-bpa,.concl{padding:20px}.ia-extremes{font-size:13px}.alerte{padding:14px}}
+"""
+
+
+CSS_V255 = """
+.dossier-entete{padding:24px 0 12px}.dossier-entete .sub{margin:6px auto}
+.dossier-cours{font:650 27px/1.25 ui-monospace,monospace;margin:10px auto;color:var(--titre)}
+.histoire-bloc{text-align:center}.histoire-bloc+.histoire-bloc{margin-top:20px;padding-top:18px;border-top:1px solid var(--bord)}
+.histoire-bloc h2{margin:0 auto 8px;font:650 17px/1.35 system-ui,sans-serif}
+.histoire-bloc p{max-width:58ch;margin:0 auto 6px}.histoire-bloc p:last-child{margin-bottom:0}
+.avenir-perspectives{margin-top:16px;padding-top:15px;border-top:1px solid var(--bord)}.avenir-perspectives p{margin:0 auto}
+.p1-regle{margin-inline:55px}
+@media(max-width:800px){
+  .p1-regle{height:auto;margin:22px 0 10px;display:grid;gap:8px}
+  .p1-axe,.p1-dot{display:none}
+  .p1-pt,.p1-lbl{position:static;width:auto;height:auto;transform:none}
+  .p1-lbl{display:grid;grid-template-columns:minmax(6ch,25%) 1fr;align-items:center;gap:10px;text-align:left}
+  .p1-t br{display:none}
+}
+.pilote{margin:28px auto}.concl-suivi{margin:18px auto 0}.concl-suivi p{margin:6px auto 0}
+.dossier-nav{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:27px auto 17px}
+.dossier-nav a{display:grid;place-items:center;padding:12px 8px;border:1px solid var(--bord);border-radius:12px;
+  background:var(--carte);text-decoration:none;font:650 15px/1.35 system-ui,sans-serif}
+.dossier-nav a:hover,.dossier-nav a:focus-visible{border-color:var(--sous-titre);background:#211a32;color:var(--sous-titre)}
+.dossier-section>h2{margin:20px 0;color:var(--sous-titre);font:650 clamp(22px,3vw,30px)/1.3 Georgia,serif}
+.dossier-detail{padding:12px;margin:12px auto}.dossier-detail>h4{color:var(--sous-titre);margin-bottom:12px}
+.alerte,.ia-details{ text-align:center }
+.alerte{border-width:1px;border-top-width:4px}
+.alerte p,.alerte .sub,.ia-details p{margin-left:auto;margin-right:auto}.alerte p{max-width:68ch}
+.alerte ul{padding:0;text-align:center}.alerte li{padding:0;margin-left:auto;margin-right:auto}
+.concl h3{margin-bottom:10px}
+.concl p.concl-voie{color:var(--titre);font:650 15px/1.4 system-ui,sans-serif;margin:0 auto 12px}
+.concl p.concl-verdict{margin:0 auto 12px}.concl .b.wrap{text-align:center}
+.concl p.concl-consigne{font-size:clamp(20px,3vw,25px);line-height:1.45;margin:0 auto}
+.concl-prix{color:var(--titre);white-space:nowrap}
+.concl p.concl-sortie{max-width:62ch;margin:16px auto 0;color:var(--txt2)}
+.concl p.concl-raison{max-width:60ch;margin:16px auto 0;padding-top:13px;border-top:1px solid var(--bord);line-height:1.5}
+@media(max-width:620px){.dossier-nav{grid-template-columns:1fr 1fr}}
+@media print{.dossier-nav{display:none}}
+"""
+
+
+CSS_V26 = """
+:root{--rail-vert:#4ede9a;--rail-jaune:#f2cf5b;--rail-orange:#f0994a;--rail-rouge:#f0605f;--rail-gris:#7e979d}
+body{background:#000;color:#f2f7f8;overflow-wrap:anywhere}
+.wrap{max-width:1100px}
+.rail-vert{--feu:var(--rail-vert)}.rail-jaune{--feu:var(--rail-jaune)}.rail-orange{--feu:var(--rail-orange)}
+.rail-rouge{--feu:var(--rail-rouge)}.rail-gris{--feu:var(--rail-gris)}
+.rail-activite,.rail-these-tests{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.rail-activite{margin:12px 0 26px}
+.rail-activite .histoire-bloc,.rail-activite .histoire-bloc+.histoire-bloc{margin:0;padding:18px;border:1px solid var(--bord);border-radius:14px;background:var(--carte)}
+.rail-activite .histoire-bloc p{font-size:18px}
+.rail-verdict h2{font:650 clamp(26px,4.2vw,38px)/1.2 Georgia,serif;margin:14px auto 20px;max-width:27ch}
+.rail-these{border:1px solid var(--cy);border-radius:18px;padding:22px 24px;background:rgba(57,214,224,.06)}
+.rail-these h2,.rail-arbitre h2,.rail-memo h2{font:650 24px/1.25 Georgia,serif;margin:0 auto 10px}
+.rail-these>p{font-size:clamp(19px,2.3vw,23px)}
+.rail-these-tests>div{border-top:1px solid var(--bord);padding-top:10px;font-size:16px}
+.rail-these-tests p{margin:4px auto 0}
+.rail-sommaire{margin:30px 0 20px}
+.rail-sommaire>p,.rail-kicker{color:var(--sous-titre);font:650 14px/1.4 ui-monospace,monospace;letter-spacing:.07em}
+.rail-sommaire nav{position:relative;display:flex;align-items:flex-start;justify-content:center;isolation:isolate;row-gap:16px}
+.rail-sommaire nav::before{content:"";position:absolute;inset:21px 7% auto;height:6px;border-radius:4px;background:var(--rail-degrade);z-index:-1}
+.rail-lien{flex:1 1 0;min-width:0;padding:0 4px;color:var(--feu);text-decoration:none;text-align:center}
+.rail-lien:hover,.rail-lien:focus-visible{text-decoration:underline;text-underline-offset:4px}
+.rail-rond,.rail-point{display:grid;place-items:center;background:var(--feu);color:#091214;border:5px solid var(--bg);border-radius:50%;font-size:20px}
+.rail-rond{width:48px;height:48px;margin:0 auto 6px}
+.rail-lien b{display:block;font:700 clamp(12px,1.55vw,17px)/1.35 ui-monospace,monospace}
+.rail-lien span:last-child{font-size:15px;color:var(--txt2)}
+.rail-arbitre,.rail-aiguillage{border:2px solid var(--rail-jaune);border-radius:16px;padding:18px 22px;margin:20px 0;background:rgba(242,207,91,.08)}
+.rail-arbitre h2{color:var(--rail-jaune)}.rail-arbitre p{margin:8px auto}
+.rail-arbitre-ok{border-color:var(--rail-vert);background:rgba(78,222,154,.07)}.rail-arbitre-ok h2{color:var(--rail-vert)}
+.rail-aiguillage{border:2px dashed var(--sous-titre);background:rgba(197,167,255,.07)}.rail-aiguillage h3{color:var(--sous-titre)}
+.rail-vertical{position:relative;margin:34px 0;padding-left:66px;text-align:left}
+.rail-vertical::before{content:"";position:absolute;left:24px;top:20px;bottom:40px;width:6px;border-radius:4px;background:var(--rail-degrade)}
+.rail-chap{position:relative;min-width:0;scroll-margin-top:20px}
+.rail-point{position:absolute;left:-60px;top:0;width:42px;height:42px}
+.rail-chap>h2{margin:3px 0;font:650 clamp(23px,3.3vw,32px)/1.2 Georgia,serif}
+.rail-reponse{font-size:clamp(19px,2.5vw,25px);color:var(--feu);margin:8px 0 14px;max-width:none;font-weight:650}
+.rail-reponse>b{display:inline-block;font:700 clamp(14px,1.8vw,18px) ui-monospace,monospace;margin-left:.35em}
+.rail-preuves{min-width:0;border:1px solid var(--bord);border-radius:16px;background:var(--carte);padding:18px 20px;text-align:center}
+.rail-preuves>.c:last-child{margin-bottom:0}
+.rail-donc{margin:14px 0 32px;max-width:none;font-style:italic}
+.rail-donc>b{color:var(--cy);font-style:normal}
+.rail-pastilles{display:flex;justify-content:center;flex-wrap:wrap;gap:8px;margin:12px 0}
+.rail-pill{color:var(--feu);border:1px solid currentColor;border-radius:8px;padding:5px 8px;font:650 13px/1.4 ui-monospace,monospace}
+.rail-barrette{position:relative;height:18px;margin:18px auto 10px;background:#182327;border-radius:8px}
+.rail-barrette .seg{top:0;height:100%}
+.rail-barrette-cours{position:absolute;height:28px;width:3px;top:-5px;background:#fff;outline:1px solid #000;transform:translateX(-50%)}
+.rail-seuils{display:flex;justify-content:center;flex-wrap:wrap;gap:4px 18px;margin:12px auto;padding:0;list-style:none}
+.rail-seuils li{padding:0}.rail-seuils li::before{content:none}
+.rail-decision{border:2px solid var(--feu);border-radius:22px;background:color-mix(in srgb,var(--feu) 7%,var(--carte));padding:24px;margin-top:12px;text-align:center}
+.rail-act{font-size:clamp(21px,2.8vw,30px);font-weight:650;margin:10px auto 14px}
+.rail-plan{padding:0;margin:0;list-style:none}.rail-plan li{margin:0 auto 14px;padding:0;max-width:55ch}
+.rail-plan li::before{content:none}.rail-plan li>span{display:grid;place-items:center;width:30px;height:30px;border-radius:50%;
+  background:var(--feu);color:#091214;margin:0 auto 6px;font:700 16px ui-monospace,monospace}
+.rail-plan p{margin:0 auto}
+.rail-raison,.rail-etat-these,.rail-suivi{border-top:1px solid var(--bord);padding-top:12px;margin:14px auto 0}
+.rail-suivi p{margin:6px auto 0}
+.rail-memo{border:1px dashed var(--bord);border-radius:16px;padding:16px;margin:30px auto;background:#090e10;color:var(--txt2)}
+.rail-memo>.grid{margin:12px 0 20px}
+.rail-memo h2{color:var(--txt2)}
+.grid>*{min-width:0}svg{max-width:100%}.b,.chiffre,.concl-prix{white-space:normal}
+.rail-preuves .rl{overflow:hidden}
+@media(max-width:940px){.rail-preuves .p1-regle{height:auto;margin:18px 0;display:grid;gap:8px}
+  .rail-preuves .p1-axe,.rail-preuves .p1-dot{display:none}
+  .rail-preuves .p1-pt,.rail-preuves .p1-lbl{position:static;width:auto;height:auto;transform:none}
+  .rail-preuves .p1-lbl{display:grid;grid-template-columns:minmax(6ch,25%) 1fr;align-items:center;gap:10px;text-align:left}
+  .rail-preuves .p1-t br{display:none}
+}
+@media(max-width:650px){
+  .wrap{padding:22px 12px 48px}.p0{font-size:11px}
+  .rail-activite,.rail-these-tests{grid-template-columns:1fr}
+  .rail-activite,.rail-these-tests{gap:8px}
+  .rail-sommaire nav{flex-wrap:wrap}.rail-sommaire nav::before{content:none}
+  .rail-lien{flex:0 0 33.333%;padding-inline:2px}.rail-lien span:last-child{font-size:13px}
+  .rail-vertical{padding-left:24px}.rail-vertical::before{left:5px;width:3px;top:11px}
+  .rail-point{left:-23px;top:1px;width:16px;height:16px;border-width:3px;font-size:0}
+  .rail-preuves,.rail-decision,.rail-memo,.rail-these,.rail-arbitre{padding:12px}
+  .rail-preuves .c,.rail-memo .c{padding:10px}.rail-kicker{font-size:12px}
+  table{table-layout:fixed;width:100%}td,th{padding:5px 3px;overflow-wrap:anywhere;white-space:normal!important}
+  .scroll{overflow-x:visible}.scroll table{min-width:0}
+  .big,.p1-v{font-size:clamp(23px,6vw,32px)}.p1-pf{padding:12px}
+  .xl{flex-wrap:wrap}.rail-seuils{font-size:15px}
+  .rl .tick,.rl .cur{font-size:10px;white-space:normal}
+}
 """
 
 
@@ -5788,7 +6257,8 @@ def main():
     R = calculer(D)
     calc_pourquoi(D, R)
     calc_avenir(D, R)
-    calc_profil(D, R)     # V23 (A)
+    calc_profil(D, R)
+    calc_ia_bpa(D, R)
     calc_valeur(D, R)     # V23 (B)
     calc_capital(D, R)    # avant le contrôle d’autofinancement
     calc_autofinancement(D, R)
@@ -5837,6 +6307,10 @@ def main():
     _sur(calc_action, D, R)
     _sur(calc_angles_morts, D, R)
     _sur(calc_recit, D, R)  # V25 : le recit de la page 1 (lecture seule)
+    for cle, titre in CHAMPS_THESE:
+        champ = G(D, 'acte0.these.' + cle)
+        if not isinstance(champ, str) or not champ.strip():
+            chk('Boussole · ' + titre, 'alerte', 'acte0.these.%s à écrire' % cle)
     nbm, nbp = compter_these(G(D, 'acte0.these.texte'))
     if nbm > 80 or not (3 <= nbp <= 4):
         warn('Th\u00e8se : %s mots / %s phrases \u2014 format 3 \u00e0 4 phrases, 80 mots au plus.' % (nbm, nbp))
