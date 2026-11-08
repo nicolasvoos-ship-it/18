@@ -18,9 +18,11 @@ import json, sys, os, re, math, html, copy, hashlib, datetime, statistics as stx
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V25.1.1"
+VERSION = "V25.3"
 VERSION_DATE = "08/11/2026"
 # Journal des versions archive dans NICO_Historique_Versions.md (hors Projet, sur le PC de Nico).
+# V25.3 : débouchés accessibles et capacité de conquête ; contrôle d’autofinancement conservé.
+# V25.2 : lecture des derniers résultats dans le pilote et provenance à l'épisode 6.
 # V25.1.1 : ordres conditionnes aux donnees fiables, registre obligatoire pour engager en B, plan B conserve jusqu'au changement de voie.
 # V25.1 : audit ChatGPT -- une seule consigne (action -> page 1 -> TRI), RENFORCER TACTIQUEMENT (VOIE B), zone d'entree et garde-fous de la Voie B,
 #         lignes tactiques du registre (4 places, sorties), pile/face au prix d'entree, VE negative recoupee par action, registre valide.
@@ -710,9 +712,9 @@ CHAMPS_NUM_VV = ['meta.cours', 'meta.capitalisation_meur', 'valo.base_normalisee
                  # V23
                  'risques.forensique.sloan', 'profil.etat_pct',
                  'creation_valeur.spread', 'creation_valeur.spread_5a', 'creation_valeur.spread_pire_10a',
-                 'creation_valeur.eva_marge', 'creation_valeur.eva_momentum',
-                 'triangle.reinvestissement', 'triangle.rendement_marginal', 'triangle.roe',
-                 'triangle.variation_actions', 'triangle.croissance_comparable']  # lus via vv() : seule la valeur interne est controlee
+                 'creation_valeur.eva_marge', 'creation_valeur.eva_momentum']
+CHAMPS_NUM_VV += [f'{bloc}.{champ}' for bloc in ('autofinancement', 'triangle') for champ in (
+    'reinvestissement', 'rendement_marginal', 'roe', 'variation_actions', 'croissance_comparable')]
 CHAMPS_TXT = ['meta.fiabilite', 'valo.clause', 'taux_exige.motif']
 
 
@@ -1559,6 +1561,91 @@ def bdg(t, l, extra=''):
 def prov(p):
     return '<sup class="pv">%s</sup>' % esc(p) if p else ''
 
+
+def publication_resultats_html(D):
+    """Une saisie pour la synthèse du pilote et le détail sourcé de l'épisode 6."""
+    pub = G(D, 'resultats.publication')
+    if not isinstance(pub, dict) or not pub:
+        return '', ''
+    date = _date(pub.get('date'))
+    date_eval = _date(G(D, 'meta.date_eval'))
+    periode, source = pub.get('periode'), pub.get('source')
+    if not (date and all(isinstance(s, str) and s.strip() for s in (periode, source))):
+        return '', '<p class="sub">Publication à compléter · date, période et source officielle requises.</p>'
+    if date_eval and date > date_eval:
+        return '', '<p class="sub">Publication postérieure à la date du dossier · écartée de la synthèse.</p>'
+
+    def lignes(cle, limite):
+        brut = pub.get(cle)
+        return (row for row in brut[:limite] if isinstance(row, list)) if isinstance(brut, list) else ()
+
+    def chiffre(x):
+        if not num(x):
+            return 'n.d.'
+        return fr(x, 4 if 0 < abs(x) < 0.1 else 2).rstrip('0').rstrip(',')
+
+    def ecart(publie, base, unite):
+        if not num(base):
+            return 'n.d.'
+        if unite == '%':
+            return fr(publie - base, 1, True) + ' pt'
+        if base <= 0:
+            return fr(publie - base, 2, True) + ' ' + unite
+        return fr((publie / base - 1) * 100, 1, True) + ' %'
+
+    points, rows = [], []
+    for row in lignes('chiffres', 3):
+        if len(row) < 4:
+            continue
+        nom, unite, avant, publie, attendu, src, date_attendue = (row + [None] * 7)[:7]
+        if not (isinstance(nom, str) and nom.strip() and isinstance(unite, str) and unite.strip() and num(publie)):
+            continue
+        date_cons = _date(date_attendue)
+        if not (num(attendu) and isinstance(src, str) and src.strip() and date_cons and date_cons < date):
+            attendu = None
+        var_an, surprise = ecart(publie, avant, unite), ecart(publie, attendu, unite)
+        points.append('<li><b>%s</b> · %s %s publié · %s · %s</li>' % (
+            esc(nom), chiffre(publie), esc(unite),
+            esc('%s sur un an' % var_an) if num(avant) else 'période comparable n.d.',
+            esc('%s attendu (%s)' % (chiffre(attendu), surprise)) if num(attendu) else 'consensus antérieur n.d.'))
+        preuve = '%s · %s' % (src, date_cons.strftime('%d/%m/%Y')) if num(attendu) else 'n.d.'
+        rows.append('<tr>' + ''.join('<td>%s</td>' % esc(x) for x in (
+            '%s (%s)' % (nom, unite), chiffre(avant), chiffre(attendu), chiffre(publie), var_an, surprise, preuve)) + '</tr>')
+
+    guidance = pub.get('guidance')
+    direction = ''
+    if isinstance(guidance, list) and guidance:
+        etat, horizon, ancien, nouveau = (guidance + [''] * 4)[:4]
+        if etat in ('RELEVÉE', 'ABAISSÉE', 'MAINTENUE', 'INITIÉE', 'RETIRÉE', 'NON CHIFFRÉE', 'SANS GUIDANCE', 'N.D.'):
+            chemin = ' → '.join(x for x in (ancien, nouveau) if isinstance(x, str) and x.strip())
+            direction = '<p><b>Guidance</b> · %s</p>' % esc(' · '.join(
+                x for x in (etat, horizon, chemin) if isinstance(x, str) and x.strip()))
+
+    annonces = []
+    for row in lignes('annonces', 2):
+        if row and isinstance(row[0], str) and row[0].strip():
+            annonces.append('<li>%s</li>' % esc(' · '.join(x for x in row[:4] if isinstance(x, str) and x.strip())))
+    suites = '<p><b>Ce qui change pour la suite</b></p><ul>%s</ul>' % ''.join(annonces) if annonces else ''
+    these = pub.get('these')
+    impact = ''
+    niveaux = {'RENFORCÉE': 5, 'INCHANGÉE': 'gris', 'FRAGILISÉE': 2}
+    if isinstance(these, list) and len(these) == 2 and all(isinstance(s, str) for s in these) and these[0] in niveaux:
+        impact = '<p><b>Lecture de la thèse</b> · %s%s</p>' % (
+            bdg(these[0], niveaux[these[0]]), ' · ' + esc(these[1]) if these[1].strip() else '')
+
+    if not (points or direction or suites or impact):
+        return '', ''
+    titre = '<p class="sub">%s · publié le %s</p>' % (esc(periode), date.strftime('%d/%m/%Y'))
+    synthese = ('<div class="c"><h3>Que disent les derniers résultats ?</h3>%s%s%s%s%s'
+                '<p class="sub"><a href="#publication-resultats">Chiffres et sources · épisode 6</a></p></div>') % (
+        titre, '<ul>%s</ul>' % ''.join(points) if points else '', direction, suites, impact)
+    table = ('<div class="scroll"><table><tr><th>Indicateur</th><th>Comparable</th><th>Attendu</th>'
+             '<th>Publié</th><th>Écart annuel</th><th>Surprise</th><th>Consensus antérieur</th></tr>%s'
+             '</table></div>') % ''.join(rows) if rows else ''
+    detail = '<div id="publication-resultats">%s%s<p class="sub">Source officielle · %s</p></div>' % (titre, table, esc(source))
+    return synthese, detail
+
+
 CSS = """
 :root{--l6:#4ede9a;--l5:#4ede9a;--l4:#f2cf5b;--l3:#f0994a;--l2:#f0605f;--l1:#e0403f;--gris:#7e979d;
 --bg:#000;--carte:#0c1113;--bord:#2b3d42;--bord2:#1d2a2e;--txt:#e8f2f4;--txt2:#a9c0c5;--cy:#39d6e0;--cy2:#0f8f99;
@@ -1854,6 +1941,7 @@ def rendu(D, R):
     meta = D.get('meta') or {}
     valo = D.get('valo') or {}
     cours = vv(meta.get('cours')); dev = meta.get('devise', '')
+    resultats_pilote, resultats_detail = _sur(publication_resultats_html, D, defaut=('', ''))
     BK = {}
     _cur = ['tete']
 
@@ -1910,6 +1998,7 @@ def rendu(D, R):
           esc(v.get('phrase')), esc(v.get('cause')),
           ' \u00b7 ' + esc(v.get('cause2')) if v.get('cause2') else ''))
     A(flags_html(R))  # V23 : red flags ethique / Etat / forensique, sans blocage
+    A(resultats_pilote)
     if not (R.get('recit') or {}).get('chapeau'):
         A(fait_cle_html(R))  # V24 : le fait qui explique le prix (repris par la page 1 sinon)
     A(_sur(pilote_html, D, R))  # V23.7 : les trois reponses + capital preserve + phrase en clair
@@ -2011,9 +2100,9 @@ def rendu(D, R):
     A('<div class="c"><h3>Derniers r\u00e9sultats et guidance</h3><div>%s</div>'
       '<div class="scroll"><table><tr><th class="n">CA vs N\u22121</th><th class="n">CA vs attentes</th>'
       '<th class="n">BPA vs N\u22121</th><th class="n">BPA vs attentes</th></tr><tr>%s</tr></table></div>'
-      '<p>%s</p><div class="sub">Confirmations : %s</div></div>' % (
+      '%s<p>%s</p><div class="sub">Confirmations : %s</div></div>' % (
           bdg(res.get('verdict', 'IND\u00c9TERMIN\u00c9'), L_LAB('resultats', res.get('verdict'))), cells,
-          esc(res.get('guidance') or res.get('commentaire')), esc(' \u00b7 '.join((' \u2014 '.join(str(y) for y in c if y) if isinstance(c, list) else str(c))
+          resultats_detail, esc(res.get('guidance') or res.get('commentaire')), esc(' \u00b7 '.join((' \u2014 '.join(str(y) for y in c if y) if isinstance(c, list) else str(c))
                                 for c in (res.get('confirmations') or []) if c))))
     rows = ''.join('<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % (
         esc(r.get('fait')), esc(r.get('mecanisme')), esc(r.get('gravite')), esc(r.get('indicateur')), esc(r.get('hypothese')))
@@ -2082,7 +2171,6 @@ def rendu(D, R):
 
     # ---------------- bloc 3
     S_('prix_tri')
-    A(triangle_html(R))  # V23 : triangle 15/15/15
     tol = R.get('tolerance')
     A('<div class="grid g3">%s%s%s</div>' % (
         carte('Multiple de sortie exig\u00e9 par le cours', ('%s\u00d7' % fr(R.get('mult_exige'), 1)) if num(R.get('mult_exige')) else 'n.d.',
@@ -2227,7 +2315,7 @@ def rendu(D, R):
              episode('ÉPISODE 1', 'L’histoire', 'Ce qu’elle fait, le problème qu’elle résout, ce qu’elle apporte au monde, et pourquoi elle pourrait gagner.'),
              T_('ep1'), _sur(monde_html, R),
              episode('ÉPISODE 2', 'La croissance : de combien les bénéfices grandissent', acc2),
-             _sur(croissance_html, D, R, meta_.get('devise', '')),
+             _sur(marche_html, D, R), _sur(croissance_html, D, R, meta_.get('devise', '')),
              ('<details class="c"><summary>📋 Le tableau des chiffres : CA, marge, BPA, FCF par action</summary>%s</details>' % T_('traj')) if BK.get('traj') else '',
              T_('vent'),
              episode('ÉPISODE 3', 'La forteresse : combien de temps ça tient', acc3),
@@ -2242,7 +2330,7 @@ def rendu(D, R):
     return ''.join(pages)
 
 
-# ------------------------------------------------------------------ V23 : fiche de tri, creation de valeur, triangle
+# ------------------------------------------------------------------ Fiche de tri, création de valeur et autofinancement
 # Trois blocs de LECTURE. Aucun point dans Q, aucun veto, aucun effet sur le taux exige, le prix ou la taille (R3).
 L_SPREAD2 = lambda x: cut(x, [0, 2, 4, 8], [2, 3, 4, 5, 6])      # economic spread, pts
 L_EVAM = lambda x: cut(x, [0, 5, 10], [2, 3, 4, 5])               # marge EVA, % du CA
@@ -2452,6 +2540,15 @@ def calc_valeur(D, R):
     chk('Création de valeur (V23)', 'validé' if lvl != 'gris' else 'n.d.', synth)
 
 
+def entrees_autofinancement(D):
+    """Les anciens dossiers conservent leurs hypothèses au rechargement."""
+    champs = D.get('autofinancement')
+    if isinstance(champs, dict):
+        return champs
+    ancien = D.get('triangle')
+    return ancien if isinstance(ancien, dict) else {}
+
+
 def _equiv_nopat(tr):
     """V23.4 : equivalence resultat net / NOPAT documentee = ["OUI", motif] (dette et frais financiers stables...)."""
     e = tr.get('equivalence_nopat')
@@ -2459,7 +2556,7 @@ def _equiv_nopat(tr):
     return motif if (lab.upper().startswith('OUI') and motif) else ''
 
 
-METHODES_TRI = {'OPERATIONNELLE': 'OPÉRATIONNELLE', 'OPÉRATIONNELLE': 'OPÉRATIONNELLE',
+METHODES_FINANCEMENT = {'OPERATIONNELLE': 'OPÉRATIONNELLE', 'OPÉRATIONNELLE': 'OPÉRATIONNELLE',
                 'FONDS PROPRES': 'FONDS PROPRES'}
 
 
@@ -2571,8 +2668,9 @@ def calc_capital(D, R):
             chk('Glacière et Modèle 2', 'alerte', 'Modèle 2 = 1 avec glacière COPIABLE')
             warn('Incohérence : Modèle 2 = 1 avec glacière COPIABLE.')
 
-    reinv = vv(G(D, 'triangle.reinvestissement'))
-    rendement = vv(G(D, 'triangle.rendement_marginal'))
+    af = entrees_autofinancement(D)
+    reinv = vv(af.get('reinvestissement'))
+    rendement = vv(af.get('rendement_marginal'))
     if not num(rendement) and origine != 'RACHATS' and rb.get('metrique') in ('ROIC', 'ROCE après impôt'):
         rendement = mediane
     distribution = _chiffre_capital(c, 'distribution_pct', 0)
@@ -2592,57 +2690,17 @@ def calc_capital(D, R):
     }
 
 
-def calc_triangle(D, R):
-    """(C) Triangle 15/15/15, lu comme un EQUILIBRE : un actif capable de grandir en s'autofinancant, a prix raisonnable.
-      - Croissance : croissance du BPA par action + rendement du dividende >= 15 %/an (repere brut).
-      - Prix : PEGY = PER total / (croissance + dividende) <= 1.
-      - Qualite : rentabilite >= 15 % ET croissance theoriquement compatible avec le reinvestissement.
-    V23.2 : deux methodes jamais melangees -- OPERATIONNELLE (rendement des nouveaux investissements x reinvestissement
-    net / NOPAT -> croissance du NOPAT) ou FONDS PROPRES (ROE x taux de retention -> croissance du resultat net).
-    Le rendement marginal documente est prefere a la mediane historique. Lecture seulement."""
-    tr = D.get('triangle') if isinstance(D.get('triangle'), dict) else {}
+def calc_autofinancement(D, R):
+    """Compare la croissance prévue à la croissance théorique sur un périmètre identique."""
+    tr = entrees_autofinancement(D)
     capital = R.get('capital') or {}
     leger = capital.get('intensite') in CAPITAL_LEGER
     rb = R.get('rentab') or {}
     med = rb.get('med') if num(rb.get('med')) else rb.get('last')
     g = R.get('gc')
-    meta = D.get('meta') or {}
-    valo = D.get('valo') or {}
-    cours = vv(meta.get('cours'))
-    # --- PER total (V23.2) : cours / BPA normalise si la tresorerie est separee, sinon multiple actuel
-    base = vv(valo.get('base_normalisee'))
-    tn = vv(valo.get('tresorerie_nette_action'))
-    est_fcf = 'FCF' in str(valo.get('metrique') or '').upper()
-    per_lab = 'P/FCF' if est_fcf else 'PER'
-    if num(tn):
-        if num(cours) and cours > 0 and num(base) and base > 0:
-            per, per_src = cours / base, '%s total (cours / base normalisée, trésorerie incluse)' % per_lab
-            if tn >= cours:  # V24 : valeur d'entreprise negative
-                per_src += (' — attention : la trésorerie nette par action (%s) dépasse le cours, le business seul coûte moins que zéro ; '
-                            'ce %s bas mesure surtout le doute sur l\u2019accès au cash' % (fprix(tn), per_lab))
-        else:
-            per, per_src = None, '%s total non calculable (trésorerie séparée, base normalisée absente ou non positive)' % per_lab
-            warn('Triangle : %s total non calculable \u2014 le multiple hors trésorerie n\u2019est pas repris.' % per_lab)
-    else:
-        per, per_src = vv(valo.get('multiple_actuel')), '%s actuel du dossier' % per_lab
-    # --- dividende
-    dps = G(D, 'valo.scenarios.central.dps') or []
-    d1 = dps[0] if (isinstance(dps, list) and dps and num(dps[0])) else None
-    d_src = 'dividende central de l\u2019an 1 / cours (repère prospectif : vérifier qu\u2019il est ordinaire et représentatif)'
-    d_ord = vv(valo.get('dividende_ordinaire'))
-    if num(d_ord):  # V24 : dividende ordinaire declare par l'analyste
-        d1, d_src = d_ord, 'dividende ordinaire déclaré (valo.dividende_ordinaire) / cours'
-    elif num(d1) and isinstance(dps, list) and len(dps) > 1 and num(dps[1]) and d1 < 0.5 * dps[1]:
-        # V24 : an 1 partiel (dividende deja detache exclu des flux d'un nouvel achat) -> l'an 2 represente mieux le rendement
-        d1, d_src = dps[1], ('an 1 partiel (%s : acompte déjà détaché exclu des flux) : dividende central de l\u2019an 2 / cours, plus représentatif'
-                             % fr(dps[0], 2))
-    rdt = 100.0 * d1 / cours if (num(d1) and num(cours) and cours > 0) else None
-    rdt_src = d_src if num(rdt) else 'aucun dividende renseigné : PEGY = PEG'
-    moteur = (g + (rdt or 0.0)) if num(g) else None
-    pegy = per / moteur if (num(per) and per > 0 and num(moteur) and moteur > 0) else None
     # --- methode de croissance theorique
     meth_brute = _sans_accent(vv(tr.get('methode')) or '').upper()
-    methode = METHODES_TRI.get(meth_brute) or ('OPÉRATIONNELLE' if 'OPERA' in meth_brute else
+    methode = METHODES_FINANCEMENT.get(meth_brute) or ('OPÉRATIONNELLE' if 'OPERA' in meth_brute else
                                                'FONDS PROPRES' if 'FONDS' in meth_brute else None)
     roic_non_pertinent = capital.get('origine') == 'RACHATS'
     reinv = vv(tr.get('reinvestissement'))
@@ -2653,10 +2711,10 @@ def calc_triangle(D, R):
         taux, taux_src = (roe, 'ROE attendu') if num(roe) else (
             (med, 'ROE médian du dossier') if metr == 'ROE' else (None, ''))
         if not num(taux) and not leger:
-            warn('Triangle, méthode FONDS PROPRES : renseigner triangle.roe (ROE attendu) \u2014 un %s n\u2019en tient pas lieu.' % metr)
+            warn('Autofinancement, méthode FONDS PROPRES : renseigner autofinancement.roe (ROE attendu) \u2014 un %s n\u2019en tient pas lieu.' % metr)
     else:
         if methode is None and num(reinv) and not leger:
-            warn('Triangle : méthode non déclarée (triangle.methode) \u2014 lue comme OPÉRATIONNELLE (rendement × réinvestissement net / NOPAT).')
+            warn('Autofinancement : méthode non déclarée (autofinancement.methode) \u2014 lue comme OPÉRATIONNELLE (rendement × réinvestissement net / NOPAT).')
         methode = methode or 'OPÉRATIONNELLE'
         if num(marg):
             taux, taux_src = marg, 'rendement marginal documenté'
@@ -2665,8 +2723,8 @@ def calc_triangle(D, R):
         else:
             taux, taux_src = None, ''
             if num(med) and metr not in ('ROIC', 'ROCE après impôt') and not leger:
-                warn('Triangle, méthode OPÉRATIONNELLE : la rentabilité du dossier est un %s, jamais utilisé comme rendement '
-                     'opérationnel \u2014 renseigner triangle.rendement_marginal ou passer en méthode FONDS PROPRES.' % metr)
+                warn('Autofinancement, méthode OPÉRATIONNELLE : la rentabilité du dossier est un %s, jamais utilisé comme rendement '
+                     'opérationnel \u2014 renseigner autofinancement.rendement_marginal ou passer en méthode FONDS PROPRES.' % metr)
     # croissance de meme nature que la croissance theorique (NOPAT ou resultat net), jamais le BPA brut
     gc_decl = vv(tr.get('croissance_comparable'))
     var_act = vv(tr.get('variation_actions'))
@@ -2675,7 +2733,7 @@ def calc_triangle(D, R):
         gcomp, gcomp_src = gc_decl, 'croissance centrale %s déclarée' % nature
     elif num(g) and num(var_act) and methode == 'OPÉRATIONNELLE' and not _equiv_nopat(tr):
         gcomp, gcomp_src = None, ('pont par les actions = croissance du résultat net, pas du NOPAT : documenter '
-                                  'triangle.equivalence_nopat ou renseigner triangle.croissance_comparable (NOPAT)')
+                                  'autofinancement.equivalence_nopat ou renseigner autofinancement.croissance_comparable (NOPAT)')
     elif num(g) and num(var_act):
         gcomp = ((1 + g / 100.0) * (1 + var_act / 100.0) - 1) * 100.0
         gcomp_src = ('croissance du résultat net déduite du BPA (%s %%/an) et du nombre d\u2019actions (%s %%/an)%s'
@@ -2684,7 +2742,7 @@ def calc_triangle(D, R):
     else:
         gcomp, gcomp_src = None, ''
     gmax = None
-    chk_lib = 'Croissance compatible avec le réinvestissement (triangle, V23)'
+    chk_lib = 'Croissance compatible avec le réinvestissement'
     if leger:
         af, aflvl = 'NON CONTRAINT PAR LE CAPITAL', 4
         chk(chk_lib, 'n.a.', 'ratio rendement × réinvestissement écarté : examiner les contraintes opérationnelles et le pont du §7')
@@ -2693,7 +2751,7 @@ def calc_triangle(D, R):
         chk(chk_lib, 'n.a.', 'dénominateur non pertinent après rachats : reconstituer le capital opérationnel')
     elif not num(reinv) or not num(taux):
         af, aflvl = 'NON MESURÉE', 'gris'
-        chk(chk_lib, 'n.d.', 'renseigner triangle.methode, triangle.reinvestissement et le rendement adapté à la méthode')
+        chk(chk_lib, 'n.d.', 'renseigner autofinancement.methode, autofinancement.reinvestissement et le rendement adapté à la méthode')
     elif taux <= 0 or reinv < 0:
         af, aflvl = 'NON APPLICABLE \u2014 PONT REQUIS', 'gris'
         chk(chk_lib, 'n.a.', 'rentabilité ou réinvestissement non positif : seul le pont de financement du §7 tranche')
@@ -2701,8 +2759,8 @@ def calc_triangle(D, R):
         gmax = taux * reinv / 100.0
         if not num(gcomp):
             af, aflvl = 'COMPARAISON NON DOCUMENTÉE', 'gris'
-            chk(chk_lib, 'n.d.', 'croissance théorique %s %%/an %s, sans pont vers le BPA : renseigner triangle.croissance_comparable '
-                'ou triangle.variation_actions' % (fr(gmax, 1), nature))
+            chk(chk_lib, 'n.d.', 'croissance théorique %s %%/an %s, sans pont vers le BPA : renseigner autofinancement.croissance_comparable '
+                'ou autofinancement.variation_actions' % (fr(gmax, 1), nature))
         elif gcomp <= gmax + 1e-6:  # tolerance d'arrondi machine
             af, aflvl = 'COMPATIBLE', 5
         elif gcomp <= gmax + 2 + 1e-6:
@@ -2719,76 +2777,18 @@ def calc_triangle(D, R):
         if reinv > 100:
             warn('Réinvestissement %s %% : au-delà de 100 %%, la croissance suppose trésorerie accumulée ou financement externe \u2014 '
                  'à montrer dans le pont du §7.' % fr(reinv, 0))
-    # --- sommets
-    if num(med):
-        lq = cut(med, [10, 15], [2, 4, 5])
-    else:
-        lq = 'gris'
-    q_raison = None
-    if leger:
-        qualite_prouvee = (_note_ctrl(D, 'visibilite', 1) == 1 and _note_ctrl(D, 'cash', 0) == 1
-                          and capital.get('protection_documentee'))
-        lq = 5 if qualite_prouvee else 4
-        aflvl = lq
-        if not qualite_prouvee:
-            q_raison = 'marges stables, conversion en cash et protection documentée doivent être réunies'
-    elif roic_non_pertinent:
-        lq, q_raison = 'gris', 'rentabilité du dossier non interprétable sur le dénominateur réduit par les rachats'
-    elif lq == 5 and af in ('NON MESURÉE', 'COMPARAISON NON DOCUMENTÉE'):
-        lq, q_raison = 4, 'rentabilité au rendez-vous, mais compatibilité de la croissance avec le réinvestissement non mesurée'
-    elif lq == 5 and af.startswith('NON APPLICABLE'):
-        lq, q_raison = 4, 'rentabilité au rendez-vous, mais modèle de croissance non applicable : le pont de financement tranche'
-    elif lq in (4, 5) and af == 'À FINANCER':
-        lq, q_raison = 3, 'la rentabilité ne suffit pas à financer la croissance visée : dette, dilution ou hausse de marge devront prendre le relais'
-    elif lq != 'gris' and lq != 5:
-        q_raison = 'rentabilité sous le repère de 15 %%%s' % (
-            ' ; financement théorique compatible avec la croissance' if af.startswith('COMPATIBLE') else '')
-    lg = cut(moteur, [5, 10, 15], [2, 3, 4, 5])
-    g_raison = None
-    if lg != 'gris' and lg != 5:
-        g_raison = 'croissance + dividende sous 15 %/an (repère brut)'
-    if num(g) and g < 0 and num(rdt) and rdt > 0:
-        g_raison = (g_raison + ' \u2014 ' if g_raison else '') + 'rendement porté par la distribution, BPA en recul'
-    if num(per) and per > 0 and num(moteur) and moteur <= 0:
-        lp, p_raison = 2, 'PEGY non applicable : croissance + dividende non positifs'
-    else:
-        lp = cut(pegy, [1.0 + 1e-9, 1.5, 2.0], [5, 4, 3, 2]) if num(pegy) else 'gris'
-        p_raison = ('le %s dépasse croissance + dividende (PEGY %s) : la croissance se paie trop cher' % (per_lab, fr(pegy, 2))
-                    if lp not in ('gris', 5) else None)
-    verts = sum(1 for l in (lq, lg, lp) if l == 5)
-    connus = sum(1 for l in (lq, lg, lp) if l != 'gris')
-    raisons = [r for r in (q_raison, g_raison, p_raison) if r]
-    manque = [n for n, l in (('qualité', lq), ('croissance', lg), ('prix', lp)) if l != 5 and l != 'gris']
-    if connus < 3:
-        synth, lvl = 'TRIANGLE INCOMPLET', 'gris'
-        txt = 'Donnée manquante pour un sommet (rentabilité, croissance centrale ou %s).' % per_lab
-    elif verts == 3:
-        synth, lvl = 'LE TRIANGLE TIENT', 5
-        qualite_txt = ('marges stables, conversion en cash et protection documentée' if leger else
-                       'rentabilité au rendez-vous, croissance théoriquement compatible avec le réinvestissement')
-        txt = 'Équilibre trouvé : %s, croissance + dividende ≥ 15 %% et %s qui ne dépasse pas ce moteur.' % (qualite_txt, per_lab)
-    elif verts == 2:
-        synth, lvl = 'TRIANGLE BANCAL \u2014 %s' % manque[0].upper(), 4
-        txt = (raisons[0][0].upper() + raisons[0][1:] + '.') if raisons else ''
-    else:
-        synth, lvl = 'HORS TRIANGLE', 3 if verts == 1 else 2
-        txt = 'L\u2019équilibre n\u2019y est pas : ' + ' ; '.join(raisons) + '.'
-    R['triangle'] = {'roic': med, 'metrique': rb.get('metrique', 'ROIC'), 'g': g, 'rdt': rdt, 'rdt_src': rdt_src,
-                     'moteur': moteur, 'per': per, 'per_lab': per_lab, 'per_src': per_src, 'pegy': pegy,
-                     'lq': lq, 'lg': lg, 'lp': lp, 'verts': verts, 'connus': connus, 'synth': synth, 'lvl': lvl,
-                     'txt': txt, 'reinv': reinv, 'taux': taux, 'taux_src': taux_src, 'methode': methode,
-                     'gmax': gmax, 'af': af, 'aflvl': aflvl, 'gcomp': gcomp, 'gcomp_src': gcomp_src, 'nature': nature,
-                     'reinv_src': V(tr.get('reinvestissement'))['src'] or V(tr.get('reinvestissement'))['note'] or '',
-                     'mult_cst': R.get('tri_mult_constant')}
-    if roic_non_pertinent:
-        R['triangle']['roic_non_pertinent'] = True
+    R['autofinancement'] = {
+        'af': af, 'aflvl': aflvl, 'methode': methode, 'nature': nature, 'gmax': gmax,
+        'gcomp': gcomp, 'gcomp_src': gcomp_src, 'taux': taux, 'taux_src': taux_src, 'reinv': reinv,
+        'reinv_src': V(tr.get('reinvestissement'))['src'] or V(tr.get('reinvestissement'))['note'] or '',
+    }
 
 
 def calc_boule_neige(D, R):
     """V23.6 : preuve de croissance, lecture seule ; jamais un ROIC historique comme preuve future."""
     b = D.get('boule_neige')
     b = b if isinstance(b, dict) else {}
-    c, t = R.get('capital') or {}, R.get('triangle') or {}
+    c, t = R.get('capital') or {}, R.get('autofinancement') or {}
     def preuve(cle, labels):
         x = b.get(cle)
         if not isinstance(x, list) or len(x) != 2 or not all(isinstance(v, str) for v in x):
@@ -2806,7 +2806,7 @@ def calc_boule_neige(D, R):
     h = V(b.get('horizon_ans'))
     horizon_doc = (horizon is not None and h['prov'] in ('P', 'C', 'E')
                    and isinstance(h['src'], str) and bool(re.search(DATE_PREUVE, h['src'])))
-    tr = D.get('triangle') if isinstance(D.get('triangle'), dict) else {}
+    tr = entrees_autofinancement(D)
     financier = est_financier(D)
     cle = 'roe' if financier and t.get('methode') == 'FONDS PROPRES' else 'rendement_marginal'
     marginal = _chiffre_capital(tr, cle)
@@ -2957,79 +2957,32 @@ def valeur_html(R):
         esc(Vb.get('source') or 'non nommée'))
 
 
-def triangle_svg(T):
-    W, H = 360, 300
-    top, bl, br = (180, 62), (62, 236), (298, 236)
-    def pct(x):
-        return ('%s %%' % fr(x, 1)) if num(x) else 'n.d.'
-    o = ['<svg viewBox="0 0 %d %d" width="100%%" style="max-width:440px;display:block;margin:0 auto" role="img" '
-         'aria-label="Triangle 15/15/15">' % (W, H)]
-    o.append('<polygon points="%d,%d %d,%d %d,%d" fill="rgba(57,214,224,.10)" stroke="var(--cy2)" stroke-width="2"/>'
-             % (top + bl + br))
-    mono = 'font-family="ui-monospace,Menlo,monospace"'
-    o.append('<text x="180" y="168" text-anchor="middle" fill="var(--cy)" font-size="34" font-weight="600" %s>%s/3</text>'
-             % (mono, T.get('verts', 0) if T.get('connus') == 3 else '?'))
-    o.append('<text x="180" y="190" text-anchor="middle" fill="var(--txt2)" font-size="12" %s>règle 15/15/15</text>' % mono)
-    for (x, y), l in ((top, T['lg']), (bl, T['lq']), (br, T['lp'])):
-        o.append('<circle cx="%d" cy="%d" r="12" fill="%s" stroke="#000" stroke-width="2"/>' % (x, y, _col(l)))
-    o.append('<text x="180" y="22" text-anchor="middle" fill="var(--txt)" font-size="15" font-weight="600" %s>Croissance</text>' % mono)
-    o.append('<text x="180" y="40" text-anchor="middle" fill="var(--txt2)" font-size="13" %s>BPA %s + div. %s = %s · ≥ 15</text>'
-             % (mono, pct(T.get('g')), pct(T.get('rdt') or 0), pct(T.get('moteur'))))
-    o.append('<text x="8" y="268" fill="var(--txt)" font-size="15" font-weight="600" %s>Qualité</text>' % mono)
-    qualite = '%s %s ≥ 15' % (esc(T.get('metrique')), pct(T.get('roic')))
-    if T['af'] == 'NON CONTRAINT PAR LE CAPITAL':
-        qualite = 'Marges · cash · moat'
-    elif T.get('roic_non_pertinent'):
-        qualite = 'ROIC non pertinent'
-    o.append('<text x="8" y="286" fill="var(--txt2)" font-size="13" %s>%s</text>' % (mono, qualite))
-    o.append('<text x="352" y="268" text-anchor="end" fill="var(--txt)" font-size="15" font-weight="600" %s>Prix</text>' % mono)
-    o.append('<text x="352" y="286" text-anchor="end" fill="var(--txt2)" font-size="13" %s>%s %s ≤ %s</text>'
-             % (mono, esc(T.get('per_lab', 'PER')), fr(T.get('per'), 1), fr(T.get('moteur'), 1)))
-    o.append('</svg>')
-    return ''.join(o)
-
-
-def triangle_html(R):
-    T = R.get('triangle')
-    if not T:
-        return ''
-    verbe = 'réinvestis (net / NOPAT)' if T.get('methode') == 'OPÉRATIONNELLE' else 'retenus (1 \u2212 distribution)'
-    leger = T['af'] == 'NON CONTRAINT PAR LE CAPITAL'
-    qualite = ('marges stables (Visibilité 2 = 1), conversion en cash (Cash 1 = 1) et glacière PROTÉGÉ avec preuve datée'
-               if leger else 'rentabilité ≥ 15 % et croissance compatible avec le réinvestissement')
-    if T.get('roic_non_pertinent'):
-        qualite = 'capital opérationnel à reconstituer après les rachats'
-    if leger:
-        af = 'La croissance dépend des contraintes opérationnelles. Le pont de financement du §7 reste à documenter.'
-    elif num(T.get('gmax')):
-        af = ('Méthode %s : %s %s %% × %s %% %s = <b>%s %%/an</b> de croissance %s théoriquement compatible, contre <b>%s</b> '
-              '(%s). Hypothèse de rentabilité constante ; l\u2019autofinancement n\u2019est confirmé que par le pont '
-              'de financement du §7.' % (esc(T['methode'].lower()), esc(T['taux_src']), fr(T['taux'], 1), fr(T['reinv'], 0), verbe,
-                                       fr(T['gmax'], 1), esc(T.get('nature', '')),
-                                       ('%s %%/an' % fr(T['gcomp'], 1)) if num(T.get('gcomp')) else 'une croissance comparable non documentée',
-                                       esc(T.get('gcomp_src') or 'renseigner triangle.croissance_comparable ou triangle.variation_actions')))
-    elif T.get('roic_non_pertinent'):
-        af = 'Le dénominateur réduit par les rachats rend le ROIC non pertinent. Vérifier le pont de financement du §7.'
-    elif str(T.get('af', '')).startswith('NON APPLICABLE'):
-        af = 'Rentabilité ou réinvestissement non positif : le modèle ne s\u2019applique pas, seul le pont de financement du §7 tranche.'
-    else:
-        af = 'Non mesurée : renseigner triangle.methode (opérationnelle ou fonds propres) et triangle.reinvestissement.'
-    mc = T.get('mult_cst')
-    mc_txt = ('À multiple constant, le moteur donne <b>%s %%/an net</b> au cours du jour, fiscalité belge et flux du dossier compris : '
-              'c\u2019est le rendement net qui compte.' % fr(mc, 1)) if num(mc) else ''
-    return ('<div class="c"><h3>\U0001f53a Le triangle 15/15/15</h3><div class="grid g2"><div>%s</div><div>'
-            '<div>%s</div><p style="margin-top:10px">%s</p><div style="margin:10px 0">%s</div><p>%s</p><p>%s</p>'
-            '<div class="sub">L\u2019équilibre : un actif capable de grandir en s\u2019autofinançant, à prix raisonnable. '
-            'Croissance du BPA + rendement du dividende ≥ 15 %%/an ; %s ≤ croissance + dividende (PEGY %s, il faut ≤ 1 : '
-            'un %s de 20 avec 20 %% de moteur présente le même PEGY qu\u2019un %s de 15 avec 15 %%) ; qualité : %s. '
-            '%s : %s. Dividende : %s. Croissance + dividende est un repère brut, sans conversion '
-            'nette universelle. Lecture seulement : le prix d\u2019achat reste celui du taux exigé de la ligne.%s</div>'
-            '</div></div></div>') % (
-        triangle_svg(T), bdg(T['synth'], T['lvl'], 'gros wrap'), esc(T['txt']),
-        bdg('Autofinancement de la croissance : ' + T['af'], T['aflvl'], 'wrap'), af, mc_txt,
-        esc(T.get('per_lab', 'PER')), fr(T.get('pegy'), 2), esc(T.get('per_lab', 'PER')), esc(T.get('per_lab', 'PER')),
-        esc(qualite), esc(T.get('per_lab', 'PER')), esc(T.get('per_src')), esc(T.get('rdt_src')),
-        (' Réinvestissement : ' + esc(T['reinv_src']) + '.') if T.get('reinv_src') else '')
+def marche_html(D, R):
+    """Lecture qualitative des débouchés, sans score supplémentaire."""
+    b = R.get('boule_neige') or {}
+    marche = G(D, 'boule_neige.marche')
+    marche = marche if isinstance(marche, dict) else {}
+    preuves = {
+        'DÉMONTRÉS': ('Débouchés étayés', 5),
+        'PLAUSIBLES': ('Débouchés plausibles', 4),
+        'LIMITÉS': ('Débouchés limités', 3),
+    }
+    lab, lvl = preuves.get(b.get('debouches'), ('Débouchés à documenter', 'gris')) if b.get('debouches_documentes') else (
+        'Débouchés à documenter', 'gris')
+    elements = (
+        ('Où peut-elle gagner des clients ?', marche.get('accessible')),
+        ('Pourquoi elle pourrait les gagner', marche.get('avantage')),
+        ('Ce que les faits montrent', b.get('debouches_texte')),
+        ('Le principal frein', b.get('limite')),
+        ('Le test qui peut trancher', marche.get('test')),
+    )
+    lignes = ''.join('<div class="snow-proof"><strong>%s</strong><p>%s</p></div>' % (esc(k), esc(v.strip()))
+                     for k, v in elements if isinstance(v, str) and v.strip())
+    if not lignes:
+        lignes = '<p class="sub">Il reste à identifier les clients, segments ou pays que l’entreprise peut atteindre.</p>'
+    horizon = '<p class="sub">Horizon estimé à partir des preuves du dossier · environ %s ans.</p>' % fr(b['horizon'], 1) if num(b.get('horizon')) else ''
+    return ('<section class="c" id="marche-a-conquerir"><h3>🌍 Lui reste-t-il un marché à conquérir ?</h3>'
+            '<div>%s</div><div class="grid g2">%s</div>%s</section>') % (bdg(lab, lvl), lignes, horizon)
 
 
 def roic_hist_html(D, R):
@@ -3053,7 +3006,7 @@ def roic_hist_html(D, R):
 
 def capital_html(D, R):
     """V23.6 : trois questions lisibles ; methode et pedagogie a la demande."""
-    c, t, rb = R['capital'], R['triangle'], R['rentab']
+    c, t, rb = R['capital'], R['autofinancement'], R['rentab']
     if 'boule_neige' not in R:
         calc_boule_neige(D, R)
     b = R['boule_neige']
@@ -3095,7 +3048,7 @@ def capital_html(D, R):
     horizon = ('Durée visible estimée : ~%s ans (voir « Combien d’années le prix exige-t-il ? »).' % fr(b['horizon'], 0)) if num(b['horizon']) else 'Durée à documenter.'
     cartes = [
         ('1', 'Est-elle rentable ?', mesure, metrique + ' médian', rent_lab, rent_lvl, rent_txt),
-        ('2', 'Peut-elle grandir ?', croissance, 'Croissance prévue par action', deb_lab, deb_lvl, horizon),
+        ('2', 'Les débouchés soutiennent-ils la croissance ?', croissance, 'Croissance prévue par action', deb_lab, deb_lvl, horizon),
         ('3', 'Qu’est-ce qui la protège ?', '', '', prot_lab, prot_lvl, prot_txt),
     ]
     cards = ''.join('<article class="snow-card"><div class="snow-question">%s</div>%s%s<div class="snow-status">%s</div><p>%s</p></article>' % (
@@ -3122,14 +3075,19 @@ def capital_html(D, R):
     technique = ('<div class="scroll"><table><tr><th>Coût du capital</th><td>%s %%</td></tr>'
         '<tr><th>Capital nécessaire</th><td>%s · rotation %s</td></tr>'
         '<tr><th>Réinvestissement / rendement retenu / distribution</th><td>%s / %s / %s</td></tr>'
-        '<tr><th>Compatibilité financière du triangle</th><td>%s</td></tr>'
+        '<tr><th>Autofinancement de la croissance</th><td>%s</td></tr>'
         '<tr><th>Capital investi</th><td>%s</td></tr><tr><th>Définition</th><td>%s</td></tr></table></div>' % (
             fr(cout, 1), esc(c['intensite']), fr(c['rotation'], 1),
             *(('%s %%' % fr(c[k], 1)) if num(c[k]) else 'n.d.' for k in ('reinvestissement', 'rendement', 'distribution')),
-            esc(t['af']), qual_texte(G(D, 'capital.capital_investi_meur')), qual_texte(G(D, 'capital.definition'))))
+            bdg(t['af'], t['aflvl']), qual_texte(G(D, 'capital.capital_investi_meur')), qual_texte(G(D, 'capital.definition'))))
+    if num(t.get('gmax')):
+        technique += '<p class="sub">%s · croissance théorique %s %s %%/an · croissance comparable %s %%/an.</p>' % (
+            esc(t['methode']), esc(t['nature']), fr(t['gmax'], 1), fr(t['gcomp'], 1))
+        if t.get('gcomp_src'):
+            technique += '<p class="sub">%s</p>' % esc(t['gcomp_src'])
     if c.get('note'):
         technique += '<p class="sub">%s</p>' % esc(c['note'])
-    technique += '<p class="sub">Le rendement retenu par le triangle peut être une approximation historique : ce n’est pas une preuve du rendement futur. Une faible contrainte en capital ne prouve pas les débouchés.</p>'
+    technique += '<p class="sub">Le test d’autofinancement suppose un rendement constant. Le pont de financement (§7) et les preuves de débouchés complètent ce calcul.</p>'
     # V24 : un seul bloc ROIC -- serie, stabilite et machine a profit reunies ici (le bloc « Rentabilite historique » est retire)
     technique += roic_hist_html(D, R)
     technique += encadres_qualite(D, R)
@@ -3418,7 +3376,7 @@ def resume(D, R):
             (R.get('baissier') or {}).get('lab', 'n.d.'),
             ' \u00b7 plancher prouv\u00e9 \u22121 pt' if R.get('B_actif') else '',
             ' \u00b7 \U0001f3f0 forteresse' if R.get('forteresse') else ''))
-    # V23 : red flags juste sous le verdict, puis fiche de tri, creation de valeur, triangle
+    # V23 : red flags juste sous le verdict, puis fiche de tri et création de valeur
     fl = R.get('flags') or []
     if fl:
         L.insert(2, '\U0001f6a9 Red flags (aucun blocage, \u00e0 toi de trancher) : ' + ' \u00b7 '.join(
@@ -3440,11 +3398,6 @@ def resume(D, R):
             fr(Vb.get('em'), 1), fr(Vb.get('emo'), 1, True), Vb.get('synth')))
     else:
         L.append('\U0001f48e Cr\u00e9ation de valeur : NON DOCUMENT\u00c9E')
-    T = R.get('triangle') or {}
-    if T:
-        L.append('\U0001f53a Triangle 15/15/15 : %s (%s %s %% \u00b7 croissance %s + dividende %s = %s %%/an \u00b7 %s %s \u00b7 PEGY %s) \u00b7 autofinancement %s%s' % (
-            T['synth'], T['metrique'], fr(T.get('roic'), 1), fr(T.get('g'), 1), fr(T.get('rdt') or 0, 1), fr(T.get('moteur'), 1), T.get('per_lab', 'PER'), fr(T.get('per'), 1), fr(T.get('pegy'), 2),
-            T['af'], (' (théorique %s %%/an)' % fr(T['gmax'], 1)) if num(T.get('gmax')) else ''))
     c = R['capital']
     L.append('⚖️ Capital : %s (rotation %s) · protection %s · %s' % (
         c['intensite'], fr(c['rotation'], 1), ' '.join(filter(None, (c['glaciere'], c['protection']))), c['machine']))
@@ -3928,7 +3881,7 @@ def calc_duree(D, R):
     g_ps = 100 * (e4 / e3 - 1) if (num(e3) and e3 > 0 and num(e4) and e4 > 0) else None
     if pf:
         out['notes'].append('croissance mesurée sur le BPA d’exploitation (hors produit financier de %s), périmètre du multiple' % fr(pf, 2))
-    tr = D.get('triangle') if isinstance(D.get('triangle'), dict) else {}
+    tr = entrees_autofinancement(D)
     va = _nb(tr.get('variation_actions'))
     if num(g_ps) and num(va):
         g = 100 * ((1 + g_ps / 100) * (1 + va / 100) - 1)
@@ -4531,7 +4484,7 @@ def calc_fait_cle(D, R):
                          bascule=_premiere_phrase(bascule, 220), ve=ve) if fait else {}
     if R['ve_negative']:
         chk('Fait clé : trésorerie supérieure à la capitalisation', 'alerte',
-            'valeur d’entreprise négative : PER et triangle se lisent avec prudence, la question devient l’accès au cash')
+            'valeur d’entreprise négative : le PER se lit avec prudence, la question devient l’accès au cash')
 
 
 def calc_asymetrie(D, R):
@@ -5060,8 +5013,8 @@ def calc_angles_morts(D, R):
             'non calculable quand le cash dépasse ce que vaut le business au cours' if R.get('ve_negative') else 'au-delà de 50 %, l’achat devient un pari de revalorisation')
     if not num(G(D, 'momentum.perf6m_rel')):
         add('Performance relative 6 mois', 'RYTHME', 'règle les tranches (50/25/25 si favorable) ; la MM200 seule sert à la Voie B')
-    if (R.get('triangle') or {}).get('af') in ('NON MESURÉE', 'COMPARAISON NON DOCUMENTÉE'):
-        add('Autofinancement de la croissance', 'NON', 'renseigner triangle.reinvestissement ; le pont de financement du §7 tranche déjà')
+    if (R.get('autofinancement') or {}).get('af') in ('NON MESURÉE', 'COMPARAISON NON DOCUMENTÉE'):
+        add('Autofinancement de la croissance', 'NON', 'renseigner autofinancement.reinvestissement ; le pont de financement du §7 tranche déjà')
     if not num((R.get('profil') or {}).get('etat')):
         add('Part de l’État au capital', 'OUI, si > 50 %', 'red flag (ta règle du 28/10) ; sans effet automatique')
     if (R.get('capital') or {}).get('machine') == 'NON MESURÉE':
@@ -5837,8 +5790,8 @@ def main():
     calc_avenir(D, R)
     calc_profil(D, R)     # V23 (A)
     calc_valeur(D, R)     # V23 (B)
-    calc_capital(D, R)    # V23.5 (D), avant la lecture du triangle
-    calc_triangle(D, R)   # V23 (C)
+    calc_capital(D, R)    # avant le contrôle d’autofinancement
+    calc_autofinancement(D, R)
     calc_boule_neige(D, R)  # V23.6 : lecture des preuves, aucun effet financier
     _sur(calc_sources, D, R)  # V23.7 (C, D) : passe / consensus / guidance / central, escalier BPA-FCF
     _sur(calc_duree, D, R)    # V23.7 (B) : annees de croissance supposees par notre multiple et par le cours
