@@ -19,8 +19,8 @@ from decimal import Decimal
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V26.0.1"
-VERSION_DATE = "08/11/2026"
+VERSION = "V26.1"
+VERSION_DATE = "09/11/2026"
 # Journal des versions archive dans NICO_Historique_Versions.md (hors Projet, sur le PC de Nico).
 # V25.3 : débouchés accessibles et capacité de conquête ; contrôle d’autofinancement conservé.
 # V25.2 : lecture des derniers résultats dans le pilote et provenance à l'épisode 6.
@@ -623,21 +623,26 @@ def val_term(sc, ctx, h=4.0, mult=None):
     return max(0.0, max(0.0, expl) * m + tn)
 
 
+def ajouter_dividendes(cf, sc, ctx, h):
+    """Ajoute les dividendes nets datés aux flux en EUR."""
+    x0 = ctx['x0']
+    tk, dl = ctx.get('tk') or TK_DEF, ctx.get('delai', 0.0)
+    k = 1
+    while True:
+        tp = (tk[k] if k <= 4 else tk[4] + (k - 4)) + dl
+        if tp > h + 1e-9:
+            break
+        if tp > 1e-9:  # dividende deja paye a la date d'evaluation : exclu
+            tq = round(tp, 6)
+            cf[tq] = cf.get(tq, 0.0) + dps_at(sc, k, ctx['gt']) * fx_at(sc, x0, tp) * ctx['net_div']
+        k += 1
+
 def flux(P, sc, ctx, h=4.0, mult=None, divs=True):
     x0 = ctx['x0']; B = P * x0
     I0 = B * (1 + TOB + ctx['fa'])
     cf = {0.0: -I0}
     if divs:
-        tk, dl = ctx.get('tk') or TK_DEF, ctx.get('delai', 0.0)
-        k = 1
-        while True:
-            tp = (tk[k] if k <= 4 else tk[4] + (k - 4)) + dl
-            if tp > h + 1e-9:
-                break
-            if tp > 1e-9:  # dividende deja paye a la date d'evaluation : exclu
-                tq = round(tp, 6)
-                cf[tq] = cf.get(tq, 0.0) + dps_at(sc, k, ctx['gt']) * fx_at(sc, x0, tp) * ctx['net_div']
-            k += 1
+        ajouter_dividendes(cf, sc, ctx, h)
     S = val_term(sc, ctx, h, mult) * fx_at(sc, x0, h)
     vente = S - TAX_PV * max(S - B, 0.0) - S * (TOB + ctx['fv'])
     cf[float(h)] = cf.get(float(h), 0.0) + vente
@@ -1951,11 +1956,319 @@ def plancher_html(R):
         tests or '<tr><td>n.d.</td></tr>', conds or '<tr><td>n.d.</td></tr>')
 
 
+def donnees_ajustement_prix(D, R):
+    """Prépare les flux du moteur et les hypothèses d’origine pour la simulation locale."""
+    ctx = R.get('ctx')
+    if not (R.get('calc') and ctx and R.get('valorisation_valide') and num(R.get('PA')) and R['PA'] > 0):
+        return None
+    action = R.get('action') or {}
+    if action.get('dossier_a_corriger') or (R.get('pf') or {}).get('tactique_ligne'):
+        return None
+    cours = vv(G(D, 'meta.cours'))
+    devise = G(D, 'meta.devise') or ''
+    # La ligne existante fait foi pour le format TRI, avec ou sans module de simulation.
+    if len(R['nico'].split(' | ')) != 17:
+        return None
+    scs = G(D, 'valo.scenarios')
+    scenarios = []
+    for nom in ('baissier', 'central', 'haussier'):
+        sc = scs[nom]
+        dividendes = {}
+        ajouter_dividendes(dividendes, sc, ctx, 4.0)
+        change = fx_at(sc, ctx['x0'], 4.0)
+        valeur = val_term(sc, ctx)
+        scenarios.append(dict(poids=sc.get('poids', POIDS_DEF[nom]), dividendes=sorted(dividendes.items()),
+                              change=change, valeur=valeur, sortie=valeur * change))
+    bear, central, _ = scenarios
+    Bs = scs['baissier']
+    bpa = bpa_at(Bs, ctx['base'], 4.0, ctx['gt'], ctx.get('tk'))
+    cash, produit = tn_sc(Bs, ctx)
+    plafond = R['R_plafond']
+    multiple = Bs['multiple']
+    echelle_bpa = max(abs(bpa), abs(produit), abs(bpa_at(scs['central'], ctx['base'], 4.0, ctx['gt'], ctx.get('tk'))))
+    if echelle_bpa == 0:
+        echelle_bpa = 1
+    exportable = (not obstacles_alerte_a(R) and action.get('act') in
+                  ('ACHETER', 'ATTENDRE LE PRIX', 'RENFORCER', 'GARDER — TAILLE ATTEINTE', 'GARDER, NE PAS RENFORCER')
+                  and G(R, 'baissier.lab') != 'DOUTEUX' and central['valeur'] > 0
+                  and 0 <= multiple <= plafond and bear['valeur'] / central['valeur'] < 0.8)
+    d = dict(
+        ligne=R['nico'], devise=devise, metrique=G(D, 'valo.metrique') or 'BPA',
+        scenarios=scenarios, produit=produit, cash=cash,
+        change=ctx['x0'], coutAchat=1 + TOB + ctx['fa'], fraisVente=TOB + ctx['fv'], tax=TAX_PV,
+        capMin=CAP_MIN, pmax=cours * 20, exportable=exportable, origine=[bpa, multiple, R['tx']],
+        bornes=[[-echelle_bpa, echelle_bpa * 2], [min(0, multiple), max(plafond, multiple)], [TX_MIN, TX_MAX]],
+        reference=dict(rendement=R.get('PA_fond'), protection=R.get('P60'), cible=R['PA'],
+                       valeurBear=bear['valeur'], erreur=''),
+    )
+    try:
+        identite = json.dumps([VERSION, R.get('empreinte_hypotheses'), d], sort_keys=True, ensure_ascii=False, allow_nan=False)
+    except ValueError:  # Aucun réglage sur un modèle aux flux non finis.
+        return None
+    d['id'] = hashlib.sha256(identite.encode('utf-8')).hexdigest()
+    return d
+
+
+def ajustement_prix_html(d):
+    def montant(x):
+        return '%s %s' % (fplafond(x), esc(d['devise']))
+
+    champs = []
+    metriques = (
+        ('bpa', '%s dans le baissier à la sortie' % esc(d['metrique']), esc(d['devise'])),
+        ('multiple', 'Multiple de sortie baissier', '×'),
+        ('taux', 'Rendement net annuel souhaité', '%'),
+    )
+    for (cle, lib, unite), origine, (bas, haut) in zip(metriques, d['origine'], d['bornes']):
+        ident = 'nico-perso-' + cle
+        attributs = ' min="%s" max="%s" step="any" value="%s"' % (bas, haut, origine)
+        champs.append('<div><label for="%s">%s</label><div class="nico-saisie">'
+                      '<input id="%s-reglette" aria-label="%s, réglette" type="range"%s>'
+                      '<input id="%s" type="number" inputmode="decimal"%s aria-describedby="%s-unite">'
+                      '<span id="%s-unite">%s</span></div></div>'
+                      % (ident, lib, ident, lib, attributs, ident, attributs, ident, ident, unite))
+    r = d['reference']
+    return ('<section class="c nico-ajustement" id="nico-ajustement"><h3>🎚 Ajuster mon prix d’achat</h3>'
+            '<p class="sub">La métrique par action couvre les douze mois qui précèdent la sortie, dans quatre ans. '
+            'Le central et le haussier gardent leurs hypothèses.</p>'
+            '<noscript><p class="sub">Active JavaScript dans ton navigateur pour ajuster le prix.</p></noscript>'
+            '<div class="nico-reglages">%s</div>'
+            '<div class="nico-plafonds"><div>Sortie baissière <strong id="nico-ajustement-bear">%s</strong></div>'
+            '<div>Plafond par le rendement <strong id="nico-ajustement-rdt">%s</strong></div>'
+            '<div>Plafond par la perte baissière de 40 %% <strong id="nico-ajustement-cap">%s</strong></div></div>'
+            '<div class="nico-plafonds"><div>Prix NICO d’origine <strong>%s</strong></div>'
+            '<div>Prix d’achat simulé <strong id="nico-ajustement-cible">%s</strong></div>'
+            '<div>Prix retenu pour TRI <strong id="nico-ajustement-retenu">%s</strong></div></div>'
+            '<p class="sub" id="nico-ajustement-message" role="status"></p>'
+            '<div class="nico-commandes"><button class="nico-bouton" id="nico-ajustement-valider" type="button" disabled>'
+            'Valider mon prix</button><button class="nico-bouton" id="nico-ajustement-reset" type="button" disabled>'
+            'Revenir au prix NICO</button><a href="#ligne-tri">Voir la ligne TRI</a></div></section>'
+            % (''.join(champs), montant(r['valeurBear']), montant(r['rendement']), montant(r['protection']),
+               montant(r['cible']), montant(r['cible']), montant(r['cible'])))
+
+
+CSS_AJUSTEMENT_PRIX = """
+.nico-ajustement{border-color:var(--sous-titre)}
+.nico-ajustement .sub{max-width:62ch}
+.nico-reglages{display:grid;gap:14px;max-width:620px;margin:20px auto;text-align:left}
+.nico-reglages label{display:block;margin-bottom:4px;font-size:16px;color:var(--titre)}
+.nico-saisie{display:grid;grid-template-columns:minmax(0,1fr) 8ch 3ch;gap:8px;align-items:center}
+.nico-saisie input{width:100%;min-width:0;accent-color:var(--sous-titre)}
+.nico-saisie input[type=range]{margin:0;min-height:36px}
+.nico-saisie input[type=number],#nico-tri-copie{box-sizing:border-box;background:var(--bg);color:inherit;
+  font:inherit;border:1px solid var(--bord);border-radius:6px;padding:6px}
+.nico-plafonds{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:12px auto}
+.nico-plafonds>div{padding:8px;border-top:1px solid var(--bord);font-size:15px}
+.nico-plafonds strong{display:block;color:var(--titre);font-size:19px}
+.nico-commandes{display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:10px;margin-top:12px;font-size:15px}
+.nico-bouton{background:var(--carte);border:1px solid var(--sous-titre);border-radius:8px;color:inherit;
+  padding:8px 12px;font:inherit;cursor:pointer;min-height:38px}
+.nico-bouton:disabled{opacity:.55;cursor:default}
+#nico-tri-copie{display:block;width:100%;margin:8px 0;text-align:left;resize:vertical}
+@media(max-width:540px){.nico-plafonds{grid-template-columns:1fr}.nico-ajustement{padding:16px}
+  .nico-bouton,.nico-saisie input[type=range]{min-height:44px}}
+"""
+
+
+JS_AJUSTEMENT_PRIX = r'''
+(() => {
+    const d = JSON.parse(document.getElementById('nico-ajustement-donnees').textContent);
+    const bloc = document.getElementById('nico-ajustement');
+    const ligne = document.getElementById('nico-tri-copie');
+    const champs = [...bloc.querySelectorAll('input[type="number"]')];
+    const reglages = champs.map(champ => {
+        const curseur = document.getElementById(champ.id + '-reglette');
+        return {champ, curseur};
+    });
+    const valider = bloc.querySelector('#nico-ajustement-valider');
+    const reinitialiser = bloc.querySelector('#nico-ajustement-reset');
+    const message = bloc.querySelector('#nico-ajustement-message');
+    const copieEtat = document.getElementById('nico-tri-etat');
+    const [bear, central, bull] = d.scenarios;
+    const cle = 'nico-prix:' + d.id;
+    const affiche = new Intl.NumberFormat('fr-BE', {maximumFractionDigits: 4});
+    const original = d.origine;
+    let valide = original;
+
+    // Même convention d'arrondi par défaut que fplafond, y compris sous 0,01.
+    function limite(p) {
+        if (!Number.isFinite(p) || p <= 0) return 'n.d.';
+        const [mantisse, exposant = '0'] = String(p).split('e');
+        const [entier, dec = ''] = mantisse.split('.');
+        const chiffres = entier + dec;
+        const pos = entier.length + Number(exposant);
+        const indice = chiffres.search(/[1-9]/);
+        const precision = Math.max(2, 2 - pos + indice);
+        const gauche = pos <= 0 ? '0' : chiffres.slice(0, pos).padEnd(pos, '0');
+        const droite = (pos < 0 ? '0'.repeat(-pos) + chiffres : chiffres.slice(pos))
+            .slice(0, precision).replace(/0+$/, '');
+        return gauche + (droite ? ',' + droite : '');
+    }
+
+    const prix = p => Number.isFinite(p) && p > 0 ? limite(p) + ' ' + d.devise : 'n.d.';
+    const equivalents = (a, b) => a.every((v, i) => v === b[i]);
+    const bornesValides = valeurs => Array.isArray(valeurs) && valeurs.length === champs.length
+        && valeurs.every((v, i) => Number.isFinite(v) && v >= +champs[i].min && v <= +champs[i].max);
+
+    function seuil(mesure, bas, haut, etendre) {
+        if (etendre) {
+            if (mesure(bas) <= 0) return null;
+            for (let n = 0; mesure(haut) > 0 && n < 40; n++) haut *= 2;
+            if (mesure(haut) > 0) return null;
+        } else {
+            if (mesure(haut) >= 0) return haut;
+            if (mesure(bas) < 0) return null;
+        }
+        for (let n = 0; n < 80; n++) {
+            const milieu = (bas + haut) / 2;
+            const valeur = mesure(milieu);
+            if (valeur > 0 || (!etendre && valeur === 0)) bas = milieu;
+            else haut = milieu;
+        }
+        return etendre ? (bas + haut) / 2 : bas;
+    }
+
+    function simuler(valeurs) {
+        if (!bornesValides(valeurs)) return {erreur: 'Saisis des valeurs comprises dans les bornes affichées.'};
+        if (equivalents(valeurs, original)) return d.reference;
+        const [bpa, multiple, taux] = valeurs;
+        const valeurBear = Math.max(0, Math.max(0, bpa - d.produit) * multiple + d.cash);
+        const sorties = [valeurBear * bear.change, central.sortie, bull.sortie];
+        const ancrage = central.valeur > 0 && valeurBear / central.valeur < 0.8;
+        const base = 1 + taux / 100;
+        const facteur4 = base ** 4;
+        const dividendes = d.scenarios.map(sc =>
+            sc.dividendes.reduce((somme, [date, montant]) => somme + montant / base ** date, 0));
+        const dividendesBear = bear.dividendes.reduce((somme, [, montant]) => somme + montant, 0);
+        const net = (vente, achat) => vente - d.tax * Math.max(vente - achat, 0) - vente * d.fraisVente;
+        const van = (i, p) => {
+            const achat = p * d.change;
+            return dividendes[i] + net(sorties[i], achat) / facteur4 - achat * d.coutAchat;
+        };
+        const pCentral = seuil(p => van(1, p), 1e-6, Math.max(d.pmax, 1), true);
+        const pPondere = seuil(p => d.scenarios.reduce((somme, sc, i) => somme + sc.poids * van(i, p), 0),
+            1e-6, Math.max(d.pmax, 1), true);
+        const prixRendement = [pCentral, pPondere].filter(Number.isFinite);
+        const rendement = prixRendement.length ? Math.min(...prixRendement) : null;
+        const capital = p => {
+            const achat = p * d.change;
+            return 100 * (dividendesBear + net(sorties[0], achat)) / (achat * d.coutAchat);
+        };
+        const protection = seuil(p => capital(p) - d.capMin, d.pmax * 1e-6, d.pmax, false);
+        const cible = rendement > 0 && protection > 0
+            ? Math.min(rendement, protection) : null;
+        return {
+            rendement, protection, cible, valeurBear,
+            erreur: !ancrage ? 'La valeur de sortie baissière doit rester sous 80 % de la valeur centrale.'
+                : cible === null ? 'Aucun prix compatible avec le rendement et la protection.' : ''
+        };
+    }
+
+    function actualiserLigne() {
+        const estPerso = !equivalents(valide, original);
+        const cible = simuler(valide).cible;
+        ligne.value = d.ligne;
+        if (estPerso) {
+            const champsTri = d.ligne.split(' | ');
+            champsTri[5] = limite(cible);
+            champsTri[15] = '🎚 PRIX PERSONNEL ' + champsTri[5] + ' ' + d.devise
+                + ' (objectif ' + affiche.format(valide[2]) + ' %/an, à réévaluer) · Analyse NICO : ' + champsTri[15];
+            ligne.value = champsTri.join(' | ');
+        }
+        bloc.querySelector('#nico-ajustement-retenu').textContent = prix(cible);
+        copieEtat.textContent = estPerso ? 'Prix personnel validé · autres champs issus de l’analyse NICO.' : 'Ligne NICO d’origine.';
+    }
+
+    function renseigner(valeurs) {
+        reglages.forEach(({champ, curseur}, i) => {
+            champ.value = valeurs[i];
+            curseur.value = valeurs[i];
+        });
+    }
+
+    function rendre() {
+        const valeurs = champs.map(champ => champ.valueAsNumber);
+        const simulation = simuler(valeurs);
+        const modifie = !equivalents(valeurs, valide);
+        bloc.querySelector('#nico-ajustement-bear').textContent = prix(simulation.valeurBear);
+        bloc.querySelector('#nico-ajustement-rdt').textContent = prix(simulation.rendement);
+        bloc.querySelector('#nico-ajustement-cap').textContent = prix(simulation.protection);
+        bloc.querySelector('#nico-ajustement-cible').textContent = prix(simulation.cible);
+        valider.disabled = !modifie || !!simulation.erreur || !simulation.cible || !d.exportable;
+        reinitialiser.disabled = equivalents(valeurs, original) && equivalents(valide, original);
+        const raison = simulation.protection < simulation.rendement
+            ? 'La protection baissière fixe le plafond.'
+            : 'Le rendement net annuel souhaité fixe le plafond.';
+        const etat = !d.exportable ? ' Export personnel bloqué par la décision NICO.'
+            : modifie ? ' Valide pour mettre à jour la ligne TRI.' : '';
+        message.textContent = (simulation.erreur || raison) + etat;
+    }
+
+    function memoriser() {
+        try {
+            if (equivalents(valide, original)) localStorage.removeItem(cle);
+            else localStorage.setItem(cle, JSON.stringify(valide));
+        } catch {
+            message.textContent = 'Réglage actif pour cette ouverture. Le navigateur bloque sa mémorisation.';
+        }
+    }
+
+    try {
+        const sauvegarde = JSON.parse(localStorage.getItem(cle));
+        if (d.exportable && bornesValides(sauvegarde)) {
+            const simulation = simuler(sauvegarde);
+            if (simulation.cible > 0 && !simulation.erreur) valide = sauvegarde;
+        }
+    } catch {
+        // Certains aperçus et navigateurs bloquent le stockage des fichiers locaux.
+    }
+
+    renseigner(valide);
+    reglages.forEach(({champ, curseur}) => {
+        champ.addEventListener('input', () => {
+            if (champ.validity.valid) curseur.value = champ.value;
+            rendre();
+        });
+        curseur.addEventListener('input', () => {
+            champ.value = curseur.value;
+            rendre();
+        });
+    });
+    valider.addEventListener('click', () => {
+        if (valider.disabled) return;
+        valide = champs.map(champ => champ.valueAsNumber);
+        actualiserLigne();
+        rendre();
+        memoriser();
+    });
+    reinitialiser.addEventListener('click', () => {
+        valide = original;
+        renseigner(original);
+        actualiserLigne();
+        rendre();
+        memoriser();
+    });
+    document.getElementById('nico-tri-bouton').addEventListener('click', async () => {
+        try {
+            await navigator.clipboard.writeText(ligne.value);
+            copieEtat.textContent = 'Ligne TRI copiée.';
+        } catch {
+            ligne.focus();
+            ligne.select();
+            copieEtat.textContent = 'Ligne sélectionnée. Utilise Ctrl+C ou la commande Copier.';
+        }
+    });
+    actualiserLigne();
+    rendre();
+})();
+'''
+
 def rendu(D, R):
     meta = D.get('meta') or {}
     valo = D.get('valo') or {}
     cours = vv(meta.get('cours')); dev = meta.get('devise', '')
     voie = route_rail(R)
+    ajustement = donnees_ajustement_prix(D, R) if voie == 'A' else None
     arbitre, confiance_arbitree = arbitre_html(D, R)
     resultats = publication_resultats_html(D, R, pastilles=voie != 'B')
     BK = {}
@@ -1969,7 +2282,8 @@ def rendu(D, R):
     A('<!doctype html><html lang="fr"><head><meta charset="utf-8">')
     A('<meta name="viewport" content="width=device-width,initial-scale=1">')
     A('<title>Dossier %s \u2014 %s</title><style>%s%s%s%s%s%s</style></head><body><div class="wrap">' % (
-        esc(meta.get('societe')), esc(meta.get('ticker')), CSS, CSS_V24, CSS_V25, CSS_V254, CSS_V255, CSS_V26))
+        esc(meta.get('societe')), esc(meta.get('ticker')), CSS, CSS_V24, CSS_V25, CSS_V254, CSS_V255,
+        CSS_V26 + (CSS_AJUSTEMENT_PRIX if ajustement else '')))
 
     # -- en-tete
     A('<div class="p0">Dossier NICO %s · évalué le %s · cours du %s · %s · <span title="A faits officiels · B solides · C incertitude bornée · D invérifiable">fiabilité %s</span> · %s</div>' % (
@@ -2182,6 +2496,8 @@ def rendu(D, R):
           bdg('Multiple exig\u00e9 : %s' % R.get('mult_exige_lab', 'n.d.'), L_LAB('mult_exige', R.get('mult_exige_lab'))),
           bdg('Part du multiple %s %%' % fr(R.get('part_mult'), 0), R.get('niv_part', 'gris')) if num(R.get('part_mult')) else '',
           esc(valo.get('seconde_methode') or 'n.d.')))
+    if ajustement:
+        A(ajustement_prix_html(ajustement))
     # V23.1 : bloc « Robustesse du rendement » retire (demande de Nico, 30/10/2026) ; calculs conserves dans le moteur.
 
     # ---------------- bloc 4
@@ -2205,7 +2521,14 @@ def rendu(D, R):
           fr(R.get('cap_PA'), 0), esc(R.get('priorite') or 'n.d.')))
     # ligne NICO + annexes
     S_('nico')
-    A('<h2>Ligne pour l\'outil de tri</h2><div class="nico">%s</div>' % esc(R['nico']))
+    if ajustement:
+        A('<h2 id="ligne-tri">Ligne pour l’outil de tri</h2>'
+          '<div class="nico"><label for="nico-tri-copie">Ligne à copier dans TRI</label>'
+          '<textarea id="nico-tri-copie" rows="3" readonly>%s</textarea>'
+          '<button class="nico-bouton" id="nico-tri-bouton" type="button">Copier la ligne TRI</button>'
+          '<p class="sub" id="nico-tri-etat" role="status">Ligne NICO d’origine.</p></div>' % esc(R['nico']))
+    else:
+        A('<h2>Ligne pour l\'outil de tri</h2><div class="nico">%s</div>' % esc(R['nico']))
     S_('sources')
     src = ''.join('<li>%s%s %s</li>' % (
         esc(s[0]), (' \u2014 <a href="%s" style="color:var(--cy)">lien</a>' % esc(s[1])) if (len(s) > 1 and str(s[1]).startswith(('http://', 'https://'))) else '',
@@ -2231,6 +2554,10 @@ def rendu(D, R):
     S_('script')
     src = json.dumps(D.get('_source') or {}, ensure_ascii=False).replace('</', '<\\/')
     A('<script type="application/json" id="nico-source" data-version="%s">%s</script>' % (VERSION, src))
+    if ajustement:
+        donnees = json.dumps(ajustement, ensure_ascii=False, allow_nan=False).replace('<', '\\u003c')
+        A('<script type="application/json" id="nico-ajustement-donnees">%s</script>' % donnees)
+        A('<script>%s</script>' % JS_AJUSTEMENT_PRIX)
     A('</div></body></html>')
     def T_(*noms):
         return ''.join(''.join(BK.get(n_, [])) for n_ in noms)
