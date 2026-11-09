@@ -19,7 +19,7 @@ from decimal import Decimal
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V26.1"
+VERSION = "V26.3"
 VERSION_DATE = "09/11/2026"
 # Journal des versions archive dans NICO_Historique_Versions.md (hors Projet, sur le PC de Nico).
 # V25.3 : débouchés accessibles et capacité de conquête ; contrôle d’autofinancement conservé.
@@ -1977,29 +1977,46 @@ def donnees_ajustement_prix(D, R):
         ajouter_dividendes(dividendes, sc, ctx, 4.0)
         change = fx_at(sc, ctx['x0'], 4.0)
         valeur = val_term(sc, ctx)
+        cash, produit = tn_sc(sc, ctx)
         scenarios.append(dict(poids=sc.get('poids', POIDS_DEF[nom]), dividendes=sorted(dividendes.items()),
-                              change=change, valeur=valeur, sortie=valeur * change))
+                              change=change, valeur=valeur, cash=cash, produit=produit, multiple=sc['multiple'],
+                              bpa=bpa_at(sc, ctx['base'], 4.0, ctx['gt'], ctx.get('tk'))))
     bear, central, _ = scenarios
-    Bs = scs['baissier']
-    bpa = bpa_at(Bs, ctx['base'], 4.0, ctx['gt'], ctx.get('tk'))
-    cash, produit = tn_sc(Bs, ctx)
     plafond = R['R_plafond']
-    multiple = Bs['multiple']
-    echelle_bpa = max(abs(bpa), abs(produit), abs(bpa_at(scs['central'], ctx['base'], 4.0, ctx['gt'], ctx.get('tk'))))
-    if echelle_bpa == 0:
-        echelle_bpa = 1
+    decimales_multiple = max(1, 1 - Decimal(str(plafond)).adjusted()) if plafond < 1 else 1
+    pas_multiple = 10.0 ** -decimales_multiple
+    multiple_max = round(math.floor(plafond / pas_multiple + 1e-9) * pas_multiple, decimales_multiple)
+    echelle = max(abs(central['bpa']), abs(bear['bpa']), abs(central['produit']), abs(bear['produit'])) or 1
+    origine, reglages, pas, bornes = [], [], [], []
+    for sc in (central, bear):
+        bpa, multiple = sc['bpa'], sc['multiple']
+        decimales = max(3, 1 - Decimal(str(abs(bpa) or echelle)).adjusted())
+        pas_bpa = 10.0 ** -decimales
+        limite = round(math.ceil(echelle / pas_bpa) * pas_bpa, decimales)
+        mult_saisie = round(multiple, decimales_multiple)
+        if 0 <= multiple <= plafond + 1e-9:
+            mult_saisie = min(mult_saisie, multiple_max)
+        origine.extend([bpa, multiple])
+        reglages.extend([round(bpa, decimales), mult_saisie])
+        pas.extend([pas_bpa, pas_multiple])
+        bornes.extend([[-limite, round(2 * limite, decimales)],
+                       [min(0, mult_saisie), max(multiple_max, mult_saisie)]])
+    origine.append(R['tx'])
+    reglages.append(math.floor(R['tx'] + .5))
+    pas.append(1)
+    bornes.append([int(TX_MIN), int(TX_MAX)])
     exportable = (not obstacles_alerte_a(R) and action.get('act') in
                   ('ACHETER', 'ATTENDRE LE PRIX', 'RENFORCER', 'GARDER — TAILLE ATTEINTE', 'GARDER, NE PAS RENFORCER')
                   and G(R, 'baissier.lab') != 'DOUTEUX' and central['valeur'] > 0
-                  and 0 <= multiple <= plafond and bear['valeur'] / central['valeur'] < 0.8)
+                  and all(0 <= sc['multiple'] <= plafond + 1e-9 for sc in (central, bear))
+                  and bear['valeur'] / central['valeur'] < 0.8)
     d = dict(
         ligne=R['nico'], devise=devise, metrique=G(D, 'valo.metrique') or 'BPA',
-        scenarios=scenarios, produit=produit, cash=cash,
+        scenarios=scenarios, plafond=plafond,
         change=ctx['x0'], coutAchat=1 + TOB + ctx['fa'], fraisVente=TOB + ctx['fv'], tax=TAX_PV,
-        capMin=CAP_MIN, pmax=cours * 20, exportable=exportable, origine=[bpa, multiple, R['tx']],
-        bornes=[[-echelle_bpa, echelle_bpa * 2], [min(0, multiple), max(plafond, multiple)], [TX_MIN, TX_MAX]],
-        reference=dict(rendement=R.get('PA_fond'), protection=R.get('P60'), cible=R['PA'],
-                       valeurBear=bear['valeur'], erreur=''),
+        capMin=CAP_MIN, pmax=cours * 20, exportable=exportable, origine=origine,
+        reglages=reglages, pas=pas, bornes=bornes,
+        reference=dict(protection=R.get('P60'), cible=R['PA']),
     )
     try:
         identite = json.dumps([VERSION, R.get('empreinte_hypotheses'), d], sort_keys=True, ensure_ascii=False, allow_nan=False)
@@ -2014,37 +2031,72 @@ def ajustement_prix_html(d):
         return '%s %s' % (fplafond(x), esc(d['devise']))
 
     champs = []
+    metrique = esc(d['metrique'])
     metriques = (
-        ('bpa', '%s dans le baissier à la sortie' % esc(d['metrique']), esc(d['devise'])),
-        ('multiple', 'Multiple de sortie baissier', '×'),
+        ('central-bpa', metrique + ' à la sortie', esc(d['devise'])),
+        ('central-multiple', 'Multiple de sortie', '×'),
+        ('bpa', metrique + ' à la sortie', esc(d['devise'])),
+        ('multiple', 'Multiple de sortie', '×'),
         ('taux', 'Rendement net annuel souhaité', '%'),
     )
-    for (cle, lib, unite), origine, (bas, haut) in zip(metriques, d['origine'], d['bornes']):
+    for (cle, lib, unite), origine, (bas, haut), pas in zip(metriques, d['reglages'], d['bornes'], d['pas']):
         ident = 'nico-perso-' + cle
-        attributs = ' min="%s" max="%s" step="any" value="%s"' % (bas, haut, origine)
+        attributs = ' min="%s" max="%s" step="%s" value="%s"' % (bas, haut, pas, origine)
+        if cle == 'taux':
+            options = ''.join('<option value="%s"%s>%s</option>' %
+                              (t, ' selected' if t == origine else '', t) for t in range(bas, haut + 1))
+            saisie = '<select id="%s" aria-describedby="%s-unite">%s</select>' % (ident, ident, options)
+        else:
+            saisie = '<input id="%s" type="number" inputmode="decimal"%s aria-describedby="%s-unite">' % (
+                ident, attributs, ident)
+        nom_curseur = lib
+        if cle != 'taux':
+            nom_curseur += ', scénario ' + ('central' if cle.startswith('central-') else 'baissier')
         champs.append('<div><label for="%s">%s</label><div class="nico-saisie">'
-                      '<input id="%s-reglette" aria-label="%s, réglette" type="range"%s>'
-                      '<input id="%s" type="number" inputmode="decimal"%s aria-describedby="%s-unite">'
+                      '<input id="%s-reglette" aria-label="%s, réglette" type="range"%s>%s'
                       '<span id="%s-unite">%s</span></div></div>'
-                      % (ident, lib, ident, lib, attributs, ident, attributs, ident, ident, unite))
+                      % (ident, lib, ident, nom_curseur, attributs, saisie, ident, unite))
     r = d['reference']
+    bear, central, bull = d['scenarios']
+    poids = ' + '.join('%s %% %s' % (fr(sc['poids'] * 100, 2).rstrip('0').rstrip(','), nom)
+                      for sc, nom in zip((bear, central, bull), ('baissier', 'central', 'haussier')))
+    panneaux = ''.join(
+        '<fieldset class="nico-scenario"><legend>%s</legend><div class="nico-reglages">%s</div>'
+        '<p class="nico-formule" id="nico-formule-%s"></p>'
+        '<div class="nico-plafonds"><div>Valeur à la revente <strong id="nico-sortie-%s">%s</strong></div>'
+        '<div>Prix d’achat à ce rendement <strong id="nico-seuil-%s">—</strong></div></div></fieldset>'
+        % (titre, ''.join(champs[debut:debut + 2]), cle, cle, montant(sc['valeur']), cle)
+        for titre, cle, debut, sc in (('Scénario central', 'central', 0, central),
+                                     ('Scénario baissier', 'bear', 2, bear)))
     return ('<section class="c nico-ajustement" id="nico-ajustement"><h3>🎚 Ajuster mon prix d’achat</h3>'
-            '<p class="sub">La métrique par action couvre les douze mois qui précèdent la sortie, dans quatre ans. '
-            'Le central et le haussier gardent leurs hypothèses.</p>'
+            '<p class="sub">Ajuste le BPA ou le flux par action des douze mois qui précèdent la revente, dans quatre ans, '
+            'et le multiple appliqué à ce chiffre. Les valeurs de départ sont arrondies à l’écran.</p>'
             '<noscript><p class="sub">Active JavaScript dans ton navigateur pour ajuster le prix.</p></noscript>'
+            '<div class="nico-prix-direct">Prix d’achat NICO simulé <output id="nico-ajustement-cible" aria-live="polite">%s</output>'
+            '<p id="nico-seuil-actif"></p></div>'
             '<div class="nico-reglages">%s</div>'
-            '<div class="nico-plafonds"><div>Sortie baissière <strong id="nico-ajustement-bear">%s</strong></div>'
-            '<div>Plafond par le rendement <strong id="nico-ajustement-rdt">%s</strong></div>'
-            '<div>Plafond par la perte baissière de 40 %% <strong id="nico-ajustement-cap">%s</strong></div></div>'
-            '<div class="nico-plafonds"><div>Prix NICO d’origine <strong>%s</strong></div>'
-            '<div>Prix d’achat simulé <strong id="nico-ajustement-cible">%s</strong></div>'
+            '<div class="nico-scenarios">%s</div>'
+            '<div class="nico-plafonds"><div>Prix sur les flux pondérés <strong id="nico-ajustement-pondere">—</strong>'
+            '<span class="sub">%s</span></div>'
+            '<div>Prix sous la règle de perte maximale de 40 %% <strong id="nico-ajustement-cap">%s</strong></div></div>'
+            '<p class="sub">Le prix NICO est le plus bas de trois seuils : scénario central, flux pondérés et protection baissière. '
+            'Le prix propre au baissier indique ce que tu pourrais payer pour atteindre ton rendement même dans ce scénario.</p>'
+            '<details class="dossier-repli nico-calcul"><summary>Voir le calcul du prix</summary>'
+            '<p>Pour la revente, le multiple s’applique au résultat ou au flux par action hors produits financiers. '
+            'La trésorerie nette par action s’ajoute ensuite si le dossier l’isole.</p>'
+            '<p>Le prix d’achat d’un scénario est celui pour lequel la somme des dividendes et de la revente, nets et actualisés, '
+            'égale le prix payé avec les frais. Chaque encaissement est divisé par (1 + rendement annuel) à la puissance de son délai en années.</p>'
+            '<p id="nico-van-central"></p><p id="nico-van-bear"></p>'
+            '<p>Le haussier garde ses hypothèses. Sa valeur de sortie est de %s. Le seuil de protection garde au moins 60 sur 100 '
+            'dans le baissier, dividendes nets compris.</p></details>'
+            '<div class="nico-plafonds nico-reperes-tri"><div>Prix NICO d’origine <strong>%s</strong></div>'
             '<div>Prix retenu pour TRI <strong id="nico-ajustement-retenu">%s</strong></div></div>'
             '<p class="sub" id="nico-ajustement-message" role="status"></p>'
             '<div class="nico-commandes"><button class="nico-bouton" id="nico-ajustement-valider" type="button" disabled>'
             'Valider mon prix</button><button class="nico-bouton" id="nico-ajustement-reset" type="button" disabled>'
             'Revenir au prix NICO</button><a href="#ligne-tri">Voir la ligne TRI</a></div></section>'
-            % (''.join(champs), montant(r['valeurBear']), montant(r['rendement']), montant(r['protection']),
-               montant(r['cible']), montant(r['cible']), montant(r['cible'])))
+            % (montant(r['cible']), champs[-1], panneaux, poids, montant(r['protection']), montant(bull['valeur']),
+               montant(r['cible']), montant(r['cible'])))
 
 
 CSS_AJUSTEMENT_PRIX = """
@@ -2055,9 +2107,21 @@ CSS_AJUSTEMENT_PRIX = """
 .nico-saisie{display:grid;grid-template-columns:minmax(0,1fr) 8ch 3ch;gap:8px;align-items:center}
 .nico-saisie input{width:100%;min-width:0;accent-color:var(--sous-titre)}
 .nico-saisie input[type=range]{margin:0;min-height:36px}
-.nico-saisie input[type=number],#nico-tri-copie{box-sizing:border-box;background:var(--bg);color:inherit;
+.nico-saisie input[type=number],.nico-saisie select,#nico-tri-copie{box-sizing:border-box;background:var(--bg);color:inherit;
   font:inherit;border:1px solid var(--bord);border-radius:6px;padding:6px}
-.nico-plafonds{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:12px auto}
+.nico-saisie select{width:100%;min-width:0}
+.nico-prix-direct{padding:12px;margin:16px auto;max-width:620px;border:1px solid var(--cy);border-radius:12px;color:var(--cy)}
+.nico-prix-direct output{display:block;color:var(--titre);font-size:clamp(28px,5vw,38px);font-weight:700;font-variant-numeric:tabular-nums}
+.nico-prix-direct p{margin:6px auto 0;font-size:15px}
+.nico-scenarios{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:14px}
+.nico-scenario{min-width:0;margin:0;padding:12px;border:1px solid var(--bord);border-radius:10px}
+.nico-scenario legend{padding:0 8px;color:var(--sous-titre);font-weight:650}
+.nico-scenario .nico-reglages{margin:8px 0}
+.nico-formule{margin:12px auto 0;color:var(--txt2);font-size:15px;font-variant-numeric:tabular-nums}
+.nico-calcul{margin:12px auto;padding:12px;text-align:left;font-size:15px}
+.nico-calcul p{max-width:none}
+.nico-plafonds{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:12px auto}
+.nico-reperes-tri{grid-template-columns:repeat(2,minmax(0,1fr))}
 .nico-plafonds>div{padding:8px;border-top:1px solid var(--bord);font-size:15px}
 .nico-plafonds strong{display:block;color:var(--titre);font-size:19px}
 .nico-commandes{display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:10px;margin-top:12px;font-size:15px}
@@ -2075,7 +2139,8 @@ JS_AJUSTEMENT_PRIX = r'''
     const d = JSON.parse(document.getElementById('nico-ajustement-donnees').textContent);
     const bloc = document.getElementById('nico-ajustement');
     const ligne = document.getElementById('nico-tri-copie');
-    const champs = [...bloc.querySelectorAll('input[type="number"]')];
+    const champs = ['central-bpa', 'central-multiple', 'bpa', 'multiple', 'taux']
+        .map(nom => document.getElementById('nico-perso-' + nom));
     const reglages = champs.map(champ => {
         const curseur = document.getElementById(champ.id + '-reglette');
         return {champ, curseur};
@@ -2087,7 +2152,8 @@ JS_AJUSTEMENT_PRIX = r'''
     const [bear, central, bull] = d.scenarios;
     const cle = 'nico-prix:' + d.id;
     const affiche = new Intl.NumberFormat('fr-BE', {maximumFractionDigits: 4});
-    const original = d.origine;
+    const montant = new Intl.NumberFormat('fr-BE', {maximumSignificantDigits: 3});
+    const original = d.reglages;
     let valide = original;
 
     // Même convention d'arrondi par défaut que fplafond, y compris sous 0,01.
@@ -2108,7 +2174,12 @@ JS_AJUSTEMENT_PRIX = r'''
     const prix = p => Number.isFinite(p) && p > 0 ? limite(p) + ' ' + d.devise : 'n.d.';
     const equivalents = (a, b) => a.every((v, i) => v === b[i]);
     const bornesValides = valeurs => Array.isArray(valeurs) && valeurs.length === champs.length
-        && valeurs.every((v, i) => Number.isFinite(v) && v >= +champs[i].min && v <= +champs[i].max);
+        && valeurs.every((v, i) => {
+            const [min, max] = d.bornes[i];
+            const crans = v / d.pas[i];
+            return Number.isFinite(v) && v >= min && v <= max && Math.abs(crans - Math.round(crans)) < 1e-7;
+        });
+    const saisir = () => champs.map(champ => champ.value === '' ? NaN : Number(champ.value));
 
     function seuil(mesure, bas, haut, etendre) {
         if (etendre) {
@@ -2129,12 +2200,13 @@ JS_AJUSTEMENT_PRIX = r'''
     }
 
     function simuler(valeurs) {
-        if (!bornesValides(valeurs)) return {erreur: 'Saisis des valeurs comprises dans les bornes affichées.'};
-        if (equivalents(valeurs, original)) return d.reference;
-        const [bpa, multiple, taux] = valeurs;
-        const valeurBear = Math.max(0, Math.max(0, bpa - d.produit) * multiple + d.cash);
-        const sorties = [valeurBear * bear.change, central.sortie, bull.sortie];
-        const ancrage = central.valeur > 0 && valeurBear / central.valeur < 0.8;
+        if (!bornesValides(valeurs)) return {erreur: 'Vérifie les bornes et les décimales des réglages.'};
+        const hypotheses = valeurs.map((v, i) => i < valeurs.length - 1 && v === original[i] ? d.origine[i] : v);
+        const [bpaC, multC, bpaB, multB, taux] = hypotheses;
+        const sortie = (sc, bpa, mult) => Math.max(0, Math.max(0, bpa - sc.produit) * mult + sc.cash);
+        const valeurBear = sortie(bear, bpaB, multB);
+        const valeurCentrale = sortie(central, bpaC, multC);
+        const sorties = [valeurBear * bear.change, valeurCentrale * central.change, bull.valeur * bull.change];
         const base = 1 + taux / 100;
         const facteur4 = base ** 4;
         const dividendes = d.scenarios.map(sc =>
@@ -2145,6 +2217,7 @@ JS_AJUSTEMENT_PRIX = r'''
             const achat = p * d.change;
             return dividendes[i] + net(sorties[i], achat) / facteur4 - achat * d.coutAchat;
         };
+        const pBear = seuil(p => van(0, p), 1e-6, Math.max(d.pmax, 1), true);
         const pCentral = seuil(p => van(1, p), 1e-6, Math.max(d.pmax, 1), true);
         const pPondere = seuil(p => d.scenarios.reduce((somme, sc, i) => somme + sc.poids * van(i, p), 0),
             1e-6, Math.max(d.pmax, 1), true);
@@ -2154,25 +2227,40 @@ JS_AJUSTEMENT_PRIX = r'''
             const achat = p * d.change;
             return 100 * (dividendesBear + net(sorties[0], achat)) / (achat * d.coutAchat);
         };
-        const protection = seuil(p => capital(p) - d.capMin, d.pmax * 1e-6, d.pmax, false);
-        const cible = rendement > 0 && protection > 0
-            ? Math.min(rendement, protection) : null;
+        const estOrigine = equivalents(hypotheses, d.origine);
+        const protection = estOrigine ? d.reference.protection
+            : seuil(p => capital(p) - d.capMin, d.pmax * 1e-6, d.pmax, false);
+        const cible = estOrigine ? d.reference.cible
+            : rendement > 0 && protection > 0 ? Math.min(rendement, protection) : null;
+        const actif = protection < rendement ? 'Protection baissière'
+            : pCentral === rendement ? 'Scénario central' : 'Flux pondérés';
+        const bilan = (i, p, valeur, sc, bpa, mult) => ({
+            prix: p, valeur, bpa, mult, cash: sc.cash, produit: sc.produit,
+            dividendes: dividendes[i] / d.change,
+            revente: p === null ? null : net(sorties[i], p * d.change) / facteur4 / d.change,
+            cout: p === null ? null : p * d.coutAchat,
+        });
+        const multipleValide = [multB, multC].every(mult => mult >= 0 && mult <= d.plafond + 1e-9);
         return {
-            rendement, protection, cible, valeurBear,
-            erreur: !ancrage ? 'La valeur de sortie baissière doit rester sous 80 % de la valeur centrale.'
+            pPondere, protection, cible, actif,
+            central: bilan(1, pCentral, valeurCentrale, central, bpaC, multC),
+            bear: bilan(0, pBear, valeurBear, bear, bpaB, multB),
+            erreur: !multipleValide ? 'Les multiples doivent rester entre 0 et le plafond du dossier.'
+                : valeurCentrale <= 0 || valeurBear / valeurCentrale >= 0.8
+                    ? 'La valeur de sortie baissière doit rester sous 80 % de la valeur centrale.'
                 : cible === null ? 'Aucun prix compatible avec le rendement et la protection.' : ''
         };
     }
 
     function actualiserLigne() {
         const estPerso = !equivalents(valide, original);
-        const cible = simuler(valide).cible;
+        const cible = estPerso ? simuler(valide).cible : d.reference.cible;
         ligne.value = d.ligne;
         if (estPerso) {
             const champsTri = d.ligne.split(' | ');
             champsTri[5] = limite(cible);
             champsTri[15] = '🎚 PRIX PERSONNEL ' + champsTri[5] + ' ' + d.devise
-                + ' (objectif ' + affiche.format(valide[2]) + ' %/an, à réévaluer) · Analyse NICO : ' + champsTri[15];
+                + ' (objectif ' + affiche.format(valide.at(-1)) + ' %/an, à réévaluer) · Analyse NICO : ' + champsTri[15];
             ligne.value = champsTri.join(' | ');
         }
         bloc.querySelector('#nico-ajustement-retenu').textContent = prix(cible);
@@ -2186,22 +2274,42 @@ JS_AJUSTEMENT_PRIX = r'''
         });
     }
 
+    function afficherScenario(cle, titre, sc) {
+        const nombre = x => montant.format(x);
+        const enDevise = x => nombre(x) + ' ' + d.devise;
+        let exploitation = nombre(sc?.bpa);
+        if (sc?.produit) {
+            const signe = sc.produit < 0 ? '+' : '−';
+            exploitation = '(' + exploitation + ' ' + signe + ' ' + nombre(Math.abs(sc.produit)) + ')';
+        }
+        if (sc && sc.bpa - sc.produit < 0) exploitation = '0';
+        const cash = sc?.cash ? (sc.cash < 0 ? ' − ' : ' + ') + nombre(Math.abs(sc.cash)) : '';
+        bloc.querySelector('#nico-formule-' + cle).textContent = sc
+            ? exploitation + ' × ' + nombre(sc.mult) + cash + ' ≈ ' + enDevise(sc.valeur) : '';
+        bloc.querySelector('#nico-sortie-' + cle).textContent = sc ? enDevise(sc.valeur) : 'n.d.';
+        bloc.querySelector('#nico-seuil-' + cle).textContent = prix(sc?.prix);
+        bloc.querySelector('#nico-van-' + cle).textContent = sc?.cout > 0
+            ? titre + ' — ' + enDevise(sc.dividendes) + ' de dividendes nets actualisés + '
+                + enDevise(sc.revente) + ' de revente nette actualisée ≈ ' + enDevise(sc.cout) + ' à l’achat, frais inclus.'
+            : '';
+    }
+
     function rendre() {
-        const valeurs = champs.map(champ => champ.valueAsNumber);
+        const valeurs = saisir();
         const simulation = simuler(valeurs);
         const modifie = !equivalents(valeurs, valide);
-        bloc.querySelector('#nico-ajustement-bear').textContent = prix(simulation.valeurBear);
-        bloc.querySelector('#nico-ajustement-rdt').textContent = prix(simulation.rendement);
+        afficherScenario('central', 'Central', simulation.central);
+        afficherScenario('bear', 'Baissier', simulation.bear);
+        bloc.querySelector('#nico-ajustement-pondere').textContent = prix(simulation.pPondere);
         bloc.querySelector('#nico-ajustement-cap').textContent = prix(simulation.protection);
         bloc.querySelector('#nico-ajustement-cible').textContent = prix(simulation.cible);
+        bloc.querySelector('#nico-seuil-actif').textContent = simulation.cible > 0
+            ? 'Seuil qui fixe ce prix · ' + simulation.actif : '';
         valider.disabled = !modifie || !!simulation.erreur || !simulation.cible || !d.exportable;
         reinitialiser.disabled = equivalents(valeurs, original) && equivalents(valide, original);
-        const raison = simulation.protection < simulation.rendement
-            ? 'La protection baissière fixe le plafond.'
-            : 'Le rendement net annuel souhaité fixe le plafond.';
-        const etat = !d.exportable ? ' Export personnel bloqué par la décision NICO.'
-            : modifie ? ' Valide pour mettre à jour la ligne TRI.' : '';
-        message.textContent = (simulation.erreur || raison) + etat;
+        const etat = !d.exportable ? 'Simulation seule : TRI garde le prix NICO.'
+            : modifie ? 'Valide pour mettre à jour la ligne TRI.' : '';
+        message.textContent = [simulation.erreur, etat].filter(Boolean).join(' ');
     }
 
     function memoriser() {
@@ -2236,7 +2344,7 @@ JS_AJUSTEMENT_PRIX = r'''
     });
     valider.addEventListener('click', () => {
         if (valider.disabled) return;
-        valide = champs.map(champ => champ.valueAsNumber);
+        valide = saisir();
         actualiserLigne();
         rendre();
         memoriser();
@@ -2263,12 +2371,37 @@ JS_AJUSTEMENT_PRIX = r'''
 })();
 '''
 
+def reperes_prix_html(D, R):
+    cours = vv(G(D, 'meta.cours'))
+    pa, pr, ps = R.get('PA'), R.get('PR'), R.get('PS')
+    if not R.get('valorisation_valide') or not (num(cours) and num(pa) and pa > 0):
+        return ''
+    devise = G(D, 'meta.devise') or ''
+    objectif, renfort, marge = R.get('tx_action') or (15.0, 18.0, 21.0)
+    comparaison = 'Au-dessus du prix maximum' if cours > pa else 'Au prix maximum ou en dessous'
+    repere_cours = '%s %%/an net estimé · %s' % (fr(R['retenu'], 1), comparaison) if num(R.get('retenu')) else comparaison
+    cartes = [
+        ('cours', 'Cours du jour', fprix(cours), repere_cours),
+        ('achat', 'Prix maximum d’achat', fplafond(pa), 'Objectif de %s %%/an net' % fr(objectif, 1)),
+        ('renfort', 'Renfort', fplafond(pr), 'Objectif +3 pts · %s %%/an net' % fr(renfort, 1)),
+        ('marge', 'Forte marge', fplafond(ps), 'Objectif +6 pts · %s %%/an net' % fr(marge, 1)),
+    ]
+    blocs = ''.join(
+        '<div class="repere-prix repere-%s"><h4>%s</h4><p><strong>%s%s</strong></p><span>%s</span></div>' %
+        (classe, esc(titre), esc(valeur), ' ' + esc(devise) if valeur != 'n.d.' else '', esc(note))
+        for classe, titre, valeur, note in cartes)
+    note = ('Ces seuils de prix sont indicatifs. La conclusion précise les conditions à remplir avant un achat.'
+            if obstacles_alerte_a(R) else 'Chaque seuil correspond à un objectif de rendement net. Une même limite de perte peut plafonner plusieurs seuils.')
+    return '<section class="c"><h3>Repères de prix</h3><div class="reperes-prix">%s</div><p class="sub">%s</p></section>' % (
+        blocs, esc(note))
+
+
 def rendu(D, R):
     meta = D.get('meta') or {}
     valo = D.get('valo') or {}
     cours = vv(meta.get('cours')); dev = meta.get('devise', '')
     voie = route_rail(R)
-    ajustement = donnees_ajustement_prix(D, R) if voie == 'A' else None
+    ajustement = donnees_ajustement_prix(D, R)
     arbitre, confiance_arbitree = arbitre_html(D, R)
     resultats = publication_resultats_html(D, R, pastilles=voie != 'B')
     BK = {}
@@ -2446,29 +2579,8 @@ def rendu(D, R):
               L_RDT(R.get('tri_bear_25')), 'revente forc\u00e9e au bout de 2 ans et demi')))
 
     S_('prix')
-    # barrette decisionnelle : seulement les niveaux actionnables au-dessus de l'objectif
-    PA, PR, PS = R.get('PA'), R.get('PR'), R.get('PS')
-    ta = R.get('tx_action') or (15.0, 18.0, 21.0)
-    pa_montre = num(PA) and voie == 'A' and not confiance_arbitree and not R.get('confiance')
-    if all(num(x) for x in (PA, PR, PS, cours)) and max(PA, cours) > 0:
-        hi = max(PA, cours) * 1.15
-        pc = lambda p: max(0.0, min(100.0, 100 * p / hi))
-        segs = [(0, pc(PS), '#2dc7c9'), (pc(PS), pc(PR), '#4ede9a'),
-                (pc(PR), pc(PA), '#9edb6b'), (pc(PA), 100, '#f0605f')]
-        sg = ''.join('<div class="seg" style="left:%s%%;width:%s%%;background:%s"></div>' %
-                     (a, max(0.4, b - a), c) for a, b, c in segs)
-        pa_txt = ('Prix maximum d’achat <b id="prix-achat">%s %s</b>' % (fplafond(PA), esc(dev))) if pa_montre else 'Prix maximum d’achat'
-        niveaux = [(pa_txt, ta[0])]
-        for lib, seuil, taux in (('Renfort', PR, ta[1]), ('Forte marge', PS, ta[2])):
-            prix_seuil = ('au même plafond' if fplafond(seuil) == fplafond(PA)
-                          else '<b>%s %s</b>' % (fplafond(seuil), esc(dev)))
-            niveaux.append(('%s %s' % (lib, prix_seuil), taux))
-        seuils = ''.join('<li>%s <span class="sub">(%s %%/an)</span></li>' % (lib, fr(t, 1)) for lib, t in niveaux)
-        A('<div class="c"><h3>Barrette de prix (%s)</h3><div class="rail-barrette">%s'
-          '<span class="rail-barrette-cours" style="left:%s%%" aria-label="Cours du jour"></span></div>'
-          '<ul class="rail-seuils">%s</ul></div>' % (esc(dev), sg, pc(cours), seuils))
-    elif pa_montre:
-        A('<p id="prix-achat">Prix maximum d’achat <b>%s %s</b></p>' % (fplafond(PA), esc(dev)))
+    PA = R.get('PA')
+    A(reperes_prix_html(D, R))
 
     srows = ''
     for nom in ('baissier', 'central', 'haussier'):
@@ -2545,10 +2657,10 @@ def rendu(D, R):
     alertes_controles = ['Le plancher de perte borne le prix d’achat.' if a.startswith('Prix d’achat ramené de ') else a for a in WARN]
     ctr = ''.join('<tr><td>%s</td><td>%s</td><td>%s</td></tr>' % (esc(c[0]), esc(c[1]), esc(c[2] if len(c) > 2 else ''))
                   for c in (D.get('controles') or []) + controles_moteur)
-    A('<section class="dossier-detail"><h4>Sources, contr\u00f4les et hypoth\u00e8ses</h4><ul>%s</ul>'
+    A('<details class="dossier-detail dossier-repli"><summary>Sources, contrôles et hypothèses</summary><ul>%s</ul>'
       '<div class="scroll"><table><tr><th>Contr\u00f4le</th><th>\u00c9tat</th><th>Note</th></tr>%s</table></div>'
       '<p class="sub">Fiscalit\u00e9 : net selon les hypoth\u00e8ses indiqu\u00e9es \u2014 plus-value 10 %%, TOB 0,35 %% \u00e0 l\'achat et \u00e0 la vente, '
-      'pr\u00e9compte 30 %%, retenue \u00e9trang\u00e8re %s %%. %s</p><p class="sub">%s</p></section>' % (
+      'pr\u00e9compte 30 %%, retenue \u00e9trang\u00e8re %s %%. %s</p><p class="sub">%s</p></details>' % (
           src, ctr, fr(100 * (valo.get('retenue_etrangere') or 0), 0), esc(valo.get('fiscalite_note')),
           esc(' \u00b7 '.join(alertes_controles))))
     S_('script')
@@ -2575,9 +2687,9 @@ def rendu(D, R):
                   for x in r.get('suite', [])]
     note_prix = ''.join('<p>%s</p>' % x for x in r.get('chapeau', []) + suite_prix)
     q3 = r.get('q3', ('', 'gris', []))[0]
-    regle = regle_html(D, R, afficher_plafond=False)
+    regle = regle_html(D, R)
     prix = (T_('prix_avertissement', 'audit') + note_prix
-            + ('<h3>Règle des prix</h3>' + regle if regle else '')
+            + ('<h3>Scénarios de sortie et cours actuel</h3>' + regle if regle else '')
             + T_('prix') + ('<p>%s</p>' % esc(q3) if q3 and voie != 'B' else '')
             + (pile_face_html(R) if voie != 'B' else '') + T_('plancher', 'prix_tri')
             + pari_html(D, R, confiance_arbitree or voie != 'A'))
@@ -2599,16 +2711,17 @@ def rendu(D, R):
     couleurs = ','.join('var(--rail-%s)' % x['couleur'] for x in stations)
     rail = ('<main class="rail-vertical" style="--rail-degrade:linear-gradient(%s)">%s%s</main>' % (
         couleurs if len(stations) > 1 else couleurs + ',' + couleurs,
-        ''.join(chapitre_rail(D, i, x) for i, x in enumerate(stations, 1)), terminus_html(D, R, voie)))
+        ''.join(chapitre_rail(D, i, x) for i, x in enumerate(stations, 1)), terminus_html(D, R)))
     action = R.get('action') or {}
     voyants = action.get('voyants') or []
     suivi = '<div class="c"><h3>🚨 Voyants de suivi</h3><ul>%s</ul></div>' % ''.join(
         '<li>%s</li>' % esc(x) for x in voyants) if voyants else ''
-    annexe = (dossier_detail('Sources et contrôles', T_('sources'))
-              + dossier_detail('Coulisses', T_('coulisses', 'taux_exige')) + lexique_html())
+    annexe = T_('sources') + dossier_detail('Coulisses', T_('coulisses', 'taux_exige'))
     memo = pour_memoire_html(D, R, croissance, longevite, prix, confiance_arbitree) if voie != 'A' else ''
     tactique = voie_b_html(D, R) if voie != 'B' else ''
-    return (T_('tete', 'ouverture') + sommaire_rail(stations, voie, action) + arbitre + T_('alertes')
+    raccourci_prix = '<p><a href="#nico-ajustement">🎚 Ajuster mon prix d’achat</a></p>' if ajustement else ''
+    return (T_('tete', 'ouverture') + conclusion_html(D, R) + sommaire_rail(stations, voie, action)
+            + raccourci_prix + arbitre + T_('alertes')
             + rail + T_('controles_decision') + porte_ouverture_html(D, R) + T_('plan') + suivi + tactique
             + T_('nico') + memo + annexe + T_('script'))
 
@@ -3154,15 +3267,19 @@ def risques_majeurs_html(risques):
 
 
 def registre_html(risques):
-    rows = []
+    cartes = []
     for i, r in enumerate(risques, 1):
         lvl = gravite_risque(r.get('gravite'))
-        rows.append('<tr id="risque-%s" class="%s"><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % (
-            i, 'risque-fort' if lvl == 2 else '', esc(r.get('fait')), esc(r.get('mecanisme')),
-            bdg(r.get('gravite') or 'n.d.', lvl, 'wrap'), esc(r.get('indicateur')), esc(r.get('hypothese'))))
-    return ('<div class="c registre"><h3>Registre des risques</h3><div class="scroll"><table>'
-            '<tr><th>Fait</th><th>Mécanisme</th><th>Gravité</th><th>Indicateur avancé</th><th>Hypothèse</th></tr>'
-            '%s</table></div></div>') % (''.join(rows) or '<tr><td colspan="5">Risques à documenter.</td></tr>')
+        details = ''.join('<div><dt>%s</dt><dd>%s</dd></div>' % (titre, esc(r.get(cle)) or 'n.d.')
+                          for cle, titre in (('mecanisme', 'Mécanisme'), ('indicateur', 'Indicateur avancé'),
+                                             ('hypothese', 'Hypothèse')))
+        cartes.append('<article id="risque-%s" class="risque-carte%s">'
+                      '<header>%s<h4>%s</h4></header><dl>%s</dl></article>' % (
+                          i, ' risque-fort' if lvl == 2 else '',
+                          bdg(r.get('gravite') or 'n.d.', lvl, 'risque-gravite'), esc(r.get('fait')) or 'Risque à documenter',
+                          details))
+    return '<section class="c registre"><h3>Registre des risques</h3>%s</section>' % (
+        ''.join(cartes) or '<p>Risques à documenter.</p>')
 
 
 IA_BPA = {
@@ -3414,9 +3531,9 @@ def boule_neige_html(D, R):
         '%s</div><p class="snow-intro">%s</p>%s<p><a href="#forteresse">Moat et durée de protection</a></p>'
         '%s%s'
         '<section class="dossier-detail"><h4>Pourquoi cette conclusion ?</h4>%s</section>'
-        '<section class="dossier-detail"><h4>Comprendre le ROIC : l’exemple de la glacière</h4>'
+        '<details class="dossier-detail dossier-repli"><summary>Comprendre le ROIC : l’exemple de la glacière</summary>'
         '<p>Une machine de 1 000 € rapporte 200 €/an : rendement de 20 %%. Une glacière de 50 € rapporte 50 €/an : rendement de 100 %%.</p>'
-        '<p><strong>Mais peut-on vendre dix fois plus ?</strong> Sans nouveaux clients, le rendement de 100 %% ne fait pas grandir les profits. Il faut aussi un modèle protégé des concurrents.</p></section>'
+        '<p><strong>Mais peut-on vendre dix fois plus ?</strong> Sans nouveaux clients, le rendement de 100 %% ne fait pas grandir les profits. Il faut aussi un modèle protégé des concurrents.</p></details>'
         '<p class="snow-footnote">Une rentabilité élevée ne garantit pas une hausse du cours. Ce bloc résume les preuves ; le verdict d’achat dépend aussi de la qualité, du prix et des contrôles du dossier.</p></section>') % (
             bdg(b['lab'], b['lvl'], 'wrap'), esc(b['txt']), debouches,
             ('<div class="snow-row"><strong>Où va l’argent ?</strong><div>%s<p>%s</p></div></div>' % (
@@ -5408,33 +5525,9 @@ padding:24px 28px;margin:0 0 20px;background:linear-gradient(135deg,rgba(57,214,
 .pari .big{font-size:30px}
 .voieb{border-color:#6b5a1f}
 ul.ouvre li::before{content:none}ul.ouvre li{padding-left:0}
-.lexique dt{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--cy);font-size:14px;margin-top:10px}
-.lexique dd{margin:2px 0 0;color:var(--txt2);font-size:15px}
 .ga-pf{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
 @media(max-width:820px){.action{grid-template-columns:1fr}.act-v{font-size:25px}.act-row{grid-template-columns:1fr;gap:2px}}
 """
-
-LEXIQUE = [
-    ('Fiabilité A / B / C / D', 'qualité des preuves, pas prévisibilité : A faits officiels rapprochés · B solides avec estimations secondaires · '
-     'C incertitude matérielle bornée (+1 pt de taux, taille ×0,7) · D intrant décisif invérifiable, achat bloqué.'),
-    ('P / C / E', 'provenance d’un chiffre : P publié · C calculé · E estimé (hypothèse de l’analyste).'),
-    ('TRI', 'taux de rendement interne : ce que tu gagnes par an, net d’impôts et de frais, dividendes compris.'),
-    ('Taux exigé', 'le rendement minimum que cette ligne doit offrir, 12 à 21 % selon les risques que les flux ne chiffrent pas.'),
-    ('Prix maximum d’achat', 'le cours le plus haut auquel le TRI atteint encore le taux exigé (et qui respecte la règle des −40 %).'),
-    ('Capital préservé', 'ce qui te reste sur 100 € si le scénario baissier arrive, après 4 ans, dividendes compris.'),
-    ('CFO / FCF', 'flux d’exploitation (cash généré par l’activité) / flux libre (CFO moins investissements).'),
-    ('BFR', 'besoin en fonds de roulement : stocks + créances clients − dettes fournisseurs. Quand il gonfle, le bénéfice ne devient pas du cash.'),
-    ('Multiple hors cash', '(cours − trésorerie nette) / (BPA − produits financiers) : ce que coûte le business seul.'),
-    ('ROIC', 'rentabilité du capital investi après impôt : chaque euro mis dans le business rapporte-t-il plus que son coût ?'),
-    ('Voie A / Voie B', 'A : société à garder 3 à 5 ans (porte qualité 70 %). B : achat tactique de 12 à 24 mois sur une revalorisation datée, 2 % au plus.'),
-]
-
-
-def lexique_html():
-    return '<section class="c dossier-detail"><h4>📖 Petit lexique du dossier</h4><dl class="lexique">%s</dl></section>' % ''.join(
-        '<dt>%s</dt><dd>%s</dd>' % (esc(t), esc(d)) for t, d in LEXIQUE)
-
-
 
 # ===================================================================== V25.0 : le recit (page 1)
 # Le dossier commence par une page qui se lit comme on parle : un titre-verdict, deux paragraphes, puis quatre questions
@@ -5821,7 +5914,7 @@ def calc_recit(D, R):
                       action=titre_act, etapes=etapes, v4=V4, q3_apres=q3_apres)
 
 
-def regle_html(D, R, afficher_plafond=True):
+def regle_html(D, R):
     """La regle des prix : du pire au meilleur cas, sur une echelle logarithmique resserree."""
     meta = D.get('meta') or {}
     cours = vv(meta.get('cours'))
@@ -5873,7 +5966,7 @@ def regle_html(D, R, afficher_plafond=True):
         haut = (i % 2 == 1)
         o.append('<div class="p1-pt %s" style="left:%.1f%%"><div class="p1-dot" style="background:var(--p1-%s)"></div>'
                  '<div class="p1-lbl"><div class="p1-px p1-%s">%s</div><div class="p1-t">%s</div></div></div>' % (
-                     'haut' if haut else 'bas', x, c, c, ('' if v == PA and not afficher_plafond else fplafond(v)) if limite else fprix(v), t.replace('<br>', '<br> ')))
+                     'haut' if haut else 'bas', x, c, c, fplafond(v) if limite else fprix(v), t.replace('<br>', '<br> ')))
     o.append('</div></div><div class="p1-echelle">Échelle resserrée pour la lisibilité · valeurs en %s · « dans 4 ans » = valeur estimée de l’action, hors dividendes.</div>'
              % esc(meta.get('devise', '')))
     return ''.join(o)
@@ -6204,7 +6297,7 @@ def sommaire_rail(stations, voie, action):
     valeur = 'Fin' if voie == 'fin' else act.split(' ', 1)[0].rstrip(',').capitalize()
     if act == 'NE PAS ACHETER' and voie != 'fin':
         valeur = 'Écarter'
-    finale = dict(cle='decision', titre='Décision', icone='🧭', valeur=valeur, couleur=c)
+    finale = dict(cle='decision', titre='Conclusion', icone='🧭', valeur=valeur, couleur=c)
     liens = ''.join('<a class="rail-lien rail-%s" href="#%s"><span class="rail-rond" aria-hidden="true">%s</span>'
                     '<b>%s</b><span>%s</span></a>' %
                     (s['couleur'], s['cle'], s['icone'], esc(s['valeur']), esc(s['titre'])) for s in [*stations, finale])
@@ -6256,7 +6349,39 @@ def these_etat_html(D, R):
     return '<p class="rail-etat-these">🧭 %s</p>' % esc(phrase)
 
 
-def terminus_html(D, R, voie):
+def raison_decision(D, R, action):
+    act = action.get('act') or ''
+    just = G(D, 'lecture.justification_action')
+    if isinstance(just, dict):
+        just = just.get(act)
+    elif isinstance(just, list) and len(just) == 2 and just[0] == act:
+        just = just[1]
+    else:
+        just = ''
+    raison = _phrase(just) if isinstance(just, str) and just.strip() else _phrase(action.get('pourquoi'))
+    if act == 'ATTENDRE LE PRIX' and not (isinstance(just, str) and just.strip()):
+        obstacles = obstacles_alerte_a(R)
+        if obstacles:
+            raison = 'Le prix seul ne suffit pas. Le dossier reste bloqué par %s.' % ', '.join(obstacles).lower()
+        elif num(R.get('retenu')) and num(R.get('tx')):
+            raison = 'Le rendement estimé au cours est de %s %%/an pour un taux exigé de %s %%/an.' % (
+                fr(R['retenu'], 1), fr(R['tx'], 1))
+    return raison
+
+
+def conclusion_html(D, R):
+    action = R.get('action') or {}
+    act = action.get('act')
+    if not act:
+        return ''
+    raison = raison_decision(D, R, action)
+    return ('<aside class="c rail-conclusion"><h2>🧭 Conclusion</h2>%s%s'
+            '<a href="#decision">Voir la décision et le suivi</a></aside>') % (
+                bdg(act, action.get('lvl') or 'gris', 'gros wrap'),
+                '<p>%s</p>' % esc(raison) if raison else '')
+
+
+def terminus_html(D, R):
     action = R.get('action') or {}
     act = action.get('act') or ''
     recit = R.get('recit') or {}
@@ -6273,33 +6398,18 @@ def terminus_html(D, R, voie):
                            r'à l’échéance du \1 si le catalyseur ne s’est pas produit (stop temps)', texte)
         etapes.append(texte)
     steps = ''.join('<li><span>%s</span><p>%s</p></li>' % (i, e) for i, e in enumerate(etapes, 1))
-    just = G(D, 'lecture.justification_action')
-    if isinstance(just, dict):
-        just = just.get(act)
-    elif isinstance(just, list) and len(just) == 2 and just[0] == act:
-        just = just[1]
-    else:
-        just = ''
-    raison = _phrase(just) if isinstance(just, str) and just.strip() else _phrase(action.get('pourquoi'))
-    if act == 'ATTENDRE LE PRIX' and not (isinstance(just, str) and just.strip()):
-        obstacles = obstacles_alerte_a(R)
-        if obstacles:
-            raison = 'Le prix seul ne suffit pas. Le dossier reste bloqué par %s.' % ', '.join(obstacles).lower()
-        elif num(R.get('retenu')) and num(R.get('tx')):
-            raison = 'Le rendement estimé au cours est de %s %%/an pour un taux exigé de %s %%/an.' % (
-                fr(R['retenu'], 1), fr(R['tx'], 1))
+    raison = raison_decision(D, R, action)
     condition = v.get('suivi_condition')
     suivi_html = ('<div class="rail-suivi"><h3>Décision de watchlist</h3>%s%s%s</div>' %
                   (bdg(suivi, L_LAB('suivi', suivi), 'wrap'),
                    '<p>%s</p>' % esc(condition) if condition else '',
                    '<p>Réexamen le %s.</p>' % esc(rdv) if rdv else ''))
-    titre = 'Fin du trajet' if voie == 'fin' else 'Ma décision'
     niv = action.get('lvl')
     couleur = {1: 'rouge', 2: 'rouge', 3: 'orange', 4: 'jaune', 5: 'vert', 6: 'vert'}.get(niv, 'gris')
     return ('<section class="rail-chap rail-%s" id="decision"><span class="rail-point" aria-hidden="true">🧭</span>'
-            '<div class="rail-kicker">TERMINUS</div><h2>%s</h2><div class="rail-decision">%s'
+            '<h2>Conclusion et décision</h2><div class="rail-decision">%s'
             '<p class="rail-act">%s</p>%s%s%s%s</div></section>') % (
-        couleur, titre, bdg(act, niv, 'gros wrap') if act else '',
+        couleur, bdg(act, niv, 'gros wrap') if act else '',
         esc(recit.get('action') or ACTIONS_HUMAINES.get(act, _phrase(act))),
         '<ol class="rail-plan">%s</ol>' % steps if steps else '',
         '<p class="rail-raison">%s</p>' % esc(raison) if raison else '', these_etat_html(D, R), suivi_html)
@@ -6402,9 +6512,15 @@ h4{margin:0 0 8px;font-size:18px;line-height:1.3}
 .alerte p,.alerte li{font-size:clamp(19px,2.15vw,23px);line-height:1.45;max-width:none;margin:0 0 6px}
 .alerte ul{display:block;padding-left:1.35em;margin:0}.alerte p:last-child,.alerte li:last-child{margin-bottom:0}
 .alerte .sub{margin-left:0}
-.registre .risque-fort td{background:#2b151a;font-size:18px}
-.registre .risque-fort td:first-child{color:var(--alerte-rouge);font-size:20px;font-weight:700}
-.registre .risque-fort .b{font-size:16px}.registre td:target,.registre tr:target td{outline:1px solid var(--alerte-rouge)}
+.risque-carte{border:1px solid var(--bord);border-radius:12px;padding:clamp(12px,2vw,20px);margin:12px 0;text-align:left}
+.risque-carte.risque-fort{background:#2b151a;border-color:#634048}
+.risque-carte:target{outline:2px solid var(--alerte-rouge);scroll-margin-top:16px}
+.risque-carte header{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 14px}
+.risque-carte h4{flex:1 1 30ch;font-weight:600;line-height:1.45;margin:0;color:var(--txt);overflow-wrap:break-word}
+.risque-carte .risque-gravite{font-size:14px;flex:none;max-width:100%;white-space:normal;overflow-wrap:normal}
+.risque-carte dl{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,17ch),1fr));gap:12px;margin:14px 0 0}
+.risque-carte dt{color:var(--sous-titre);font-weight:600;font-size:14px}
+.risque-carte dd{color:var(--txt2);font-size:16px;margin:4px 0 0;line-height:1.45;overflow-wrap:break-word}
 .ia-bpa{border-color:#466d5e;background:linear-gradient(145deg,#152728,var(--carte) 57%)}
 .ia-bpa h3{font-size:clamp(23px,3vw,32px);color:#a9f5d7}
 .ia-sens{font-size:18px}.ia-sens.l6{background:var(--vert-vif)}.ia-sens.l2{background:var(--alerte-rouge)}
@@ -6511,11 +6627,19 @@ body{background:#000;color:#f2f7f8;overflow-wrap:anywhere}
 .rail-donc>b{color:var(--cy);font-style:normal}
 .rail-pastilles{display:flex;justify-content:center;flex-wrap:wrap;gap:8px;margin:12px 0}
 .rail-pill{color:var(--feu);border:1px solid currentColor;border-radius:8px;padding:5px 8px;font:650 13px/1.4 ui-monospace,monospace}
-.rail-barrette{position:relative;height:18px;margin:18px auto 10px;background:#182327;border-radius:8px}
-.rail-barrette .seg{top:0;height:100%}
-.rail-barrette-cours{position:absolute;height:28px;width:3px;top:-5px;background:#fff;outline:1px solid #000;transform:translateX(-50%)}
-.rail-seuils{display:flex;justify-content:center;flex-wrap:wrap;gap:4px 18px;margin:12px auto;padding:0;list-style:none}
-.rail-seuils li{padding:0}.rail-seuils li::before{content:none}
+.reperes-prix{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,145px),1fr));gap:10px;margin:16px auto}
+.repere-prix{border:1px solid var(--bord);border-top:3px solid var(--repere);border-radius:10px;padding:12px}
+.repere-cours{--repere:var(--cy)}.repere-achat{--repere:var(--rail-jaune)}
+.repere-renfort{--repere:var(--rail-vert)}.repere-marge{--repere:var(--sous-titre)}
+.repere-prix h4{color:var(--repere);font-size:16px;overflow-wrap:normal}
+.repere-prix p{margin:4px auto;font-size:clamp(20px,2.5vw,26px);font-variant-numeric:tabular-nums}
+.repere-prix span{display:block;color:var(--txt2);font-size:14px;line-height:1.45}
+.dossier-repli{border:1px solid var(--bord);border-radius:12px}
+.dossier-repli summary{cursor:pointer;color:var(--sous-titre);font-size:18px;font-weight:600;text-align:left}
+.dossier-repli[open] summary{margin-bottom:12px}
+.rail-conclusion{border-color:var(--cy);margin:20px auto 0}
+.rail-conclusion h2{margin-top:0}.rail-conclusion p{margin:10px auto}
+.rail-conclusion>a{display:inline-block;margin-top:4px;font-size:16px}
 .rail-decision{border:2px solid var(--feu);border-radius:22px;background:color-mix(in srgb,var(--feu) 7%,var(--carte));padding:24px;margin-top:12px;text-align:center}
 .rail-act{font-size:clamp(21px,2.8vw,30px);font-weight:650;margin:10px auto 14px}
 .rail-plan{padding:0;margin:0;list-style:none}.rail-plan li{margin:0 auto 14px;padding:0;max-width:55ch}
@@ -6548,7 +6672,7 @@ body{background:#000;color:#f2f7f8;overflow-wrap:anywhere}
   table{table-layout:fixed;width:100%}td,th{padding:5px 3px;overflow-wrap:anywhere;white-space:normal!important}
   .scroll{overflow-x:visible}.scroll table{min-width:0}
   .big,.p1-v{font-size:clamp(23px,6vw,32px)}.p1-pf{padding:12px}
-  .xl{flex-wrap:wrap}.rail-seuils{font-size:15px}
+  .xl{flex-wrap:wrap}
   .rl .tick,.rl .cur{font-size:10px;white-space:normal}
 }
 """
