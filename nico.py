@@ -10,7 +10,7 @@ Fait tout ce qui est mecanique, pour que le modele n'ecrive que des faits et des
   2. attribution des niveaux de couleur selon le bareme du fichier A (section 13)
   3. controles automatiques (ordre des prix, residus, garde-fous de clause, coherence du verdict)
   4. rendu HTML autonome fond noir (le livrable)
-  5. ligne NICO 17 champs + resume de chat
+  5. ligne NICO 17 champs (+ 18e champ CROISSANCE facultatif, V26.4) + resume de chat
 
 Aucun appel reseau. Les seuils sont ici ET dans le fichier A : ne jamais modifier l'un sans l'autre.
 """
@@ -19,8 +19,8 @@ from decimal import Decimal
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V26.3"
-VERSION_DATE = "09/11/2026"
+VERSION = "V26.4"
+VERSION_DATE = "10/11/2026"
 # Journal des versions archive dans NICO_Historique_Versions.md (hors Projet, sur le PC de Nico).
 # V25.3 : débouchés accessibles et capacité de conquête ; contrôle d’autofinancement conservé.
 # V25.2 : lecture des derniers résultats dans le pilote et provenance à l'épisode 6.
@@ -1967,7 +1967,7 @@ def donnees_ajustement_prix(D, R):
     cours = vv(G(D, 'meta.cours'))
     devise = G(D, 'meta.devise') or ''
     # La ligne existante fait foi pour le format TRI, avec ou sans module de simulation.
-    if len(R['nico'].split(' | ')) != 17:
+    if len(R['nico'].split(' | ')) not in (17, 18):  # V26.4 : 18e champ CROISSANCE facultatif
         return None
     scs = G(D, 'valo.scenarios')
     scenarios = []
@@ -3667,6 +3667,8 @@ def ligne_nico(D, R):
           meta.get('secteur', ''), meta.get('pays', ''), note]
     bl = (R.get('baissier') or {}).get('lab')
     ch.append('BAISSIER ' + (bl or 'N.D.'))  # V25.1 : 17 champs, meme sur un dossier arrete tot
+    if num(R.get('gc')):  # V26.4 : 18e champ facultatif, croissance du BPA du scenario central (%/an), lu par la colonne Croissance de l'outil de tri
+        ch.append('CROISSANCE ' + fr(R['gc'], 1))
     return ' | '.join(str(c).replace('\u202f', '') for c in ch)
 
 
