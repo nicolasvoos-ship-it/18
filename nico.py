@@ -20,9 +20,11 @@ from decimal import Decimal
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V26.5"
+VERSION = "V26.5.1"
 VERSION_DATE = "11/11/2026"
 # Journal des versions archive dans NICO_Historique_Versions.md (hors Projet, sur le PC de Nico).
+# V26.5.1 : « La Partition » — bloc proposé (Socle, Moteur, Accélérateur, Bouclier), alertes de bloc (taux, capital préservé,
+#           bloc plein ou hors bande, plafond pays du Moteur, cash plancher), module « Place dans la partition », 19e champ BLOC.
 # V26.5 : module pré-rentabilité « 🚀 Le pari » (BPA ≤ 0) — force du pari /100 sur 7 piliers, 3 portes anti-story,
 #         réel / pari, un seul prix d'achat, poche de 2 lignes en demi-taille dans le bloc Accélérateur.
 #         Revue du 11/11 : déclencheur sur le BPA normalisé ; prix = le plus bas entre plafond de pari et rendement net au taux
@@ -1975,7 +1977,7 @@ def donnees_ajustement_prix(D, R):
     cours = vv(G(D, 'meta.cours'))
     devise = G(D, 'meta.devise') or ''
     # La ligne existante fait foi pour le format TRI, avec ou sans module de simulation.
-    if len(R['nico'].split(' | ')) not in (17, 18):  # V26.4 : 18e champ CROISSANCE facultatif
+    if len(R['nico'].split(' | ')) not in (17, 18, 19):  # V26.4 : 18e champ CROISSANCE ; V26.5.1 : 19e champ BLOC
         return None
     scs = G(D, 'valo.scenarios')
     scenarios = []
@@ -2424,7 +2426,7 @@ def rendu(D, R):
     A('<!doctype html><html lang="fr"><head><meta charset="utf-8">')
     A('<meta name="viewport" content="width=device-width,initial-scale=1">')
     A('<title>Dossier %s \u2014 %s</title><style>%s%s%s%s%s%s</style></head><body><div class="wrap">' % (
-        esc(meta.get('societe')), esc(meta.get('ticker')), CSS, CSS_V24, CSS_V25, CSS_V254, CSS_V255,
+        esc(meta.get('societe')), esc(meta.get('ticker')), CSS, CSS_V24, CSS_V25, CSS_V254, CSS_V255 + CSS_PARTITION,
         CSS_V26 + (CSS_AJUSTEMENT_PRIX if ajustement else '') + (CSS_PARI if (R.get('pari') or {}).get('actif') else '')))
 
     # -- en-tete
@@ -2744,7 +2746,7 @@ def rendu(D, R):
     raccourci_prix = '<p><a href="#nico-ajustement">🎚 Ajuster mon prix d’achat</a></p>' if ajustement else ''
     return (T_('tete', 'ouverture') + conclusion_html(D, R) + sommaire_rail(stations, voie, action)
             + raccourci_prix + arbitre + T_('alertes')
-            + rail + controles_decision + T_('plan') + suivi + tactique
+            + rail + controles_decision + T_('plan') + partition_html(D, R) + suivi + tactique
             + T_('nico') + memo + annexe + T_('script'))
 
 
@@ -3699,8 +3701,11 @@ def ligne_nico(D, R):
           meta.get('secteur', ''), meta.get('pays', ''), note]
     bl = None if pari else (R.get('baissier') or {}).get('lab')
     ch.append('BAISSIER ' + (bl or 'N.D.'))  # V25.1 : 17 champs, meme sur un dossier arrete tot
-    if num(R.get('gc')):  # V26.4 : 18e champ facultatif, croissance du BPA du scenario central (%/an), lu par la colonne Croissance de l'outil de tri
-        ch.append('CROISSANCE ' + fr(R['gc'], 1))
+    _bloc = (R.get('partition') or {}).get('bloc')
+    if num(R.get('gc')) or _bloc:  # V26.4 : 18e champ CROISSANCE ; V26.5.1 : toujours émis dès que le bloc suit, pour garder les positions
+        ch.append('CROISSANCE ' + (fr(R['gc'], 1) if num(R.get('gc')) else 'n.d.'))
+    if _bloc:  # V26.5.1 : 19e champ, bloc de la Partition proposé par le moteur
+        ch.append('BLOC ' + _bloc)
     if pari:
         ch = ['' if c is None else ' '.join(str(c).replace('|', '/').splitlines()) for c in ch]
     return ' | '.join(str(c).replace('\u202f', '') for c in ch)
@@ -3820,6 +3825,8 @@ def resume(D, R):
             '🧭 Que faire (%s) : %s — %s' % ('ligne détenue' if A.get('detenue') else 'nouvelle position', A['act'], A.get('pourquoi', '')),
             A.get('ordre'),
             pari_resume(R),
+            ('🎼 Bloc : %s — %s%s' % (G(R, 'partition.nom'), G(R, 'partition.justif'), (' · ⚠️ ' + ' · '.join(
+                a for _, a in G(R, 'partition.alertes'))) if G(R, 'partition.alertes') else '')) if G(R, 'partition.bloc') else '',
             R['nico'],
         ]))
     L = ['\U0001f4c4 %s (%s) \u2014 %s' % (meta.get('societe'), R.get('ticker') or meta.get('ticker'), meta.get('date_eval')),
@@ -3838,6 +3845,10 @@ def resume(D, R):
          'Suivi : %s \u2014 %s (%s) \u00b7 priorit\u00e9 %s' % (v.get('suivi') or 'n.d.', v.get('suivi_condition') or 'n.d.',
                                                                v.get('suivi_date') or 'n.d.', R.get('priorite') or 'n.d.')]
     L.insert(2, 'Portes : ' + portes_txt(R))
+    _Pt = R.get('partition') or {}
+    if _Pt.get('bloc'):
+        L.insert(3, '🎼 Bloc : %s — %s%s' % (_Pt.get('nom'), _Pt.get('justif'),
+                                             (' · ⚠️ ' + ' · '.join(a for _, a in _Pt.get('alertes') or [])) if _Pt.get('alertes') else ''))
     avr = R.get('avenir') or {}
     _I = R.get('init') or {}
     L.insert(3, '\U0001f454 Initi\u00e9s : %s%s' % (_I.get('lab') or 'NON V\u00c9RIFI\u00c9', (
@@ -5984,6 +5995,12 @@ def recit_pari(D, R):
     etiq, coul, titre = RECITS_PARI.get(st, RECITS_PARI['À DOCUMENTER'])
     if st in ('PARI OUVERT', 'PARI VALIDE — ATTENDRE LE PRIX') and not P.get('prix_publiable'):
         etiq, coul, titre = '🚀 POCHE PARI', 'gris', G(R, 'action.pourquoi') or 'Entrée à vérifier'
+    elif st == 'PARI OUVERT' and G(R, 'action.act') in ('VÉRIFIER LE REGISTRE', 'PAS DE PLACE DANS LA POCHE PARI'):
+        pleine = G(R, 'action.act') == 'PAS DE PLACE DANS LA POCHE PARI'
+        etiq = '🚀 AU BON PRIX · POCHE PLEINE' if pleine else '🚀 AU BON PRIX · POCHE À VÉRIFIER'
+        coul = 'jaune'
+        titre = ('Le prix est bon, mais la poche pari est pleine.' if pleine else
+                 'Le prix est bon, mais la poche pari doit être vérifiée.')
     lec = D.get('lecture') or {}
     if str(lec.get('titre') or '').strip():
         titre = _phrase(lec['titre'])
@@ -6139,8 +6156,11 @@ def entete_html(D, R):
     infos = ' · '.join(str(x) for x in (R.get('ticker') or meta.get('ticker'), meta.get('secteur'), meta.get('pays')) if x)
     action = R.get('action') or {}
     cours = None if action.get('cours_invalide') else vv(meta.get('cours'))
-    return ('<header class="dossier-entete"><h1>%s</h1><p class="sub">%s</p>%s%s</header>') % (
-        esc(meta.get('societe') or 'Dossier NICO'), esc(infos),
+    Pt = R.get('partition') or {}
+    bloc_html = ('<p class="bloc-entete"><span class="bloc-badge bloc-%s">%s</span> %s</p>' % (
+        esc(Pt['bloc'].lower().replace('à ', 'a-').replace(' ', '-')), esc(Pt.get('nom') or ''), esc(Pt.get('justif') or ''))) if Pt.get('bloc') else ''
+    return ('<header class="dossier-entete"><h1>%s</h1><p class="sub">%s</p>%s%s%s</header>') % (
+        esc(meta.get('societe') or 'Dossier NICO'), esc(infos), bloc_html,
         '<p class="sub">%s</p>' % esc(' · '.join(repere)) if repere else '',
         '<p class="dossier-cours">%s</p>' % prix_affiche(cours, str(meta.get('devise') or ''), precis=True) if num(cours) and cours > 0 else '')
 
@@ -7274,14 +7294,14 @@ def pari_station(D, R):
                    '<div class="pm-p" style="width:%s%%">Pari %s %s · %s %% 🎈</div>%s</div>'
                    '<div class="pm-scale"><span>0</span><span>Réel = CA × marge mature %s %% (%s) × PER %s + trésorerie nette</span><span>%s %s</span></div>'
                    '<p class="sub">%s</p>'
-                   '<div class="pm-leg"><span>🟩 <b>Vert</b> : ce que tu achètes de concret</span>'
-                   '<span>🟪 <b>Violet</b> : l’espoir que tu paies</span>'
-                   '<span>┆ <b>Ligne jaune</b> : l’espoir que les preuves t’autorisent</span></div>') % (
+                   '<div class="pm-leg"><span>🟩 <b>Vert</b> : ce que vaudrait le CA d’aujourd’hui, une fois rentable (estimation)</span>'
+                   '<span>🟪 <b>Violet</b> : l’espoir que tu paies</span>%s</div>') % (
             fr(pr, 0).replace(' ', ''), fprix(reel), esc(dev), fr(pr, 0), fr(100 - pr, 0).replace(' ', ''),
             fprix(max(0.0, cours - reel)), esc(dev), fr(max(0.0, part), 0), cap_l, fr(P['marge'], 0), esc(P.get('marge_src') or ''), fr(P['per'], 0), fprix(cours), esc(dev),
             ('Avec une force de %s, le cours ne doit pas contenir plus de %s %% de pari. Aujourd’hui, il en contient %s %%.' % (
                 fr(force, 0), fr(P['plafond'], 0), fr(max(0.0, part), 0))) if num(P.get('plafond')) else
-            'Force sous 50 : aucune part de pari n’est acceptée.')
+            'Force sous 50 : aucune part de pari n’est acceptée.',
+            '<span>┆ <b>Ligne jaune</b> : l’espoir que les preuves t’autorisent</span>' if num(P.get('plafond')) else '')
     else:
         cap_txt = '<p class="sub">Réel et pari non calculables : CA des 12 derniers mois, nombre d’actions ou cours manquant.</p>'
     ge, gr = P.get('g_exige'), P.get('g_org') if num(P.get('g_org')) else P.get('g_realisee')
@@ -7358,6 +7378,273 @@ def pari_resume(R):
         fr(P.get('tx'), 1), ('%s %%/an' % fr(P.get('rdt_cours'), 1)) if num(P.get('rdt_cours')) else 'n.d.', fr(P.get('cap'), 0),
         ('%s %%' % fr(P.get('part'), 0)) if num(P.get('part')) else 'n.d.',
         ('%s %%/an' % fr(P.get('g_exige'), 0, True)) if num(P.get('g_exige')) else 'n.d.')
+
+# ------------------------------------------------------------------ V26.5.1 : « La Partition »
+# Une seule question : d'où viendra le rendement ? Le moteur propose le bloc, l'analyste peut le corriger avec un motif
+# (profil.bloc = [BLOC, motif]). Lecture seule (R3) : AUCUN effet sur le taux, le prix, la taille, les tranches ni le verdict.
+# Les seuils sont ici ET dans le fichier A (§12sexies) : ne jamais modifier l'un sans l'autre.
+PARTITION_DEF = {
+    'SOCLE': dict(nom='🏛️ Socle compounders', cible=35.0, places=7, taille=5.0, tx=(12.0, 14.0), cap_min=70.0),
+    'MOTEUR': dict(nom='🔵 Moteur décoté', cible=30.0, places=6, taille=5.0, tx=(15.0, 17.0), cap_min=60.0),
+    'ACCELERATEUR': dict(nom='🚀 Accélérateur', cible=10.0, places=3, taille=3.3, tx=(17.0, 21.0), cap_min=50.0),
+    'BOUCLIER': dict(nom='🟡 Bouclier réel', cible=20.0, places=4, taille=None, tx=None, cap_min=None),
+}
+PARTITION_ORDRE = ('SOCLE', 'MOTEUR', 'ACCELERATEUR', 'BOUCLIER')
+PARTITION_CASH_MIN = 5.0         # le cash est un plancher, pas une cible
+PARTITION_TOLERANCE = 5.0        # ±5 pts par bloc
+PARTITION_PAYS_MOTEUR = 1 / 3.0  # au plus un tiers du bloc Moteur sur un même pays d'exposition
+PARTITION_PART_MULT = 25.0       # au-delà, le rendement vient surtout de la revalorisation -> Moteur
+
+
+def _bloc_cle(x):
+    u = _sans_accent(vv(x)).strip().upper()
+    if u in PARTITION_DEF:
+        return u
+    for cle, bloc in PARTITION_DEF.items():
+        nom = _sans_accent(bloc['nom']).upper()
+        if u in (nom, nom.split(' ', 1)[1]):
+            return cle
+    return None
+
+
+def _date_ecart_partition(x):
+    brut = str(vv(x) or '').strip()
+    if re.fullmatch(r'[0-9]{8}', brut):
+        brut = '%s-%s-%s' % (brut[:4], brut[4:6], brut[6:])
+    d = _date(brut) if any(sep in brut for sep in ('-', '/', '.')) else None
+    return d.strftime('%d/%m/%Y') if d else ''
+
+
+def partition_table(PF):
+    """Cibles par défaut, éventuellement remplacées par la table « partition » du registre (valeurs numériques seulement)."""
+    T = {k: dict(v) for k, v in PARTITION_DEF.items()}
+    tab = (PF or {}).get('partition') if isinstance((PF or {}).get('partition'), dict) else {}
+    for k, v in (tab.get('blocs') or {}).items() if isinstance(tab.get('blocs'), dict) else []:
+        kk = _bloc_cle(k)
+        if kk and isinstance(v, dict):
+            for champ in ('cible', 'places', 'taille'):
+                if num(v.get(champ)):
+                    T[kk][champ] = float(v[champ]) if champ != 'places' else int(v[champ])
+    cash = tab.get('cash_min') if num(tab.get('cash_min')) else PARTITION_CASH_MIN
+    tol = tab.get('tolerance') if num(tab.get('tolerance')) else PARTITION_TOLERANCE
+    return T, cash, tol
+
+
+def bloc_propose(D, R):
+    """Règle « d'où viendra le rendement ? » appliquée aux chiffres du dossier."""
+    if (R.get('pari') or {}).get('actif'):
+        return 'ACCELERATEUR', 'Rentabilité pas encore prouvée : le rendement viendra de la croissance future (module pari).'
+    pm, B = R.get('part_mult'), R.get('voie_b') or {}
+    if num(pm) and pm > PARTITION_PART_MULT:
+        return 'MOTEUR', ('Décote à refermer : %s %% du rendement attendu vient de la revalorisation du multiple.' % fr(pm, 0))
+    if B.get('statut') in ('OUVERTE', 'EN ATTENTE', 'HORS ZONE') and dict(R.get('portes') or []).get('Qualité') is not True:
+        return 'MOTEUR', 'Décote à refermer : le dossier relève de la Voie B (revalorisation à 12–24 mois).'
+    rb, gc = R.get('rentab') or {}, R.get('gc')
+    med, wacc = rb.get('med'), rb.get('wacc')
+    compose = num(med) and num(wacc) and med >= wacc + 3 and rb.get('tend') != 'EN BAISSE'
+    if compose and num(gc) and gc >= 5:
+        return 'SOCLE', ('Le rendement viendra des bénéfices qui composent : %s médian %s %% contre un coût du capital de %s %%, '
+                         'croissance centrale %s %%/an.' % (rb.get('metrique', 'ROIC'), fr(med, 0), fr(wacc, 0), fr(gc, 1)))
+    if compose:
+        return 'MOTEUR', ('Rentable mais peu de croissance (%s %%/an) : le rendement viendra surtout des flux et de la décote.'
+                          % (fr(gc, 1) if num(gc) else 'n.d.'))
+    if num(med) and num(wacc) and med < wacc and num(gc) and gc >= 15:
+        return 'ACCELERATEUR', ('Rentabilité pas encore prouvée (%s médian %s %% sous son coût) : le rendement viendra de la croissance '
+                                '(%s %%/an).' % (rb.get('metrique', 'ROIC'), fr(med, 0), fr(gc, 1)))
+    return 'À CLASSER', 'Le dossier ne permet pas de trancher : l’analyste déclare le bloc dans profil.bloc, avec son motif.'
+
+
+def calc_partition(D, R, PF):
+    T, cash_min, tol = partition_table(PF)
+    calc, motif_calc = bloc_propose(D, R)
+    decl = G(D, 'profil.bloc')
+    if isinstance(decl, list) and (not decl or decl[0] in (None, '')):
+        decl = None  # squelette du contrat laissé vide : pas de correction
+    dk = _bloc_cle(decl[0] if isinstance(decl, list) else decl)
+    motif = decl[1] if isinstance(decl, list) and len(decl) >= 2 else None
+    dmot = motif.strip() if isinstance(motif, str) else ''
+    if decl and not dk:
+        warn('profil.bloc illisible (%s) : blocs reconnus SOCLE, MOTEUR, ACCELERATEUR, BOUCLIER.' % (decl,))
+    if dk and not dmot:
+        warn('profil.bloc déclaré sans motif écrit : bloc proposé par le moteur conservé.')
+    if dk and dmot:
+        bloc, justif, source = dk, dmot, 'déclaré par l’analyste'
+        if calc != dk:
+            justif += ' (le moteur aurait proposé %s)' % (T[calc]['nom'] if calc in T else 'À CLASSER')
+    else:
+        bloc, justif, source = calc, motif_calc, 'proposé par le moteur'
+    out = dict(bloc=bloc, nom=T[bloc]['nom'] if bloc in T else '⚪ À classer', justif=justif, source=source,
+               alertes=[], blocs=[], cash=None, cash_min=cash_min, tolerance=tol)
+    R['partition'] = out
+    det = bool(R.get('detenue'))
+    lpf = (R.get('pf') or {}).get('ligne') or {}
+    # --- alertes du dossier (lecture seule : rien n'est modifié, R3)
+    if bloc in T and T[bloc]['tx'] and num(R.get('tx')):
+        lo, hi = T[bloc]['tx']
+        if not (lo - 1e-9 <= R['tx'] <= hi + 1e-9):
+            out['alertes'].append(('taux', 'taux exigé %s %% hors de la fourchette du bloc (%s–%s %%) : alerte seulement, le taux n’est pas modifié'
+                                   % (fr(R['tx'], 1), fr(lo, 0), fr(hi, 0))))
+    if bloc in T and T[bloc]['cap_min']:
+        cp, ou = (R.get('cap_PA'), 'au prix d’achat') if num(R.get('cap_PA')) else (R.get('cap_cours'), 'au cours')
+        if num(cp) and cp < T[bloc]['cap_min'] - 1e-9:
+            out['alertes'].append(('capital', 'capital préservé %s/100 %s, sous le minimum du bloc (%s/100)' % (fr(cp, 0), ou, fr(T[bloc]['cap_min'], 0))))
+    # --- place dans le portefeuille (registre)
+    if not PF:
+        out['registre'] = False
+        chk('Partition (V26.5.1)', 'n.d.', '%s · registre absent : place dans la partition non mesurée' % out['nom'])
+        return
+    out['registre'] = True
+    par_bloc = {}
+    for l in PF.get('lignes') or []:
+        poids = _nb(l.get('poids_pct'))
+        poids = poids if num(poids) and 0 <= poids <= 100 else None
+        par_bloc.setdefault(_bloc_cle(l.get('bloc')), []).append((l, poids))
+    registre_incomplet = bool(PF.get('_incomplet') or par_bloc.get(None))
+    if registre_incomplet:
+        out['alertes'].append(('registre', 'classement incomplet dans le registre : les poids et places par bloc restent partiels'))
+    cash = _nb(PF.get('liquidites_pct'))
+    out['cash'] = cash
+    ecart_dossier = (R['retenu'] - R['tx']) if (num(R.get('retenu')) and num(R.get('tx'))) else None
+    for k in PARTITION_ORDRE:
+        ls = par_bloc.get(k, [])
+        poids = sum(p for _, p in ls if p is not None)
+        complet = not registre_incomplet and all(p is not None for _, p in ls)
+        ecart = poids - T[k]['cible'] if complet else None
+        out['blocs'].append(dict(cle=k, nom=T[k]['nom'], cible=T[k]['cible'], places=T[k]['places'], n=len(ls), poids=poids,
+                                 poids_complet=complet, ecart=ecart, hors_bande=abs(ecart) > tol + 1e-9 if complet else None,
+                                 lignes=[(str(l.get('ticker') or l.get('societe')), p, _nb(l.get('ecart')),
+                                          _date_ecart_partition(l.get('ecart_date')), bool(l.get('a_confirmer'))) for l, p in ls]))
+    # Projection en points de portefeuille, jusqu'au plafond prévu par la consigne.
+    act = G(R, 'action.act') or ''
+    taille_std = G(R, 'taille.max')
+    tailles_actes = {
+        'ACHETER': taille_std, 'RENFORCER': taille_std,
+        'ACHAT TACTIQUE (VOIE B)': VOIE_B_TAILLE, 'RENFORCER TACTIQUEMENT (VOIE B)': VOIE_B_TAILLE,
+        'ACHETER (POCHE PARI)': PARI_TAILLE, 'RENFORCER (POCHE PARI)': PARI_TAILLE,
+    }
+    plafond_ordre = tailles_actes.get(act)
+    if num(cash) and num(plafond_ordre):
+        poids_actuel = 0.0
+        if act.startswith('RENFORCER'):
+            poids_actuel = _nb(lpf.get('poids_pct')) if lpf else _nb(G(R, 'action.pos'))
+        if not num(poids_actuel) or not 0 <= poids_actuel <= 100:
+            out['alertes'].append(('cash', 'projection de liquidités indisponible : poids actuel de la ligne non renseigné ou invalide'))
+        else:
+            montant = max(0.0, plafond_ordre - poids_actuel)
+            if montant > 0 and cash - montant < cash_min - 1e-9:
+                out['alertes'].append(('cash', 'avec %s %% du portefeuille engagés, les liquidités passeraient à %s %%, sous le plancher de %s %%' % (
+                    fr(montant, 1), fr(cash - montant, 1), fr(cash_min, 0))))
+    if bloc not in T:
+        chk('Partition (V26.5.1)', 'alerte', 'bloc à classer')
+        return
+    Bk = next(b for b in out['blocs'] if b['cle'] == bloc)
+    deja = det and _bloc_cle(lpf.get('bloc')) == bloc
+    if det and lpf and _bloc_cle(lpf.get('bloc')) and _bloc_cle(lpf.get('bloc')) != bloc:
+        out['alertes'].append(('registre', 'le registre classe cette ligne en %s : à aligner' % T[_bloc_cle(lpf['bloc'])]['nom']))
+    if not Bk['poids_complet']:
+        out['alertes'].append(('bande', 'poids incomplet du bloc : position par rapport à la bande non vérifiable'))
+    elif Bk['hors_bande']:
+        out['alertes'].append(('bande', 'bloc %s la bande : %s %% pour une cible de %s ± %s %%' % (
+            'au-dessus de' if Bk['ecart'] > 0 else 'sous', fr(Bk['poids'], 1), fr(Bk['cible'], 0), fr(tol, 0))))
+    out['plein'] = (not deja) and Bk['n'] >= Bk['places']
+    if out['plein']:
+        notes = [x for x in Bk['lignes'] if num(x[2])]
+        faible = min(notes, key=lambda x: x[2]) if notes else None
+        out['faible'] = faible
+        out['sans_ecart'] = [x[0] for x in Bk['lignes'] if not num(x[2])]
+        if faible:
+            if not num(ecart_dossier):
+                comparaison = 'écart du candidat non renseigné'
+            elif ecart_dossier > faible[2]:
+                comparaison = 'le candidat pourrait la remplacer sur le critère de l’écart'
+            else:
+                comparaison = 'le candidat ne fait pas mieux sur le critère de l’écart'
+            out['alertes'].append(('plein', 'bloc plein (%s/%s) : plus petit écart renseigné, %s (%s pts%s) · %s' % (
+                Bk['n'], Bk['places'], faible[0], fr(faible[2], 1, True), (' au ' + faible[3]) if faible[3] else '', comparaison)))
+        else:
+            out['alertes'].append(('plein', 'bloc plein (%s/%s) : aucune ligne n’a d’écart enregistré pour désigner la plus faible' % (Bk['n'], Bk['places'])))
+    # plafond pays du Moteur
+    if bloc == 'MOTEUR':
+        expo = str(vv(G(D, 'profil.exposition')) or lpf.get('exposition') or G(D, 'meta.pays') or '').strip().upper()
+        if expo:
+            dans = 0.0
+            incomplet = registre_incomplet
+            ajout = None if deja else T['MOTEUR']['taille']
+            for l, poids in par_bloc.get('MOTEUR', []):
+                if l is lpf:
+                    if deja:
+                        ajout = poids
+                    continue
+                pays = str(l.get('exposition') or '').strip().upper()
+                if pays == expo and poids is not None:
+                    dans += poids
+                elif pays == expo or not pays:
+                    incomplet = True
+            plafond = T['MOTEUR']['cible'] * PARTITION_PAYS_MOTEUR
+            out['pays'] = (expo, dans, ajout, plafond)
+            if incomplet or ajout is None:
+                out['pays_incomplet'] = True
+                connus = dans + (ajout if ajout is not None else 0.0)
+                constat = 'le poids connu dépasse déjà le plafond' if connus > plafond + 1e-9 else 'respect du plafond à vérifier'
+                out['alertes'].append(('pays', 'plafond pays du Moteur : %s, poids incomplet (au moins %s %% pour un plafond de %s %%) · %s' % (
+                    expo, fr(connus, 1), fr(plafond, 1), constat)))
+            elif dans + ajout > plafond + 1e-9:
+                out['alertes'].append(('pays', 'plafond pays du Moteur : %s déjà %s %% + %s %% > %s %% du portefeuille' % (
+                    expo, fr(dans, 1), fr(ajout, 1), fr(plafond, 1))))
+    out['ecart_dossier'] = ecart_dossier
+    chk('Partition (V26.5.1)', 'alerte' if out['alertes'] else 'validé', '%s · %s' % (out['nom'], ' ; '.join(a for _, a in out['alertes']) or 'aucune alerte'))
+
+
+def partition_html(D, R):
+    Pt = R.get('partition') or {}
+    if not Pt.get('bloc'):
+        return ''
+    al = ''.join('<li>%s</li>' % esc(_phrase(a)) for _, a in Pt.get('alertes') or [])
+    tete = ('<p><span class="bloc-badge bloc-%s">%s</span> %s <span class="sub">(%s)</span></p>' % (
+        esc(Pt['bloc'].lower().replace('à ', 'a-').replace(' ', '-')), esc(Pt['nom']), esc(Pt['justif']), esc(Pt['source'])))
+    if not Pt.get('registre'):
+        corps = '<p class="sub">Registre du portefeuille absent : poids des blocs et places non mesurés.</p>'
+    else:
+        rows = ''
+        for b in Pt['blocs']:
+            larg = max(0.0, min(100.0, 100.0 * b['poids'] / max(b['cible'] * 1.6, 1)))
+            cib = 100.0 * b['cible'] / max(b['cible'] * 1.6, 1)
+            coul = 'var(--gris)' if not b['poids_complet'] else 'var(--l2)' if b['hors_bande'] else 'var(--cy)'
+            poids_txt = ('%s %%' % fr(b['poids'], 1) if b['poids_complet'] else
+                         'poids incomplet (%s %% connus)' % fr(b['poids'], 1))
+            rows += ('<div class="pt-row%s"><span class="pt-nom">%s</span><div class="pt-bar"><i style="width:%s%%;background:%s"></i>'
+                     '<b style="left:%s%%"></b></div><span class="pt-val">%s / %s %% · <span%s>%s/%s places</span></span></div>') % (
+                ' pt-actif' if b['cle'] == Pt['bloc'] else '', esc(b['nom']), fr(larg, 0).replace(' ', ''), coul,
+                fr(cib, 0).replace(' ', ''), esc(poids_txt), fr(b['cible'], 0),
+                ' class="t2"' if b['n'] > b['places'] else '', b['n'], b['places'])
+        cash = Pt.get('cash')
+        rows += '<div class="pt-row"><span class="pt-nom">💵 Cash</span><div class="pt-bar"></div><span class="pt-val">%s %% · plancher %s %%</span></div>' % (
+            fr(cash, 1) if num(cash) else 'n.d.', fr(Pt['cash_min'], 0))
+        corps = '<div class="pt-grille">%s</div><p class="sub">Barre = poids du bloc · trait = cible · rouge = hors de la bande ± %s pts.</p>' % (
+            rows, fr(Pt['tolerance'], 0))
+    alertes = '<ul class="pt-alertes">%s</ul>' % al if al else '<p class="pt-ok">✅ Aucune alerte de partition.</p>'
+    return ('<section class="c partition"><h3>🎼 Place dans la partition</h3>%s%s%s'
+            '<p class="sub">Lecture seule : le bloc et ses alertes ne modifient ni le taux exigé, ni le prix, ni la taille, ni le verdict.</p></section>'
+            % (tete, corps, alertes))
+
+
+CSS_PARTITION = """
+.bloc-entete{margin:10px auto 0;max-width:70ch;font-size:16px;color:var(--txt2)}
+.bloc-badge{display:inline-block;padding:4px 12px;border-radius:999px;font-weight:650;font-size:15px;margin-right:6px;
+  border:1px solid currentColor;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.bloc-socle{color:#c5a7ff}.bloc-moteur{color:#39d6e0}.bloc-accelerateur{color:#f0994a}.bloc-bouclier{color:#f2cf5b}.bloc-a-classer{color:#7e979d}
+.partition .pt-grille{display:grid;gap:10px;margin:16px auto;max-width:760px;text-align:left}
+.pt-row{display:grid;grid-template-columns:minmax(150px,26%) 1fr minmax(170px,30%);gap:12px;align-items:center;font-size:15px}
+.pt-row.pt-actif .pt-nom{color:var(--titre);font-weight:700}
+.pt-bar{position:relative;height:12px;background:#16211f;border-radius:6px}
+.pt-bar i{display:block;height:100%;border-radius:6px}
+.pt-bar b{position:absolute;top:-4px;bottom:-4px;border-left:2px dashed var(--l4)}
+.pt-val{color:var(--txt2);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13.5px}
+.pt-alertes{display:block;max-width:70ch;margin:8px auto;text-align:left;padding-left:0}
+.pt-alertes li::before{content:"⚠";color:var(--l3);font-size:15px}
+.pt-ok{color:var(--l5)}
+@media(max-width:620px){.pt-row{grid-template-columns:1fr;gap:4px}}
+"""
 
 
 CSS_PARI = """
@@ -7488,6 +7775,7 @@ def main():
     appliquer_pari(D, R)
     _sur(calc_angles_morts, D, R)
     _sur(calc_recit, D, R)  # V25 : le recit de la page 1 (lecture seule)
+    _sur(calc_partition, D, R, PF)  # V26.5.1 : bloc de la Partition et place dans le portefeuille (lecture seule, R3)
     for cle, titre in CHAMPS_THESE:
         champ = G(D, 'acte0.these.' + cle)
         if not isinstance(champ, str) or not champ.strip():
