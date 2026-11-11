@@ -11,6 +11,7 @@ Fait tout ce qui est mecanique, pour que le modele n'ecrive que des faits et des
   3. controles automatiques (ordre des prix, residus, garde-fous de clause, coherence du verdict)
   4. rendu HTML autonome fond noir (le livrable)
   5. ligne NICO 17 champs (+ 18e champ CROISSANCE facultatif, V26.4) + resume de chat
+  6. module pré-rentabilité « 🚀 Le pari » (V26.5), déclenché seul quand le BPA de base est ≤ 0
 
 Aucun appel reseau. Les seuils sont ici ET dans le fichier A : ne jamais modifier l'un sans l'autre.
 """
@@ -19,9 +20,14 @@ from decimal import Decimal
 
 TOB, TAX_PV = 0.0035, 0.10
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V26.4"
-VERSION_DATE = "10/11/2026"
+VERSION = "V26.5"
+VERSION_DATE = "11/11/2026"
 # Journal des versions archive dans NICO_Historique_Versions.md (hors Projet, sur le PC de Nico).
+# V26.5 : module pré-rentabilité « 🚀 Le pari » (BPA ≤ 0) — force du pari /100 sur 7 piliers, 3 portes anti-story,
+#         réel / pari, un seul prix d'achat, poche de 2 lignes en demi-taille dans le bloc Accélérateur.
+#         Revue du 11/11 : déclencheur sur le BPA normalisé ; prix = le plus bas entre plafond de pari et rendement net au taux
+#         exigé du moteur ; capital préservé à la casse (trésorerie + 1 × CA) ; marge mature liée à la marge brute ;
+#         pas de prix dans la ligne NICO si le pari est suspendu ; page 1, taille, repères et sommaire propres au pari.
 # V25.3 : débouchés accessibles et capacité de conquête ; contrôle d’autofinancement conservé.
 # V25.2 : lecture des derniers résultats dans le pilote et provenance à l'épisode 6.
 # V25.1.1 : ordres conditionnes aux donnees fiables, registre obligatoire pour engager en B, plan B conserve jusqu'au changement de voie.
@@ -1964,6 +1970,8 @@ def donnees_ajustement_prix(D, R):
     action = R.get('action') or {}
     if action.get('dossier_a_corriger') or (R.get('pf') or {}).get('tactique_ligne'):
         return None
+    if (R.get('pari') or {}).get('actif'):  # V26.5 : le prix du pari ne vient pas des flux de la Voie A
+        return None
     cours = vv(G(D, 'meta.cours'))
     devise = G(D, 'meta.devise') or ''
     # La ligne existante fait foi pour le format TRI, avec ou sans module de simulation.
@@ -2400,9 +2408,10 @@ def rendu(D, R):
     meta = D.get('meta') or {}
     valo = D.get('valo') or {}
     cours = vv(meta.get('cours')); dev = meta.get('devise', '')
-    voie = route_rail(R)
+    pari = bool(G(R, 'pari.actif')) and not G(R, 'pf.tactique_ligne')
+    voie = 'pari' if pari else route_rail(R)
     ajustement = donnees_ajustement_prix(D, R)
-    arbitre, confiance_arbitree = arbitre_html(D, R)
+    arbitre, confiance_arbitree = ('', False) if pari else arbitre_html(D, R)
     resultats = publication_resultats_html(D, R, pastilles=voie != 'B')
     BK = {}
     _cur = ['tete']
@@ -2416,7 +2425,7 @@ def rendu(D, R):
     A('<meta name="viewport" content="width=device-width,initial-scale=1">')
     A('<title>Dossier %s \u2014 %s</title><style>%s%s%s%s%s%s</style></head><body><div class="wrap">' % (
         esc(meta.get('societe')), esc(meta.get('ticker')), CSS, CSS_V24, CSS_V25, CSS_V254, CSS_V255,
-        CSS_V26 + (CSS_AJUSTEMENT_PRIX if ajustement else '')))
+        CSS_V26 + (CSS_AJUSTEMENT_PRIX if ajustement else '') + (CSS_PARI if (R.get('pari') or {}).get('actif') else '')))
 
     # -- en-tete
     A('<div class="p0">Dossier NICO %s · évalué le %s · cours du %s · %s · <span title="A faits officiels · B solides · C incertitude bornée · D invérifiable">fiabilité %s</span> · %s</div>' % (
@@ -2616,7 +2625,11 @@ def rendu(D, R):
     S_('plan')
     tl = R.get('taille') or {}
     st_t = tl.get('statut')
-    if st_t == 'sans objet':
+    _Pp = R.get('pari') or {}
+    if _Pp.get('actif') and st_t == 'sans objet':  # V26.5
+        t_txt = ('<p>Poche pari : <b>pas d’entrée</b> tant que le statut est « %s ». Taille d’une ligne pari : %s %% au plus.</p>'
+                 % (esc(_Pp.get('statut') or 'À DOCUMENTER'), fr(PARI_TAILLE, 1)))
+    elif st_t == 'sans objet':
         t_txt = ('<p>Taille Voie A : <b>sans objet</b> \u2014 l\u2019achat standard est bloqu\u00e9 (voir ce qui rouvrirait la porte, juste au-dessus)%s.</p>'
                  % ('' if (R.get('voie_b') or {}).get('statut') not in ('OUVERTE', 'EN ATTENTE') else ' ; Voie B : %s %% au plus' % fr(VOIE_B_TAILLE, 0)))
     else:
@@ -2688,7 +2701,11 @@ def rendu(D, R):
     note_prix = ''.join('<p>%s</p>' % x for x in r.get('chapeau', []) + suite_prix)
     q3 = r.get('q3', ('', 'gris', []))[0]
     regle = regle_html(D, R)
-    prix = (T_('prix_avertissement', 'audit') + note_prix
+    if (R.get('pari') or {}).get('actif'):  # V26.5 : sans bénéfice, les prix de la Voie A n'ont pas de sens
+        prix = ('<p class="sub">Sans bénéfice, le BPA × PER n’a pas de sens : les prix, le plancher et le pile ou face sont ceux '
+                'de la station <a href="#pari">🚀 Le Pari</a>.</p>')
+    else:
+      prix = (T_('prix_avertissement', 'audit') + note_prix
             + ('<h3>Scénarios de sortie et cours actuel</h3>' + regle if regle else '')
             + T_('prix') + ('<p>%s</p>' % esc(q3) if q3 and voie != 'B' else '')
             + (pile_face_html(R) if voie != 'B' else '') + T_('plancher', 'prix_tri')
@@ -2700,6 +2717,7 @@ def rendu(D, R):
                     'La Voie A s’arrête ici. On examine la Voie B, une revalorisation sur 12 à 24 mois.</p></aside>')
     suivante = ('La porte qualité est franchie. Va-t-elle encore grandir ?' if voie == 'A' else
                 'La Voie A s’arrête ici. La décote justifie-t-elle la Voie B ?' if voie == 'B' else
+                'La station suivante examine les portes et le prix du pari.' if pari else
                 'Les portes requises ne sont pas franchies. Passons à la décision.')
     stations = [station('qualite', 'Qualité', '🏛️', 'Est-ce une bonne entreprise ?',
                         '%s %%' % fr(q['Q'], 0) if num(q.get('Q')) else 'n.d.',
@@ -2708,6 +2726,9 @@ def rendu(D, R):
         stations.extend(stations_a(R, croissance, longevite, prix))
     elif voie == 'B':
         stations.extend(stations_b(D, R))
+    _ps = _sur(pari_station, D, R, defaut=None)  # V26.5 : société sans bénéfice, station « 🚀 Le pari » après Qualité
+    if _ps:
+        stations.insert(1, _ps)
     couleurs = ','.join('var(--rail-%s)' % x['couleur'] for x in stations)
     rail = ('<main class="rail-vertical" style="--rail-degrade:linear-gradient(%s)">%s%s</main>' % (
         couleurs if len(stations) > 1 else couleurs + ',' + couleurs,
@@ -2717,12 +2738,13 @@ def rendu(D, R):
     suivi = '<div class="c"><h3>🚨 Voyants de suivi</h3><ul>%s</ul></div>' % ''.join(
         '<li>%s</li>' % esc(x) for x in voyants) if voyants else ''
     annexe = T_('sources') + dossier_detail('Coulisses', T_('coulisses', 'taux_exige'))
-    memo = pour_memoire_html(D, R, croissance, longevite, prix, confiance_arbitree) if voie != 'A' else ''
-    tactique = voie_b_html(D, R) if voie != 'B' else ''
+    memo = pour_memoire_html(D, R, croissance, longevite, prix, confiance_arbitree) if voie not in ('A', 'pari') else ''
+    tactique = voie_b_html(D, R) if voie not in ('B', 'pari') else ''
+    controles_decision = '' if pari else T_('controles_decision') + porte_ouverture_html(D, R)
     raccourci_prix = '<p><a href="#nico-ajustement">🎚 Ajuster mon prix d’achat</a></p>' if ajustement else ''
     return (T_('tete', 'ouverture') + conclusion_html(D, R) + sommaire_rail(stations, voie, action)
             + raccourci_prix + arbitre + T_('alertes')
-            + rail + T_('controles_decision') + porte_ouverture_html(D, R) + T_('plan') + suivi + tactique
+            + rail + controles_decision + T_('plan') + suivi + tactique
             + T_('nico') + memo + annexe + T_('script'))
 
 
@@ -3632,7 +3654,9 @@ def ligne_nico(D, R):
     v = D.get('verdict') or {}
     st = statut_suivi(D, R)
     note = (v.get('nico_note') or v.get('suivi_condition') or '').replace('|', '/')
-    B = R.get('voie_b') or {}  # V24 : la Voie B remonte dans l'outil de tri, en tete de la note (17 champs inchanges)
+    Pp = R.get('pari') or {}
+    pari = Pp.get('actif') and not G(R, 'pf.tactique_ligne')
+    B = {} if pari else R.get('voie_b') or {}  # V24 : les données tactiques occupent la Note
     A = R.get('action') or {}
     act = A.get('act', '')
     prix_valides = not A.get('dossier_a_corriger')
@@ -3660,15 +3684,25 @@ def ligne_nico(D, R):
     if rouges:
         court = ' + '.join('ÉTAT >50 %' if 'État' in t else 'ÉTHIQUE' for t in rouges)
         note = ('\U0001f6a9 %s — %s' % (court, note)) if note else '\U0001f6a9 %s' % court
+    if pari:  # V26.5 : le pari remonte en tête de la Note, sans nouveau champ
+        st_ = Pp.get('statut') or 'À DOCUMENTER'
+        tete = ('🚀 PARI %s' if st_ == 'À DOCUMENTER' else '🚀 %s') % st_
+        if num(Pp.get('force')):
+            tete += ' · force %s/100' % fr(Pp['force'], 0)
+        if num(Pp.get('cap')):
+            tete += ' · casse estimée (E)'
+        note = ('%s — %s' % (tete, note)) if note else tete
     ch = ['NICO', R.get('ticker') or meta.get('ticker', ''), meta.get('societe', ''), meta.get('devise', ''), st,
           fplafond(R.get('PA') if prix_valides else None), fprix(None if A.get('cours_invalide') else vv(meta.get('cours'))),
           fr(R.get('tx'), 1), fr(R.get('retenu') if prix_valides else None, 1),
           fr(R.get('cap_cours') if prix_valides else None, 0), fr(R['q']['Q'], 0), v.get('suivi_date', ''), meta.get('date_eval', ''),
           meta.get('secteur', ''), meta.get('pays', ''), note]
-    bl = (R.get('baissier') or {}).get('lab')
+    bl = None if pari else (R.get('baissier') or {}).get('lab')
     ch.append('BAISSIER ' + (bl or 'N.D.'))  # V25.1 : 17 champs, meme sur un dossier arrete tot
     if num(R.get('gc')):  # V26.4 : 18e champ facultatif, croissance du BPA du scenario central (%/an), lu par la colonne Croissance de l'outil de tri
         ch.append('CROISSANCE ' + fr(R['gc'], 1))
+    if pari:
+        ch = ['' if c is None else ' '.join(str(c).replace('|', '/').splitlines()) for c in ch]
     return ' | '.join(str(c).replace('\u202f', '') for c in ch)
 
 
@@ -3780,6 +3814,14 @@ def taille_txt(R):
 
 def resume(D, R):
     meta = D.get('meta') or {}; v = D.get('verdict') or {}
+    if G(R, 'pari.actif') and not G(R, 'pf.tactique_ligne'):
+        A = R.get('action') or {}
+        return '\n'.join(filter(None, [
+            '🧭 Que faire (%s) : %s — %s' % ('ligne détenue' if A.get('detenue') else 'nouvelle position', A['act'], A.get('pourquoi', '')),
+            A.get('ordre'),
+            pari_resume(R),
+            R['nico'],
+        ]))
     L = ['\U0001f4c4 %s (%s) \u2014 %s' % (meta.get('societe'), R.get('ticker') or meta.get('ticker'), meta.get('date_eval')),
          'Verdict : %s%s' % (R.get('verdict_final') or v.get('achat') or 'n.d.', (' \u2014 ' + v['phrase']) if v.get('phrase') else ''),
          'Q %s %% (couverture %s %%) \u00b7 C %s %% \u00b7 croissance centrale %s %%/an' % (
@@ -4689,7 +4731,7 @@ def charger_portefeuille(src=None, chemin=None):
                     if alias is not None and not (isinstance(alias, list) and all(isinstance(x, str) for x in alias)):
                         incomplet = True
                         ligne = dict(ligne, alias=[])
-                    if _sans_accent(ligne.get('voie')).strip() not in ('', 'a', 'b', 'voie a', 'voie b'):
+                    if _sans_accent(ligne.get('voie')).strip() not in ('', 'a', 'b', 'voie a', 'voie b') + PARI_VOIES_REGISTRE:  # V26.5 : poche pari
                         incomplet = True
                     lignes.append(ligne)
                 if incomplet:
@@ -5575,6 +5617,13 @@ ACTIONS_HUMAINES = {
     'DOSSIER À CORRIGER': 'Fais corriger les chiffres avant de décider.',
     'VÉRIFIER LE REGISTRE': 'Vérifie ton registre avant de passer un ordre tactique.',
     'VÉRIFIER LE PLAN TACTIQUE': 'Vérifie le plan tactique enregistré.',
+    'ACHETER (POCHE PARI)': 'Achète une petite ligne pari, en trois tranches.',
+    'ATTENDRE LE PRIX (POCHE PARI)': 'N’achète pas encore : le pari tient, pas le prix.',
+    'NE PAS ACHETER (PARI SUSPENDU)': 'N’achète pas : le pari est suspendu.',
+    'NE PAS ACHETER (STORY)': 'Passe ton chemin : l’histoire dépasse les preuves.',
+    'PAS DE PLACE DANS LA POCHE PARI': 'Pas de place : tes deux lignes pari sont prises.',
+    'RENFORCER (POCHE PARI)': 'Renforce ta ligne pari, jusqu’à la demi-taille.',
+    'SORTIR (PARI)': 'Vends : le pari ne tient plus.',
     'GARDER — SUIVI TACTIQUE': 'Garde ta ligne et suis le plan tactique enregistré.',
     'GARDER — CHANGEMENT DE VOIE À VALIDER': 'Garde ta ligne. Valide le passage en Voie A avant de renforcer.',
 }
@@ -5914,6 +5963,60 @@ def calc_recit(D, R):
     R['recit'] = dict(type=typ, etiquette=etiq, couleur=coul, titre=titre, chapeau=chap, suite=suite,
                       q1=(q1, q1c, t1), q2=(q2, q2c, t2), q3=(q3, q3c, t3), pile=(pile_v, pile_t), face=(face_v, face_t),
                       action=titre_act, etapes=etapes, v4=V4, q3_apres=q3_apres)
+    recit_pari(D, R)  # V26.5
+
+
+RECITS_PARI = {
+    'PARI OUVERT': ('🚀 PARI SUR L’AVENIR · AU BON PRIX', 'vert', 'Un pari sur l’avenir, à un prix qui laisse de la marge.'),
+    'PARI VALIDE — ATTENDRE LE PRIX': ('🚀 PARI SÉRIEUX · TROP CHER', 'jaune', 'Un pari qui tient, mais à un prix qui ne pardonne rien.'),
+    'PARI SUSPENDU': ('🚀 PARI SUSPENDU', 'orange', 'Le pari est en pause : une porte anti-story a sauté.'),
+    'STORY — PAS ÉLIGIBLE': ('🚀 STORY · PAS ÉLIGIBLE', 'rouge', 'Une belle histoire, mais pas encore assez de preuves.'),
+    'À DOCUMENTER': ('🚀 PARI À DOCUMENTER', 'gris', 'Un pari à documenter avant toute décision.'),
+}
+
+
+def recit_pari(D, R):
+    """V26.5 : la page 1 d'une société sans bénéfice raconte le pari, pas la Voie A (lecture seule, R3)."""
+    P, rc = R.get('pari') or {}, R.get('recit')
+    if not (P.get('actif') and rc) or G(R, 'pf.tactique_ligne') or rc.get('type') == 'A CORRIGER':
+        return
+    st = P.get('statut') or 'À DOCUMENTER'
+    etiq, coul, titre = RECITS_PARI.get(st, RECITS_PARI['À DOCUMENTER'])
+    if st in ('PARI OUVERT', 'PARI VALIDE — ATTENDRE LE PRIX') and not P.get('prix_publiable'):
+        etiq, coul, titre = '🚀 POCHE PARI', 'gris', G(R, 'action.pourquoi') or 'Entrée à vérifier'
+    lec = D.get('lecture') or {}
+    if str(lec.get('titre') or '').strip():
+        titre = _phrase(lec['titre'])
+    dev = G(D, 'meta.devise') or ''
+    cours, tx = vv(G(D, 'meta.cours')), R.get('tx')
+    prix, rc_ = P.get('prix'), P.get('rdt_cours')
+    if not num(prix) or not num(rc_):
+        q2, q2c, t2 = 'Pas encore calculé.', 'gris', ['Le prix du pari demande le CA, le nombre d’actions et une croissance centrale.']
+    else:
+        ok = num(cours) and cours <= prix
+        q2, q2c = ('Oui.', 'vert') if (ok and P.get('prix_publiable')) else ('Non, pas encore.', 'rouge') if P.get('prix_publiable') else ('Le pari est en pause.', 'orange')
+        t2 = ['Au cours du jour, le pari rapporte <b class="chiffre %s">%s</b> %% par an net estimé, pour un seuil de %s %%.'
+              % (q2c, fr(rc_, 1), fr(tx, 1)),
+              '%s <b class="chiffre cyan">%s %s</b>, fixé par %s.' % (
+                  'Prix d’achat :' if P.get('prix_publiable') else 'Prix si le pari est réactivé :', fplafond(prix), esc(dev),
+                  esc(P.get('contrainte') or 'n.d.'))]
+    vf = P.get('v_fut')
+    pile = ('%s %%' % fr(100 * (vf / cours - 1), 0, True)) if (num(vf) and num(cours) and cours > 0) else 'n.d.'
+    face = ('%s %%' % fr(P['cap'] - 100, 0)) if num(P.get('cap')) else 'n.d.'
+    etapes = []
+    A_ = R.get('action') or {}
+    if A_.get('ordre') or A_.get('pourquoi'):
+        etapes.append(esc(_phrase(A_.get('ordre') or A_.get('pourquoi'))))
+    rdv = A_.get('rdv') or G(D, 'verdict.suivi_date')
+    if rdv:
+        etapes.append('Prochain point le <b>%s</b> : relis les trois portes avec les nouveaux comptes.' % esc(rdv))
+    etapes.append('Tu sors si une porte anti-story saute : trésorerie sous %s ans, dilution au-dessus de %s %%/an, '
+                  'ou %s baisses de marge brute d’affilée.' % (fr(PARI_RUNWAY_MIN, 0), fr(PARI_DILUTION_MAX, 0), PARI_MB_BAISSES))
+    rc.update(type='PARI', etiquette=etiq, couleur=coul, titre=titre, q2=(q2, q2c, t2),
+              q3=('Beaucoup si l’histoire se réalise, beaucoup si elle rate.', 'orange', []),
+              pile=(pile, 'en %s ans si le scénario central se réalise (CA, marge et PER matures).' % P.get('H', PARI_HORIZON)),
+              face=(face, 'si le pari échoue : il ne reste que la trésorerie et 1 fois le CA (convention de casse). Ce n’est pas une perte maximale.'),
+              action=ACTIONS_HUMAINES.get(A_.get('act'), _phrase(str(A_.get('act') or '').lower())), etapes=etapes[:3], q3_apres='')
 
 
 def regle_html(D, R):
@@ -6290,15 +6393,23 @@ def stations_b(D, R):
 
 def sommaire_rail(stations, voie, action):
     feu = sum(s['etat'] is True for s in stations)
-    etat = ('LE TRAJET DU DOSSIER · VOIE A · %s FEUX SUR 4' % feu if voie == 'A' else
-            '🔀 BIFURCATION VERS LA VOIE B · %s FEUX SUR 5' % feu if voie == 'B' else
+    pari = any(s['cle'] == 'pari' for s in stations)  # V26.5
+    etat = ('LE TRAJET DU DOSSIER · VOIE A · %s FEUX SUR %s' % (feu, len(stations)) if voie == 'A' else
+            '🔀 BIFURCATION VERS LA VOIE B · %s FEUX SUR %s' % (feu, len(stations)) if voie == 'B' else
+            'LE TRAJET DU DOSSIER · 🚀 MODULE PARI' if pari else
             'LE TRAJET DU DOSSIER · ARRÊT À LA QUALITÉ')
+    if pari and voie in ('A', 'B'):
+        etat += ' · 🚀 MODULE PARI'
     niv = action.get('lvl')
     c = {1: 'rouge', 2: 'rouge', 3: 'orange', 4: 'jaune', 5: 'vert', 6: 'vert'}.get(niv, 'gris')
     act = action.get('act') or ''
     valeur = 'Fin' if voie == 'fin' else act.split(' ', 1)[0].rstrip(',').capitalize()
     if act == 'NE PAS ACHETER' and voie != 'fin':
         valeur = 'Écarter'
+    if pari:  # V26.5 : la dernière station affiche la consigne du pari, pas « Fin »
+        valeur = next((v for k, v in (('NE PAS ACHETER', 'Écarter'), ('PAS DE PLACE', 'Pas de place'), ('ACHETER', 'Acheter'),
+                                      ('ATTENDRE', 'Attendre'), ('SORTIR', 'Sortir'), ('RENFORCER', 'Renforcer'),
+                                      ('GARDER', 'Garder'), ('VÉRIFIER', 'Vérifier'), ('DOCUMENTER', 'Documenter')) if act.startswith(k)), valeur)
     finale = dict(cle='decision', titre='Conclusion', icone='🧭', valeur=valeur, couleur=c)
     liens = ''.join('<a class="rail-lien rail-%s" href="#%s"><span class="rail-rond" aria-hidden="true">%s</span>'
                     '<b>%s</b><span>%s</span></a>' %
@@ -6680,6 +6791,614 @@ body{background:#000;color:#f2f7f8;overflow-wrap:anywhere}
 """
 
 
+# ------------------------------------------------------------------ V26.5 : module pré-rentabilité « 🚀 Le pari »
+# Déclenché automatiquement quand le BPA de base est négatif ou nul (ou par pari.actif = true).
+# Il mesure la FORCE DU PARI sur des preuves (7 piliers, /100), applique 3 portes anti-story,
+# sépare le cours en « réel » et « pari ». Le prix d'achat retient la plus basse des deux bornes :
+# le plafond de la part de pari et le prix au rendement net exigé.
+# Les seuils sont ici ET dans le fichier A (§12quinquies) : ne jamais modifier l'un sans l'autre.
+PARI_PALIERS = ((80.0, 70.0, 'RÉVOLUTION EN COURS', 'vert'), (65.0, 50.0, 'PARI SÉRIEUX', 'jaune'),
+                (50.0, 30.0, 'PARI FRAGILE', 'orange'))   # (force mini, part de pari max %, libellé, couleur)
+PARI_MARGE_MATURE = 15.0     # marge nette de maturité si la marge brute est inconnue, % du CA
+PARI_MARGE_DE_MB = 0.35      # V26.5 : marge nette mature par défaut = marge brute × 0,35 ...
+PARI_MARGE_BORNES = (8.0, 25.0)  # ... bornée entre 8 et 25 % (un hardware à 30 % de marge brute ne fera pas 15 % net)
+PARI_PER_MATURE = 25.0       # PER de maturité par défaut
+PARI_HORIZON = 5             # années du calcul inversé et du rendement indicatif
+PARI_DILUTION_HYP = 3.0      # dilution annuelle supposée dans le calcul inversé, %
+PARI_CA_CASSE = 1.0          # V26.5 : capital préservé si le pari échoue = (trésorerie nette + 1 × CA) / actions (convention E)
+PARI_RUNWAY_MIN = 2.0        # porte : années de trésorerie au moins
+PARI_DILUTION_MAX = 15.0     # porte : dilution annuelle au plus, %
+PARI_MB_BAISSES = 3          # porte : baisses consécutives de marge brute qui suspendent le pari
+PARI_ACCELERATEUR = (10.0, 3)  # V26.5 : bloc 🚀 Accélérateur de la Partition (cible %, places) qui héberge la poche
+PARI_LIGNES_MAX = 2          # lignes de la poche au plus, sur les 3 places de l'Accélérateur
+PARI_TAILLE = 2.5            # taille d'une ligne, % du portefeuille (demi-taille)
+PARI_PERTE_TEST = 60.0       # perte de test sur une ligne, % (coût pour le portefeuille affiché)
+PARI_PILIERS_MIN = 5         # piliers documentés au moins pour conclure
+PARI_PILIERS = (('croissance', 'Croissance du chiffre d’affaires', '📈', 20),
+                ('techno', 'Avance technologique prouvée', '🔬', 15),
+                ('demande', 'Qualité de la demande', '🤝', 10),
+                ('rentab', 'Chemin vers la rentabilité', '⚙️', 20),
+                ('autonomie', 'Autonomie financière', '🏦', 15),
+                ('direction', 'Direction alignée', '👤', 10),
+                ('mission', 'Mission et marché', '🌍', 10))
+PARI_VOIES_REGISTRE = ('pari', 'c', 'voie c', 'poche pari')
+
+
+def _pv(p, k):
+    """Valeur numérique d'un champ du bloc pari (format compact accepté), sinon None."""
+    x = vv(p.get(k)) if isinstance(p, dict) else None
+    return x if num(x) else None
+
+
+def _pliste(p, k):
+    x = p.get(k) if isinstance(p, dict) else None
+    return x if isinstance(x, list) else []
+
+
+def pari_declenche(D):
+    p = D.get('pari')
+    if isinstance(p, dict) and p.get('actif') is False:
+        return False, ''
+    # V26.5 : le BPA normalisé fait foi ; le publié ne sert que si le normalisé manque.
+    # Une perte ponctuelle (dépréciation, amende) chez une société rentable ne bascule donc pas dans le pari.
+    if isinstance(p, dict) and p.get('actif') is True:
+        return True, 'activé dans le JSON (pari.actif)'
+    metrique = _sans_accent(vv(G(D, 'valo.metrique'))).strip()
+    if metrique and not any(x in metrique for x in ('bpa', 'eps', 'benefice')):
+        return False, ''
+    k = 'base_normalisee' if num(vv(G(D, 'valo.base_normalisee'))) else 'base_publiee'
+    b = vv(G(D, 'valo.' + k))
+    if num(b) and b <= 0:
+        return True, 'BPA de base ≤ 0 (valo.%s = %s)' % (k, fr(b, 2))
+    return False, ''
+
+
+def _pari_preuves(p, cle, limite, date_eval, faits):
+    preuves = []
+    for entree in _pliste(p, cle):
+        if not (isinstance(entree, list) and len(entree) >= 2
+                and all(isinstance(x, str) and x.strip() for x in entree[:2])):
+            continue
+        fait, date = (x.strip() for x in entree[:2])
+        if re.fullmatch(r'\d{1,2}/\d{4}', date):
+            date = '01/' + date
+        date_preuve = _date(date) if len(date) > 7 else None
+        identite = ' '.join(_sans_accent(fait).split()).rstrip('.')
+        if date_preuve and (not date_eval or date_preuve <= date_eval) and identite not in faits:
+            faits.add(identite)
+            preuves.append(fait)
+            if len(preuves) == limite:
+                break
+    return preuves
+
+
+def _pari_piliers(p, date_eval):
+    """Chaque pilier rend (points ou None si non documenté, maximum, justification)."""
+    out, faits = {}, set()
+    go, gp, gprec = _pv(p, 'croissance_ca_organique_pct'), _pv(p, 'croissance_ca_publiee_pct'), _pv(p, 'croissance_ca_organique_prec_pct')
+    g = go if num(go) else gp
+    # 📈 Croissance du CA /20 : organique de préférence ; publiée seule = plafond 15 (un rachat n'est pas une preuve)
+    if num(g):
+        s = 20 if g >= 40 else 15 if g >= 30 else 10 if g >= 20 else 5 if g >= 10 else 0
+        why = ['%s %s %%' % ('organique' if num(go) else 'publiée', fr(g, 0, True))]
+        if num(go) and num(gprec):
+            d = go - gprec
+            s += 2 if d >= 5 else -2 if d <= -5 else 0
+            why.append('accélère' if d >= 5 else 'ralentit' if d <= -5 else 'rythme stable')
+        if not num(go):
+            s = min(s, 15)
+            why.append('organique non publiée : plafond 15')
+        out['croissance'] = (max(0, min(20, s)), 20, ' · '.join(why))
+    else:
+        out['croissance'] = (None, 20, 'croissance du CA non renseignée')
+    # 🔬 Avance technologique /15 : niveau et tendance de la marge brute, preuves de victoire commerciale
+    mb = [vv(y) for y in _pliste(p, 'marge_brute_trim')]
+    niv = mb[-1] if mb and num(mb[-1]) else _pv(p, 'marge_brute_pct')
+    tend = _pv(p, 'marge_brute_yoy_pts')
+    if not num(tend) and len(mb) >= 5 and num(mb[-1]) and num(mb[-5]):
+        tend = mb[-1] - mb[-5]
+    preuves = _pari_preuves(p, 'preuves_techno', 3, date_eval, faits)
+    if num(niv) or preuves:
+        s, why = 0, []
+        if num(niv):
+            s += 8 if niv >= 60 else 6 if niv >= 50 else 4 if niv >= 40 else 2 if niv >= 30 else 0
+            why.append('marge brute %s %%' % fr(niv, 0))
+        if num(tend):
+            s += 4 if tend >= 2 else 2 if tend > -2 else 0
+            why.append('en hausse' if tend >= 2 else 'stable' if tend > -2 else 'en baisse')
+        s += min(3, len(preuves))
+        if preuves:
+            why.append('%s preuve%s de victoire' % (min(3, len(preuves)), 's' if len(preuves) > 1 else ''))
+        out['techno'] = (min(15, s), 15, ' · '.join(why))
+    else:
+        out['techno'] = (None, 15, 'marge brute et preuves non renseignées')
+    # 🤝 Qualité de la demande /10 : rétention nette, carnet, concentration, preuves de demande
+    nrr, carnet, top = _pv(p, 'retention_nette_pct'), _pv(p, 'carnet_mois'), _pv(p, 'top_client_pct')
+    pdem = _pari_preuves(p, 'preuves_demande', 2, date_eval, faits)
+    if any(num(x) for x in (nrr, carnet, top)) or pdem:
+        s, why = 0, []
+        if num(nrr):
+            s += 4 if nrr >= 120 else 3 if nrr >= 110 else 2 if nrr >= 100 else 0
+            why.append('rétention nette %s %%' % fr(nrr, 0))
+        if num(carnet):
+            s += 3 if carnet >= 12 else 2 if carnet >= 6 else 1 if carnet > 0 else 0
+            why.append('carnet %s mois' % fr(carnet, 0))
+        if num(top):
+            s += 1 if top <= 10 else 0
+            why.append('1er client %s %% du CA' % fr(top, 0))
+        s += min(2, len(pdem))
+        if pdem:
+            why.append(_premiere_phrase(pdem[0], 70))
+        out['demande'] = (min(10, s), 10, ' · '.join(why))
+    else:
+        out['demande'] = (None, 10, 'rétention, carnet et preuves de demande non renseignés')
+    # ⚙️ Chemin vers la rentabilité /20 : règle des 40 et levier opérationnel
+    mfcf, gch = _pv(p, 'marge_fcf_pct'), _pv(p, 'croissance_charges_pct')
+    if num(g) and (num(mfcf) or num(gch)):
+        s, why = 0, []
+        if num(mfcf):
+            r40 = g + mfcf
+            s += 12 if r40 >= 40 else 9 if r40 >= 30 else 6 if r40 >= 20 else 3 if r40 >= 10 else 0
+            why.append('règle des 40 ≈ %s %%' % fr(r40, 0))
+        if num(gch):
+            lev = (gp if num(gp) else g) - gch
+            s += 8 if lev >= 20 else 6 if lev >= 10 else 3 if lev >= 0 else 0
+            why.append('charges %s %% contre CA %s %%' % (fr(gch, 0, True), fr(gp if num(gp) else g, 0, True)))
+        out['rentab'] = (min(20, s), 20, ' · '.join(why))
+    else:
+        out['rentab'] = (None, 20, 'marge FCF et croissance des charges non renseignées')
+    # 🏦 Autonomie financière /15 : années de trésorerie et dilution
+    tn, burn, dil = _pv(p, 'tresorerie_nette_m'), _pv(p, 'consommation_cash_m'), _pv(p, 'dilution_pct')
+    runway = None
+    if num(burn) and burn <= 0:
+        runway = float('inf')
+    elif num(tn) and num(burn) and burn > 0:
+        runway = max(0.0, tn) / burn
+    if runway is not None or num(dil):
+        s, why = 0, []
+        if runway is not None:
+            s += 9 if runway == float('inf') else 8 if runway >= 5 else 6 if runway >= 3 else 3 if runway >= 2 else 0
+            why.append('génère déjà du cash' if runway == float('inf') else '%s ans de trésorerie' % fr(runway, 1))
+        if num(dil):
+            s += 6 if dil <= 2 else 4 if dil <= 5 else 2 if dil <= 10 else 0
+            why.append('%s %% d’actions en un an' % fr(dil, 0, True))
+        out['autonomie'] = (min(15, s), 15, ' · '.join(why))
+    else:
+        out['autonomie'] = (None, 15, 'trésorerie, consommation de cash et dilution non renseignées')
+    # 👤 Direction alignée /10 : fondateur, détention des initiés, rémunération en actions
+    fond, ini, sbc = p.get('fondateur') if isinstance(p, dict) else None, _pv(p, 'inities_pct'), _pv(p, 'sbc_pct_ca')
+    if isinstance(fond, bool) or num(ini) or num(sbc):
+        s, why = 0, []
+        if fond is True:
+            s += 3
+            why.append('fondateur aux commandes')
+        elif fond is False:
+            why.append('pas de fondateur aux commandes')
+        if num(ini):
+            s += 4 if ini >= 10 else 2 if ini >= 3 else 1 if ini >= 1 else 0
+            why.append('initiés %s %% du capital' % fr(ini, 1))
+        if num(sbc):
+            s += 3 if sbc <= 5 else 2 if sbc <= 10 else 1 if sbc <= 20 else 0
+            why.append('rémunération en actions %s %% du CA' % fr(sbc, 0))
+        out['direction'] = (min(10, s), 10, ' · '.join(why))
+    else:
+        out['direction'] = (None, 10, 'direction non renseignée')
+    # 🌍 Mission et marché /10 : seul jugement écrit, plafonné, sans effet sans justification
+    m = p.get('mission') if isinstance(p, dict) else None
+    ms, mt = (m + [None, ''])[:2] if isinstance(m, list) else (None, '')
+    if num(ms) and isinstance(mt, str) and mt.strip():
+        out['mission'] = (max(0, min(10, ms)), 10, _premiere_phrase(mt, 110))
+    elif num(ms):
+        out['mission'] = (None, 10, 'note sans justification écrite : 0 point')
+        warn('Pari : mission notée sans justification (pari.mission = [note, texte]) : 0 point.')
+    else:
+        out['mission'] = (None, 10, 'mission non renseignée')
+    return out, runway, mb
+
+
+def calc_pari(D, R):
+    actif, motif = pari_declenche(D)
+    if not actif:
+        return
+    p = D.get('pari')
+    if not isinstance(p, dict) or not p:
+        R['pari'] = {'actif': True, 'motif': motif, 'statut': 'À DOCUMENTER', 'lvl': 'gris', 'vide': True}
+        warn('Module pari déclenché (%s) mais bloc « pari » absent : renseigner pari (§12quinquies).' % motif)
+        chk('Module pari (V26.5)', 'échec', 'bloc pari absent')
+        return
+    pil, runway, mb = _pari_piliers(p, _date(G(D, 'meta.date_eval')))
+    docs = [k for k, (s, _, _) in pil.items() if s is not None]
+    force = float(sum(s for s, _, _ in pil.values() if s is not None))
+    palier = next((x for x in PARI_PALIERS if force >= x[0]), None)
+    plafond = palier[1] if palier else None
+    # --- portes anti-story
+    dil = _pv(p, 'dilution_pct')
+    g_tres = None if runway is None else (runway >= PARI_RUNWAY_MIN)
+    g_dil = None if not num(dil) else (dil <= PARI_DILUTION_MAX)
+    fin = mb[-(PARI_MB_BAISSES + 1):]
+    if len(fin) == PARI_MB_BAISSES + 1 and all(num(x) for x in fin):
+        g_mb = not all(fin[i + 1] < fin[i] for i in range(PARI_MB_BAISSES))
+    else:
+        g_mb = None
+    portes_p = [('Trésorerie', '≥ %s ans' % fr(PARI_RUNWAY_MIN, 0), g_tres,
+                 'génère du cash' if runway == float('inf') else ('%s ans' % fr(runway, 1)) if runway is not None else 'n.d.'),
+                ('Dilution annuelle', '≤ %s %%' % fr(PARI_DILUTION_MAX, 0), g_dil, ('%s %%' % fr(dil, 0, True)) if num(dil) else 'n.d.'),
+                ('Marge brute', 'pas %s baisses d’affilée' % PARI_MB_BAISSES, g_mb,
+                 ' → '.join(('%s %%' % fr(x, 1)) if num(x) else 'n.d.' for x in fin) or 'n.d.')]
+    if g_mb is None:
+        warn('Pari : série de marge brute incomplète (pari.marge_brute_trim, 4 derniers trimestres consécutifs) : porte non vérifiée.')
+    # --- réel / pari, calcul inversé, rendement net
+    meta = D.get('meta') or {}
+    cours = vv(meta.get('cours'))
+    tx = R.get('tx') if num(R.get('tx')) else TX_BASE  # V26.5 : taux exigé calculé par le moteur (taille, droits, fiabilité, initiés)
+    ca, nb, tn = _pv(p, 'ca_ttm_m'), _pv(p, 'actions_m'), _pv(p, 'tresorerie_nette_m')
+    mb_niv = mb[-1] if mb and num(mb[-1]) else _pv(p, 'marge_brute_pct')
+    if vv(p.get('marge_nette_mature_pct')) is not None:
+        marge, marge_src = _pv(p, 'marge_nette_mature_pct'), 'déclarée'
+    elif num(mb_niv):  # V26.5 : la marge mature suit la marge brute (un hardware ne vise pas la marge d'un logiciel)
+        marge = max(PARI_MARGE_BORNES[0], min(PARI_MARGE_BORNES[1], mb_niv * PARI_MARGE_DE_MB))
+        marge_src = 'marge brute %s %% × %s' % (fr(mb_niv, 0), fr(PARI_MARGE_DE_MB, 2))
+    else:
+        marge, marge_src = PARI_MARGE_MATURE, 'défaut (marge brute inconnue)'
+    per = PARI_PER_MATURE if vv(p.get('per_mature')) is None else _pv(p, 'per_mature')
+    dh = PARI_DILUTION_HYP if vv(p.get('dilution_hyp_pct')) is None else _pv(p, 'dilution_hyp_pct')
+    H = PARI_HORIZON
+    valo_ = D.get('valo') or {}
+    fa = (valo_.get('frais_achat_pct') or 0) / 100.0
+    fv = (valo_.get('frais_vente_pct') or 0) / 100.0
+
+    def rdt_net(P_, v_):
+        """V26.5 : rendement annuel NET (TOB à l'achat et à la vente, plus-value 10 %), comme le reste du moteur."""
+        if not (num(P_) and P_ > 0 and num(v_) and v_ > 0):
+            return None
+        ent = P_ * (1 + TOB + fa)
+        sor = v_ - TAX_PV * max(v_ - P_, 0.0) - v_ * (TOB + fv)
+        return 100.0 * ((sor / ent) ** (1.0 / H) - 1) if sor > 0 else -100.0
+
+    reel = part = prix = prix_plafond = prix_taux = g_exige = rdt_cours = rdt_prix = cap = cap_prix = v_fut = casse = None
+    contrainte = ''
+    cours_valide = num(cours) and cours > 0 and not R.get('unites_suspectes')
+    donnees_valides = num(ca) and ca > 0 and num(nb) and nb > 0 and num(tn)
+    hypotheses_valides = num(marge) and 0 < marge <= 100 and num(per) and per > 0 and num(dh) and dh > -100
+    # Avec un taux positif et des frais non négatifs, la cible exige une plus-value.
+    # Inverser rdt_net donne le même facteur pour le prix au taux et le CA exigé au cours.
+    coef_vente = 1 - TOB - fv - TAX_PV
+    coef_achat = (1 + TOB + fa) * (1 + tx / 100.0) ** H - TAX_PV
+    if donnees_valides and hypotheses_valides and fa >= 0 and fv >= 0 and coef_vente > 0:
+        dilution = (1 + dh / 100.0) ** H
+        valorisation_ca = marge / 100.0 * per
+        reel = (ca * valorisation_ca + tn) / nb
+        casse = max(0.0, (tn + PARI_CA_CASSE * ca) / nb)
+        if cours_valide:
+            part = 100.0 * (1 - reel / cours)
+            cap = min(100.0, 100.0 * casse / cours)
+            ca_req = max(0.0, cours * coef_achat / coef_vente * nb * dilution - tn) / valorisation_ca
+            g_exige = 100.0 * ((ca_req / ca) ** (1.0 / H) - 1)
+        if num(plafond) and reel > 0:
+            prix_plafond = reel / (1 - plafond / 100.0)
+        gc = _pv(p, 'croissance_ca_centrale_pct')
+        if num(gc) and gc >= -100:
+            v_fut = (ca * (1 + gc / 100.0) ** H * valorisation_ca + tn) / (nb * dilution)
+            if num(v_fut) and v_fut > 0:
+                prix_taux = v_fut * coef_vente / coef_achat
+                if cours_valide:
+                    rdt_cours = rdt_net(cours, v_fut)
+        else:
+            warn('Pari : croissance centrale du CA absente ou invalide (pari.croissance_ca_centrale_pct).')
+        if num(prix_plafond) and prix_plafond > 0 and num(prix_taux) and prix_taux > 0:
+            prix, contrainte = min((prix_plafond, 'plafond de pari'), (prix_taux, 'rendement au taux exigé'))
+            if cours_valide and math.isclose(prix, cours, rel_tol=1e-14):
+                prix = cours  # Annule l'écart numérique de l'aller-retour cours → croissance → prix.
+            rdt_prix = rdt_net(prix, v_fut)
+            cap_prix = min(100.0, 100.0 * casse / prix)
+    else:
+        warn('Pari : vérifier le CA, les actions, la trésorerie nette, les frais et les hypothèses de valorisation.')
+    echecs = [nom for nom, _, ok, _ in portes_p if ok is False]
+    manques = [nom for nom, _, ok, _ in portes_p if ok is None]
+    if echecs:
+        statut, lvl, lab = 'PARI SUSPENDU', 'orange', 'porte anti-story fermée : ' + ', '.join(echecs)
+    elif len(docs) < PARI_PILIERS_MIN:
+        statut, lvl, lab = 'À DOCUMENTER', 'gris', '%s piliers documentés sur 7 : force provisoire' % len(docs)
+    elif manques:
+        statut, lvl, lab = 'À DOCUMENTER', 'gris', 'porte non vérifiée : ' + ', '.join(manques)
+    elif palier is None:
+        statut, lvl, lab = 'STORY — PAS ÉLIGIBLE', 'rouge', 'force sous 50 : l’histoire dépasse les preuves'
+    elif not cours_valide or not num(prix):
+        statut, lvl, lab = 'À DOCUMENTER', 'gris', 'cours invalide ou l’une des deux bornes de prix non calculable'
+    elif cours <= prix:
+        statut, lvl, lab = 'PARI OUVERT', 'vert', 'le cours est sous le prix d’achat'
+    else:
+        statut, lvl, lab = 'PARI VALIDE — ATTENDRE LE PRIX', 'jaune', 'force suffisante, cours trop cher'
+    reac = []
+    if g_dil is False:
+        reac.append('dilution au plus à %s %%/an sur 4 trimestres glissants' % fr(PARI_DILUTION_MAX, 0))
+    if g_tres is False:
+        reac.append('trésorerie d’au moins %s ans (financement sécurisé)' % fr(PARI_RUNWAY_MIN, 0))
+    if g_mb is False:
+        reac.append('marge brute qui remonte sur un trimestre')
+    if palier is None and len(docs) >= PARI_PILIERS_MIN:
+        reac.append('force du pari d’au moins 50/100, sur preuves publiées')
+    if isinstance(p.get('reactivation'), str) and p['reactivation'].strip():
+        reac.append(p['reactivation'].strip().rstrip('.'))
+    R['pari'] = dict(actif=True, motif=motif, piliers=pil, docs=len(docs), force=force,
+                     palier=(palier[2] if palier else 'STORY'), couleur_force=(palier[3] if palier else 'rouge'),
+                     plafond=plafond, portes=portes_p, reel=reel, part=part, prix=prix, g_exige=g_exige,
+                     g_realisee=_pv(p, 'croissance_ca_publiee_pct'), g_org=_pv(p, 'croissance_ca_organique_pct'),
+                     rdt_cours=rdt_cours, rdt_prix=rdt_prix, cap=cap, cap_prix=cap_prix, casse=casse, statut=statut, lvl=lvl, lab=lab,
+                     reactivation=reac, marge=marge, marge_src=marge_src, per=per, dh=dh, H=H, tx=tx,
+                     prix_plafond=prix_plafond, prix_taux=prix_taux, contrainte=contrainte, v_fut=v_fut,
+                     prix_publiable=statut in ('PARI OUVERT', 'PARI VALIDE — ATTENDRE LE PRIX'))
+    chk('Module pari (V26.5)', 'validé' if statut not in ('À DOCUMENTER',) else 'alerte',
+        'force %s/100 · %s · %s piliers documentés' % (fr(force, 0), statut.lower(), len(docs)))
+
+
+def appliquer_pari(D, R):
+    """Le module fixe la consigne, le prix d'achat, le rendement au cours et le capital préservé
+    des sociétés sans bénéfice. La valorisation Voie A reste lisible « pour mémoire »."""
+    P = R.get('pari') or {}
+    if not P.get('actif'):
+        return
+    A = R.setdefault('action', {})
+    for k, d in (('voie_b', ''), ('pos', None), ('rdv', ''), ('rdv_txt', ''), ('voyants', []), ('plan_tactique', ''),
+                 ('dossier_a_corriger', False), ('cours_invalide', False)):
+        A.setdefault(k, d)
+    det = bool(R.get('detenue'))
+    A['detenue'] = det
+    st = P.get('statut')
+    dev = G(D, 'meta.devise') or ''
+    pf = R.get('pf') or {}
+    if pf.get('tactique_ligne'):
+        P['prix_publiable'] = False
+        return
+    ligne = pf.get('ligne') or {}
+    pos = _nb(ligne.get('poids_pct'))
+    n_poche = pf.get('pari')
+    prix_txt = '%s %s' % (fplafond(P.get('prix')), dev)
+    ordre = ''
+    vf = str(R.get('verdict_final') or '').upper()
+    rejet = vf.startswith(('REJET', 'HORS PÉRIMÈTRE', 'HORS PERIMETRE'))
+    garde_fou = ''
+    if str(G(D, 'meta.fiabilite') or '').upper().startswith('D'):
+        garde_fou = 'fiabilité D'
+    elif R.get('guidance_cas') in ('VETO ACTIF', 'IMPACT NON BORNABLE'):
+        garde_fou = 'veto de guidance actif'
+    elif num(R.get('tx_brut')) and R['tx_brut'] > TX_MAX + 1e-9:
+        garde_fou = 'taux exigé brut au-dessus de la limite du moteur'
+    if rejet:
+        act, lvl, pq = ('VENDRE' if det else 'NE PAS ACHETER'), 2, vf
+    elif garde_fou and st not in ('PARI SUSPENDU', 'STORY — PAS ÉLIGIBLE'):
+        act = 'GARDER SOUS SURVEILLANCE' if det else 'DOCUMENTER AVANT D’ACHETER'
+        lvl, pq = 'gris', garde_fou
+    elif det:
+        if st in ('PARI SUSPENDU', 'STORY — PAS ÉLIGIBLE'):
+            act, lvl = 'SORTIR (PARI)', 2
+            pq = 'règle de la poche : sortie quand une porte anti-story saute' if st == 'PARI SUSPENDU' else 'la force du pari est passée sous 50'
+        elif st == 'PARI OUVERT':
+            if n_poche is None or _sans_accent(ligne.get('voie')).strip() not in PARI_VOIES_REGISTRE or not (num(pos) and 0 < pos <= 100):
+                act, lvl, pq = 'VÉRIFIER LE REGISTRE', 'gris', 'places ou poids de la ligne pari non vérifiés'
+            elif n_poche > PARI_LIGNES_MAX:
+                act, lvl, pq = 'PAS DE PLACE DANS LA POCHE PARI', 3, 'la poche dépasse deux lignes'
+            elif pos >= PARI_TAILLE:
+                act, lvl, pq = 'GARDER — TAILLE ATTEINTE', 4, 'ligne déjà à %s %% (taille de la poche : %s %%)' % (fr(pos, 1), fr(PARI_TAILLE, 1))
+            else:
+                act, lvl, pq = 'RENFORCER (POCHE PARI)', 5, 'cours sous le prix d’achat du pari'
+                ordre = 'une tranche au plus, jusqu’à %s %% du portefeuille au total et à %s maximum' % (fr(PARI_TAILLE, 1), prix_txt)
+        elif st == 'PARI VALIDE — ATTENDRE LE PRIX':
+            act, lvl, pq = 'GARDER, NE PAS RENFORCER', 4, 'pari valide, mais le cours dépasse le prix d’achat (%s)' % prix_txt
+        else:
+            act, lvl, pq = 'GARDER SOUS SURVEILLANCE', 'gris', P.get('lab') or 'pari à documenter'
+    else:
+        if st == 'PARI OUVERT':
+            if n_poche is None:
+                act, lvl, pq = 'VÉRIFIER LE REGISTRE', 'gris', 'places de la poche non vérifiées'
+            elif n_poche >= PARI_LIGNES_MAX:
+                act, lvl, pq = 'PAS DE PLACE DANS LA POCHE PARI', 3, '%s lignes pari déjà en portefeuille (maximum %s)' % (n_poche, PARI_LIGNES_MAX)
+            else:
+                act, lvl, pq = 'ACHETER (POCHE PARI)', 5, 'force %s/100 et cours sous le prix d’achat' % fr(P.get('force'), 0)
+                ordre = 'tranche 1 sur 3 au plus à %s · ligne de %s %% au plus' % (prix_txt, fr(PARI_TAILLE, 1))
+        elif st == 'PARI VALIDE — ATTENDRE LE PRIX':
+            act, lvl, pq = 'ATTENDRE LE PRIX (POCHE PARI)', 4, 'pari valide, cours au-dessus du prix d’achat'
+            ordre = 'alerte à %s' % prix_txt
+        elif st == 'PARI SUSPENDU':
+            act, lvl, pq = 'NE PAS ACHETER (PARI SUSPENDU)', 2, P.get('lab') or 'une porte anti-story saute'
+            if num(P.get('prix')):
+                ordre = 'réexaminer si la porte se rouvre · prix si réactivé %s' % prix_txt
+        elif st == 'STORY — PAS ÉLIGIBLE':
+            act, lvl, pq = 'NE PAS ACHETER (STORY)', 2, 'force du pari sous 50 : pas éligible à la poche'
+        else:
+            act, lvl, pq = 'DOCUMENTER AVANT D’ACHETER', 'gris', P.get('lab') or 'pari à documenter'
+    A.update(act=act, lvl=lvl, pourquoi=pq, ordre=ordre, voie_b='',
+             dossier_a_corriger=bool(A.get('cours_invalide')))
+    if rejet or garde_fou:  # registre ou place manquants : la consigne change, le prix de l'action reste publié
+        P['prix_publiable'] = False
+    # V26.5 : pari suspendu ou story -> aucun prix dans la ligne NICO (le dossier l'affiche comme « prix si réactivé »)
+    R['PA'] = P['prix'] if (P.get('prix_publiable') and num(P.get('prix'))) else None
+    R['retenu'] = P.get('rdt_cours') if num(P.get('rdt_cours')) else None
+    R['cap_cours'] = P.get('cap') if num(P.get('cap')) else None
+    R['cap_PA'] = P.get('cap_prix') if (R['PA'] is not None and num(P.get('cap_prix'))) else None
+    R['niv_retenu'] = L_RDT_TX(R['retenu'], R.get('tx'))
+    R['niv_cap'] = L_CAP(R['cap_cours'])
+    # le taux exigé n'est PAS écrasé : c'est celui du moteur, seuil de la ligne NICO
+    statut_t = ('actionnable' if act in ('ACHETER (POCHE PARI)', 'RENFORCER (POCHE PARI)') else
+                'conditionnel' if act == 'ATTENDRE LE PRIX (POCHE PARI)' else 'sans objet')
+    R['taille'] = {'limites': [('poche pari (demi-taille)', PARI_TAILLE)], 'max': PARI_TAILLE, 'contrainte': 'poche pari (demi-taille)',
+                   'provisoire': False, 'statut': statut_t}
+    R['tranches'] = '1/3 – 1/3 – 1/3'
+    R['tranche1'] = 'au plus au prix d’achat du pari ; sortie si une porte anti-story saute'
+    chk('Consigne fixée par le module pari (V26.5)', 'validé', act)
+
+
+def _pari_barre(lab, why, s, mx, icone):
+    if s is None:
+        return ('<div class="pm-pil"><span class="pm-n">%s %s</span><span class="pm-v">n.d. / %s</span>'
+                '<div class="pm-bar"><i style="width:0"></i></div><span class="pm-why">%s</span></div>') % (icone, esc(lab), mx, esc(why))
+    pct = 100.0 * s / mx if mx else 0
+    c = 'vert' if pct >= 70 else 'jaune' if pct >= 50 else 'orange' if pct >= 30 else 'rouge'
+    return ('<div class="pm-pil"><span class="pm-n">%s %s</span><span class="pm-v">%s / %s</span>'
+            '<div class="pm-bar"><i style="width:%s%%;background:var(--rail-%s)"></i></div><span class="pm-why">%s</span></div>') % (
+        icone, esc(lab), fr(s, 0), mx, fr(pct, 0).replace(' ', ''), c, esc(why))
+
+
+def pari_station(D, R):
+    P = R.get('pari') or {}
+    if not P.get('actif'):
+        return None
+    dev = G(D, 'meta.devise') or ''
+    cours = vv(G(D, 'meta.cours'))
+    coul = {'vert': 'vert', 'jaune': 'jaune', 'orange': 'orange', 'rouge': 'rouge'}.get(P.get('lvl'), 'gris')
+    etat = True if P.get('statut') == 'PARI OUVERT' and P.get('prix_publiable') else False if P.get('statut') in ('PARI SUSPENDU', 'STORY — PAS ÉLIGIBLE') else None
+    if P.get('vide'):
+        return station('pari', 'Le Pari', '🚀', 'Le pari vaut-il d’être tenté ?', 'n.d.', 'Le bloc pari reste à renseigner.', None, 'gris',
+                       'Sans preuves, pas de pari. Passons à la décision.',
+                       '<p>Le module s’est déclenché (%s), mais le bloc <b>pari</b> du JSON est vide.</p>' % esc(P.get('motif')))
+    force = P.get('force') or 0
+    cf = P.get('couleur_force') or 'rouge'
+    dash = 439.8 * max(0.0, min(100.0, force)) / 100.0
+    jauge = ('<svg viewBox="0 0 180 180" width="190" height="190" role="img" aria-label="Force du pari %s sur 100">'
+             '<circle cx="90" cy="90" r="70" fill="none" stroke="#161b20" stroke-width="16"/>'
+             '<circle cx="90" cy="90" r="70" fill="none" stroke="var(--rail-%s)" stroke-width="16" stroke-linecap="round" '
+             'stroke-dasharray="%.1f 439.8" transform="rotate(-90 90 90)"/>'
+             '<text x="90" y="94" text-anchor="middle" font-size="44" font-weight="bold" fill="var(--rail-%s)">%s</text>'
+             '<text x="90" y="120" text-anchor="middle" font-size="14" fill="#8b96a3">/ 100</text></svg>') % (
+        fr(force, 0), cf, dash, cf, fr(force, 0))
+    piliers = ''.join(_pari_barre(lab, P['piliers'][k][2], P['piliers'][k][0], mx, ic) for k, lab, ic, mx in PARI_PILIERS)
+    portes = ''.join('<tr><td>%s</td><td>%s</td><td class="pm-%s">%s %s</td></tr>' % (
+        esc(n), esc(s), 'ok' if ok is True else 'ko' if ok is False else 'nd', '✓' if ok is True else '✕' if ok is False else '○', esc(v))
+        for n, s, ok, v in P['portes'])
+    reel, part, cap_txt = P.get('reel'), P.get('part'), ''
+    if num(reel) and num(cours) and cours > 0:
+        pr = max(0.0, min(100.0, 100.0 * reel / cours))
+        cap_l = ('<div class="pm-cap" style="left:%s%%"><span>Plafond pour une force %s : %s %% de pari</span></div>' % (
+            fr(100 - P['plafond'], 0), fr(force, 0), fr(P['plafond'], 0))) if num(P.get('plafond')) else ''
+        cap_txt = ('<div class="pm-stack"><div class="pm-r" style="width:%s%%">🧱 Réel %s %s · %s %%</div>'
+                   '<div class="pm-p" style="width:%s%%">Pari %s %s · %s %% 🎈</div>%s</div>'
+                   '<div class="pm-scale"><span>0</span><span>Réel = CA × marge mature %s %% (%s) × PER %s + trésorerie nette</span><span>%s %s</span></div>'
+                   '<p class="sub">%s</p>'
+                   '<div class="pm-leg"><span>🟩 <b>Vert</b> : ce que tu achètes de concret</span>'
+                   '<span>🟪 <b>Violet</b> : l’espoir que tu paies</span>'
+                   '<span>┆ <b>Ligne jaune</b> : l’espoir que les preuves t’autorisent</span></div>') % (
+            fr(pr, 0).replace(' ', ''), fprix(reel), esc(dev), fr(pr, 0), fr(100 - pr, 0).replace(' ', ''),
+            fprix(max(0.0, cours - reel)), esc(dev), fr(max(0.0, part), 0), cap_l, fr(P['marge'], 0), esc(P.get('marge_src') or ''), fr(P['per'], 0), fprix(cours), esc(dev),
+            ('Avec une force de %s, le cours ne doit pas contenir plus de %s %% de pari. Aujourd’hui, il en contient %s %%.' % (
+                fr(force, 0), fr(P['plafond'], 0), fr(max(0.0, part), 0))) if num(P.get('plafond')) else
+            'Force sous 50 : aucune part de pari n’est acceptée.')
+    else:
+        cap_txt = '<p class="sub">Réel et pari non calculables : CA des 12 derniers mois, nombre d’actions ou cours manquant.</p>'
+    ge, gr = P.get('g_exige'), P.get('g_org') if num(P.get('g_org')) else P.get('g_realisee')
+    mxb = max([x for x in (ge, gr) if num(x)] + [1.0])
+    inverse = ('<div class="pm-cmp"><div class="pm-lb"><span>Croissance du CA exigée par le cours (%s ans)</span><b class="pm-ko">%s</b></div>'
+               '<div class="pm-bar pm-gros"><i style="width:%s%%;background:var(--rail-rouge)"></i></div></div>'
+               '<div class="pm-cmp"><div class="pm-lb"><span>Croissance %s sur un an</span><b class="pm-wa">%s</b></div>'
+               '<div class="pm-bar pm-gros"><i style="width:%s%%;background:var(--rail-orange)"></i></div></div>'
+               '<p class="sub">Pour %s %%/an : marge nette %s %% et PER %s dans %s ans, dilution %s %%/an.</p>') % (
+        P['H'], ('%s %%/an' % fr(ge, 1, True)) if num(ge) else 'n.d.',
+        fr(max(0.0, min(100.0, 100.0 * ge / mxb)) if num(ge) else 0, 0).replace(' ', ''),
+        'organique' if num(P.get('g_org')) else 'publiée', ('%s %%' % fr(gr, 0, True)) if num(gr) else 'n.d.',
+        fr(max(0.0, min(100.0, 100.0 * gr / mxb)) if num(gr) else 0, 0).replace(' ', ''),
+        fr(P.get('tx'), 1), fr(P['marge'], 0), fr(P['per'], 0), P['H'], fr(P['dh'], 0))
+    paliers = ''.join('<tr%s><td class="pm-c-%s">%s ≥ %s%s</td><td>%s %%</td><td>%s</td></tr>' % (
+        ' class="pm-hl"' if P.get('palier') == lab else '', c, {'vert': '🟢', 'jaune': '🟡', 'orange': '🟠'}[c], fr(f, 0),
+        ' ◀' if P.get('palier') == lab else '', fr(pm, 0), esc(lab.capitalize())) for f, pm, lab, c in PARI_PALIERS)
+    paliers += '<tr%s><td class="pm-c-rouge">🔴 &lt; 50%s</td><td>—</td><td>Story, pas éligible</td></tr>' % (
+        ' class="pm-hl"' if P.get('palier') == 'STORY' else '', ' ◀' if P.get('palier') == 'STORY' else '')
+    poche = ('<div class="pm-kpi"><div><b>%s lignes</b><span>au plus, sur les %s places du bloc 🚀 Accélérateur (%s %%)</span></div>'
+             '<div><b>½ taille</b><span>%s %% par ligne</span></div><div><b class="pm-ko">%s %%</b><span>du PF si une ligne perd %s %%</span></div>'
+             '<div><b>%s %%</b><span>seuil de la ligne (taux exigé du moteur)</span></div></div>'
+             '<p class="sub">Entrée en 3 tranches · sortie si une porte anti-story saute.</p>') % (
+        PARI_LIGNES_MAX, PARI_ACCELERATEUR[1], fr(PARI_ACCELERATEUR[0], 0), fr(PARI_TAILLE, 1),
+        fr(-PARI_TAILLE * PARI_PERTE_TEST / 100.0, 1), fr(PARI_PERTE_TEST, 0), fr(P.get('tx'), 1))
+    prix = P.get('prix')
+    dist = (100.0 * (prix / cours - 1)) if (num(prix) and num(cours) and cours > 0) else None
+    pub = P.get('prix_publiable')
+    deux = ('<p class="sub">Deux contraintes, on garde la plus basse : plafond de pari %s %s · rendement net de %s %% au central %s %s.</p>' % (
+        fplafond(P.get('prix_plafond')), esc(dev), fr(P.get('tx'), 1), fplafond(P.get('prix_taux')), esc(dev)))
+    chiffres = ('<div class="pm-pr"><div><b class="pm-cy">%s %s</b><span>%s · fixé par le %s</span></div>'
+                '<div><b class="pm-ok">%s</b><span>Rendement central net à ce prix, seuil %s %%</span></div>'
+                '<div><b class="pm-wa">%s</b><span>Distance entre le cours et ce prix</span></div>'
+                '<div><b class="%s">%s</b><span>Capital préservé au cours (scénario de casse estimé)</span></div></div>%s') % (
+        fplafond(prix), esc(dev), 'Prix d’achat' if pub else 'Plafond théorique (hors ligne NICO)',
+        esc(P.get('contrainte') or 'n.d.'),
+        ('≈ %s %%/an' % fr(P.get('rdt_prix'), 1)) if num(P.get('rdt_prix')) else 'n.d.', fr(P.get('tx'), 1),
+        ('%s %%' % fr(dist, 0, True)) if num(dist) else 'n.d.',
+        'pm-ok' if num(P.get('cap')) and P['cap'] >= 70 else 'pm-wa' if num(P.get('cap')) and P['cap'] >= 50 else 'pm-ko',
+        ('%s / 100' % fr(P['cap'], 0)) if num(P.get('cap')) else 'n.d.', deux)
+    reac = ('<p>🔁 <b>Réactivation</b> : %s.</p>' % esc(' ; '.join(P['reactivation']))) if P.get('reactivation') else ''
+    contenu = ('<p class="sub">Module déclenché automatiquement · %s. La force se mesure sur des preuves ; la mission ne pèse que 10 points.</p>'
+               '<div class="pm-grid"><div class="pm-card pm-centre"><h3>💪 Force du pari</h3>%s'
+               '<span class="rail-pill rail-%s">%s</span></div><div class="pm-card"><h3>Les 7 piliers</h3>%s</div></div>'
+               '<div class="pm-grid"><div class="pm-card"><h3>🔒 Portes anti-story</h3><div class="scroll"><table>'
+               '<tr><th>Porte</th><th>Seuil</th><th>Mesure</th></tr>%s</table></div>'
+               '<p class="sub">Une seule porte qui saute suffit : pari suspendu.</p></div>'
+               '<div class="pm-card"><h3>🔄 Ce que le cours exige</h3>%s</div></div>'
+               '<div class="pm-card"><h3>🎈 Ce que tu paies : du réel ou du pari ?</h3>%s</div>'
+               '<div class="pm-grid"><div class="pm-card"><h3>🔗 Force du pari → part de pari acceptée</h3><div class="scroll"><table>'
+               '<tr><th>Force</th><th>Pari max</th><th>Lecture</th></tr>%s</table></div></div>'
+               '<div class="pm-card"><h3>🧺 La poche satellite</h3>%s</div></div>'
+               '<div class="pm-concl"><h3>✍️ Le pari en clair</h3>%s%s<p class="pm-dec">%s · %s</p></div>') % (
+        esc(P.get('motif')), jauge, cf, esc(P.get('palier')), piliers, portes, inverse, cap_txt, paliers, poche,
+        chiffres, reac, esc(P.get('statut')), esc(P.get('lab')))
+    suite = {'PARI OUVERT': 'Le cours respecte le plafond. La conclusion précise si une entrée est autorisée.',
+             'PARI VALIDE — ATTENDRE LE PRIX': 'Le pari tient, pas le prix. La conclusion pose l’alerte.',
+             'PARI SUSPENDU': 'Une porte anti-story saute : on attend la réactivation.',
+             'STORY — PAS ÉLIGIBLE': 'Les preuves ne suivent pas l’histoire. On passe à une autre idée.'}.get(
+        P.get('statut'), 'Le pari reste à documenter avant toute décision.')
+    return station('pari', 'Le Pari', '🚀', 'Le pari vaut-il d’être tenté ?', 'Force %s/100' % fr(force, 0),
+                   _phrase(P.get('lab') or ''), etat, coul, suite, contenu)
+
+
+def pari_resume(R):
+    P = R.get('pari') or {}
+    if not P.get('actif'):
+        return ''
+    if P.get('vide'):
+        return '🚀 Pari : module déclenché, bloc pari absent — à documenter.'
+    return '🚀 Pari : force %s/100 (%s) · %s · %s %s (%s) · seuil %s %% · rendement net au cours %s · capital préservé %s/100 · part de pari %s · croissance exigée %s' % (
+        fr(P.get('force'), 0), P.get('palier'), P.get('statut'),
+        'prix d’achat' if P.get('prix_publiable') else 'prix si réactivé', fplafond(P.get('prix')), P.get('contrainte') or 'n.d.',
+        fr(P.get('tx'), 1), ('%s %%/an' % fr(P.get('rdt_cours'), 1)) if num(P.get('rdt_cours')) else 'n.d.', fr(P.get('cap'), 0),
+        ('%s %%' % fr(P.get('part'), 0)) if num(P.get('part')) else 'n.d.',
+        ('%s %%/an' % fr(P.get('g_exige'), 0, True)) if num(P.get('g_exige')) else 'n.d.')
+
+
+CSS_PARI = """
+.p1-e-gris{background:rgba(126,151,157,.12);color:var(--p1-gris);border:1px solid rgba(126,151,157,.45)}
+.pm-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;margin:16px 0}
+.pm-card{border:1px solid #1d2329;border-radius:12px;padding:18px;background:#0b0d10;margin:16px 0}
+.pm-grid .pm-card{margin:0}
+.pm-card h3{margin:0 0 12px}
+.pm-centre{display:flex;flex-direction:column;align-items:center;text-align:center;gap:8px}
+.pm-centre h3{align-self:flex-start}
+.pm-pil{display:grid;grid-template-columns:1fr auto;gap:4px 12px;align-items:center;margin-bottom:12px}
+.pm-n{font-size:16px}.pm-v{font-size:15px;color:#8b96a3;font-variant-numeric:tabular-nums}
+.pm-bar{grid-column:1/-1;height:9px;background:#161b20;border-radius:5px;overflow:hidden}
+.pm-bar.pm-gros{height:14px}
+.pm-bar i{display:block;height:100%;border-radius:5px}
+.pm-why{grid-column:1/-1;font-size:14px;color:#8b96a3}
+.pm-ok{color:var(--rail-vert)}.pm-ko{color:var(--rail-rouge)}.pm-wa{color:var(--rail-orange)}.pm-nd{color:var(--rail-gris)}.pm-cy{color:#39d6e0}
+.pm-c-vert{color:var(--rail-vert)}.pm-c-jaune{color:var(--rail-jaune)}.pm-c-orange{color:var(--rail-orange)}.pm-c-rouge{color:var(--rail-rouge)}
+tr.pm-hl td{background:rgba(240,153,74,.10)}
+.pm-cmp{margin:8px 0 16px}.pm-lb{display:flex;justify-content:space-between;gap:12px;font-size:16px;margin-bottom:4px}
+.pm-stack{display:flex;height:44px;border-radius:8px;overflow:visible;margin:30px 0 8px;position:relative}
+.pm-r{background:linear-gradient(90deg,#1f8a5a,var(--rail-vert));display:flex;align-items:center;padding-left:10px;color:#00140a;font-weight:bold;font-size:15px;border-radius:8px 0 0 8px;white-space:nowrap;overflow:hidden}
+.pm-p{background:repeating-linear-gradient(135deg,#5b3fa8 0 10px,#6d4fc4 10px 20px);display:flex;align-items:center;justify-content:flex-end;padding-right:10px;color:#fff;font-weight:bold;font-size:15px;border-radius:0 8px 8px 0;white-space:nowrap;overflow:hidden}
+.pm-cap{position:absolute;top:-24px;bottom:-8px;border-left:2px dashed var(--rail-jaune)}
+.pm-cap span{position:absolute;top:-2px;left:6px;white-space:nowrap;font-size:13px;color:var(--rail-jaune)}
+.pm-scale{display:flex;justify-content:space-between;gap:8px;font-size:14px;color:#8b96a3;flex-wrap:wrap}
+.pm-kpi{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+.pm-kpi div{border:1px solid #1d2329;border-radius:8px;padding:12px}
+.pm-kpi b{display:block;font-size:22px;color:#fff}.pm-kpi span{font-size:14px;color:#8b96a3}
+.pm-concl{margin-top:16px;border:1px solid #39d6e0;border-radius:12px;padding:20px;background:linear-gradient(135deg,rgba(57,214,224,.10),rgba(0,0,0,0) 60%)}
+.pm-pr{display:flex;gap:12px;flex-wrap:wrap;margin:14px 0}
+.pm-pr div{flex:1;min-width:180px;border:1px solid #1d2329;border-radius:8px;padding:12px;background:#07090b}
+.pm-pr b{display:block;font-size:24px}.pm-pr span{font-size:14px;color:#8b96a3}
+.pm-dec{color:var(--rail-jaune);font-weight:bold}
+.pm-leg{display:flex;flex-wrap:wrap;justify-content:center;gap:8px 22px;margin-top:10px;font-size:15px;color:#c9d4da}
+.pm-pil,.pm-cmp,.pm-kpi{text-align:left}
+@media(max-width:600px){.pm-cap span{display:none}.pm-r,.pm-p{font-size:12px}.pm-r{padding-left:6px}.pm-p{padding-right:6px}.pm-stack{margin-top:12px}}
+"""
+
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__); sys.exit(1)
@@ -6756,8 +7475,17 @@ def main():
     _sur(calc_fait_cle, D, R)
     _sur(calc_asymetrie, D, R)
     _sur(calc_voie_b, D, R)
+    if pari_declenche(D)[0]:
+        try:
+            calc_pari(D, R)
+        except Exception as e:  # noqa: BLE001 -- ArithmeticError ou entrée malformée : À DOCUMENTER, dossier livré
+            R['pari'] = dict(actif=True, statut='À DOCUMENTER', lvl='gris', vide=True, lab='hypothèses de pari hors limites')
+            warn('Pari : calcul impossible avec les hypothèses saisies (%s).' % type(e).__name__)
+        R['pf']['pari'] = (sum(1 for l in PF['lignes'] if _sans_accent(l.get('voie')).strip() in PARI_VOIES_REGISTRE)
+                           if PF and not PF['_incomplet'] else None)
     _sur(calc_confiance, D, R)
     _sur(calc_action, D, R)
+    appliquer_pari(D, R)
     _sur(calc_angles_morts, D, R)
     _sur(calc_recit, D, R)  # V25 : le recit de la page 1 (lecture seule)
     for cle, titre in CHAMPS_THESE:
