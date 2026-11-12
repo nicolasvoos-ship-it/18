@@ -1,8 +1,10 @@
 """Revue NICO en lot. Les valorisations sont calculées par nico.py."""
 import argparse
+import calendar
 import copy
 import datetime
 import html
+import hashlib
 import json
 import math
 import os
@@ -134,8 +136,10 @@ def instantane(nico, d, r):
 def marche_verifiee(v, date, devise, date_reference):
     marche = objet(v, 'marche')
     d = jour(marche.get('date'), 'marche.date')
-    if d > date or (date_reference and d < date_reference):
-        raise ValueError('Le cours doit être daté entre le cours de référence et la revue')
+    if date_reference and d < date_reference:
+        raise ValueError(f'Cours fourni le {d.isoformat()}, antérieur au cours de référence du {date_reference.isoformat()}')
+    if d > date:
+        raise ValueError(f'Cours fourni le {d.isoformat()}, postérieur à la revue du {date.isoformat()}')
     if chaine(marche.get('devise'), 'marche.devise') != devise:
         raise ValueError(f'Devise de marché différente du dossier ({devise})')
     if not positif(marche.get('cours')):
@@ -157,6 +161,11 @@ def dernier_controle(v, date):
             raise ValueError('Une publication doit être antérieure ou égale à la date du contrôle')
         publication = dict(date=publiee.isoformat(), periode=chaine(pub.get('periode'), 'veille.publication.periode'),
                            source=chaine(pub.get('source'), 'veille.publication.source'))
+        revision = pub.get('revision', 0)
+        if type(revision) is not int or revision < 0:
+            raise ValueError('Révision de publication invalide')
+        if revision:
+            publication['revision'] = revision
     return dict(date=controle.isoformat(), source=source, publication=publication)
 
 
@@ -209,14 +218,191 @@ def prix_personnel(v, date, devise):
     d = jour(p.get('date'), 'prix_personnel.date')
     if d > date:
         raise ValueError('Le prix personnel ne peut pas être postérieur à la revue')
-    return dict(prix=p['prix'], date=d.isoformat(), devise=devise, motif=chaine(p.get('motif'), 'prix_personnel.motif'),
-                hypotheses=p.get('hypotheses'), etat='À revalider sur les nouveaux chiffres')
+    resultat = dict(prix=p['prix'], date=d.isoformat(), devise=devise, motif=chaine(p.get('motif'), 'prix_personnel.motif'),
+                    hypotheses=p.get('hypotheses'), etat='À revalider sur les nouveaux chiffres')
+    for k in ('empreinte_hypotheses', 'prix_nico'):
+        if k in p:
+            resultat[k] = p[k]
+    return resultat
 
 
-def analyser_ligne(nico, entree, date, racine, pf, proximite, precedents):
+def variation_plafond(nico, d, src, registre, reference, courant):
+    """Rejoue la référence à la nouvelle date, puis mesure le solde des changements."""
+    if (reference['route'] != courant['route'] or
+            not all(positif(x['prix']) for x in (reference, courant))):
+        return None
+    initiale = jour_dossier(nico, reference['date'])
+    nouvelle = jour_dossier(nico, courant['date'])
+    if not (initiale and nouvelle):
+        return None
+    if initiale == nouvelle:
+        apres_temps = reference['prix']
+    else:
+        temoin = copy.deepcopy(d)
+        temoin['meta']['date_eval'] = nouvelle.isoformat()
+        alertes, controles = list(nico.WARN), list(nico.CHK)
+        try:
+            calcul = nico.traiter_dossier(temoin, str(src), registre)
+            s = instantane(nico, temoin, calcul)
+            apres_temps = s['prix'] if s['route'] == reference['route'] else None
+        finally:
+            nico.WARN[:], nico.CHK[:] = alertes, controles
+    if not positif(apres_temps):
+        return None
+    return dict(reference=reference['prix'], temps=apres_temps - reference['prix'],
+                autres=courant['prix'] - apres_temps, jours=(nouvelle - initiale).days)
+
+
+def comparer_performance(entree, date):
+    """Compare deux séries de rendement total dans une devise commune."""
+    retours = entree.get('performance', [])
+    if not isinstance(retours, list):
+        raise ValueError('performance doit être une liste')
+    lignes, vus = [], set()
+    for p in retours:
+        objet(p, 'performance')
+        debut, fin = jour(p.get('debut'), 'performance.debut'), jour(p.get('fin'), 'performance.fin')
+        mois = p.get('mois')
+        nature = p.get('nature')
+        if type(mois) is not int or mois not in (12, 24, 48) or nature not in ('execute', 'ecarte'):
+            raise ValueError('performance attend un horizon 12, 24 ou 48 mois et une décision execute ou ecarte')
+        annee, m = divmod(debut.year * 12 + debut.month - 1 + mois, 12)
+        cible = datetime.date(annee, m + 1, min(debut.day, calendar.monthrange(annee, m + 1)[1]))
+        if not cible <= fin <= min(cible + datetime.timedelta(days=7), date):
+            raise ValueError('performance doit arriver à échéance et finir au plus sept jours après la date cible')
+        cle = (debut, mois, nature)
+        if cle in vus:
+            raise ValueError('Mesure de performance en double')
+        vus.add(cle)
+        valeurs = [p.get(k) for k in ('titre_debut', 'titre_fin', 'iwda_debut', 'iwda_fin')]
+        if not all(positif(x) for x in valeurs) or p.get('rendement_total') is not True:
+            raise ValueError('performance attend quatre niveaux de rendement total positifs et comparables')
+        t0, t1, b0, b1 = valeurs
+        rt, rb = 100 * (t1 / t0 - 1), 100 * (b1 / b0 - 1)
+        if not (nombre(rt) and nombre(rb) and nombre(rt - rb)):
+            raise ValueError('Niveaux de performance hors limites')
+        lignes.append(dict(debut=debut.isoformat(), fin=fin.isoformat(), mois=mois, nature=nature,
+                           devise=chaine(p.get('devise'), 'performance.devise'), titre_pct=rt,
+                           iwda_pct=rb, ecart_pts=rt - rb, source=chaine(p.get('source'), 'performance.source')))
+    return lignes
+
+
+def prochain_evenement(entree, date):
+    calendrier = entree.get('prochaine_publication')
+    if calendrier is None:
+        return None
+    p = objet(calendrier, 'prochaine_publication')
+    quand = jour(p.get('date'), 'prochaine_publication.date')
+    return dict(date=quand.isoformat(), source=chaine(p.get('source'), 'prochaine_publication.source'),
+                etat='Passée · communiqué à rechercher' if quand < date else 'À venir',
+                estimee=p.get('estimee') is True)
+
+
+def calendrier_ics(bilan):
+    def echapper(valeur):
+        return str(valeur).replace('\\', '\\\\').replace('\n', '\\n').replace('\r', '').replace(',', '\\,').replace(';', '\\;')
+
+    def plier(ligne):
+        resultat = []
+        while len(ligne.encode('utf-8')) > 75:
+            index = 75
+            while len(ligne[:index].encode('utf-8')) > 75:
+                index -= 1
+            resultat.append(ligne[:index])
+            ligne = ' ' + ligne[index:]
+        return resultat + [ligne]
+
+    lignes = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//NICO//Revue//FR', 'CALSCALE:GREGORIAN']
+    date_lot = bilan['date'].replace('-', '')
+    for dossier in bilan['dossiers']:
+        evenement = dossier.get('prochaine_publication')
+        if not evenement or evenement['date'] < bilan['date']:
+            continue
+        date = evenement['date'].replace('-', '')
+        identite_evenement = json.dumps([dossier['ticker'], dossier['devise'], evenement['date']])
+        uid = hashlib.sha256(identite_evenement.encode()).hexdigest()[:24] + '@nico'
+        titre = 'Publication ' + dossier['ticker'] + (' (estimée)' if evenement['estimee'] else '')
+        lignes.extend(('BEGIN:VEVENT', 'UID:' + uid, 'DTSTAMP:' + date_lot + 'T000000Z',
+                       'DTSTART;VALUE=DATE:' + date, 'SUMMARY:' + echapper(titre),
+                       'STATUS:' + ('TENTATIVE' if evenement['estimee'] else 'CONFIRMED'),
+                       'DESCRIPTION:' + echapper(evenement['source']), 'END:VEVENT'))
+    if len(lignes) == 4:
+        return None
+    lignes.append('END:VCALENDAR')
+    return '\r\n'.join(p for ligne in lignes for p in plier(ligne)) + '\r\n'
+
+
+def donnees_par_instrument(chemin):
+    if not chemin:
+        return {}
+    donnees = lire_json(chemin)
+    if not isinstance(donnees, list):
+        raise ValueError('Le fichier de données doit contenir une liste')
+    resultats = {}
+    for ligne in donnees:
+        objet(ligne, 'données par instrument')
+        cle = (chaine(ligne.get('ticker'), 'ticker').upper(), chaine(ligne.get('devise'), 'devise'))
+        if cle in resultats:
+            raise ValueError('Instrument en double dans les données · %s %s' % cle)
+        resultats[cle] = {k: ligne[k] for k in ('marche', 'veille', 'prochaine_publication') if k in ligne}
+    return resultats
+
+
+def index_prix_personnels(chemins, date):
+    prix = {}
+    for chemin in chemins or []:
+        brut = lire_json(chemin)
+        entree = objet(brut, 'prix personnel exporté')
+        if entree.get('schema') != 'nico-prix-personnel-1':
+            raise ValueError('Fichier de prix personnel non reconnu')
+        cle = (chaine(entree.get('ticker'), 'prix_personnel.ticker').upper(),
+               chaine(entree.get('devise'), 'prix_personnel.devise'))
+        p = prix_personnel(entree, date, cle[1])
+        if cle in prix and prix[cle]['date'] == p['date'] and prix[cle] != p:
+            raise ValueError('Prix personnels contradictoires pour %s %s' % cle)
+        if cle not in prix or prix[cle]['date'] <= p['date']:
+            prix[cle] = p
+    return prix
+
+
+def precedents_journal(journal, date):
+    if not journal:
+        return {}
+    precedents = {}
+    for p in sorted(journal.glob('revue_*.json')):
+        revue = lire_json(p)
+        if jour(revue.get('date'), 'date du journal') >= date:
+            continue
+        for x in revue['dossiers']:
+            cle = (x['ticker'], x['devise'])
+            # En cas de deux revues du même jour, ne pas arbitrer par ordre de hash.
+            old = precedents.get(cle)
+            valeur = x.get('prix_personnel')
+            if old and old[0] == revue['date'] and old[1] != valeur:
+                precedents[cle] = (revue['date'], None)
+            else:
+                precedents[cle] = (revue['date'], valeur)
+    return {k: {'prix_personnel': p} for k, (_, p) in precedents.items()}
+
+
+def journaliser(nico, journal, bilan):
+    journal.mkdir(parents=True, exist_ok=True)
+    contenu = encoder(nico, bilan)
+    empreinte = hashlib.sha256(contenu.encode()).hexdigest()[:20]
+    p = journal / f'revue_{bilan["date"]}_{empreinte}.json'
+    if p.exists() and p.read_text(encoding='utf-8') != contenu:
+        raise ValueError('Conflit dans le journal de revue')
+    if not p.exists():
+        ecrire_atomique(p, contenu)
+
+
+def analyser_ligne(nico, entree, date, racine, pf, proximite, precedents, donnees=None, prix_importes=None):
     src = racine / chaine(entree.get('reference'), 'reference')
     d = objet(nico.lire_dossier(src), 'dossier de référence')
     ticker, devise = identite(nico, d)
+    cle = (ticker, devise)
+    if donnees:
+        entree = {**donnees.get(cle, {}), **entree}
     nom = nico.G(d, 'meta.societe') or ticker
     date_ref = jour_dossier(nico, nico.G(d, 'meta.date_eval'))
     if date_ref and date_ref > date:
@@ -226,25 +412,36 @@ def analyser_ligne(nico, entree, date, racine, pf, proximite, precedents):
     calc_ref = nico.traiter_dossier(base, str(src), registre_ref)
     ref = instantane(nico, base, calc_ref)
     archive, action_archivee = ligne_archivee(src)
-    if archive:
-        champs = archive.split(' | ')
-        if len(champs) in (17, 18, 19) and champs[0] == 'NICO' and champs[1].upper() == ticker and champs[3] == devise:
-            ref['tri'] = archive
-            ref['statut'] = champs[4]
-            ref['detenue'] = champs[4] == 'PF'
-            ref['prix'] = nico._nb(champs[5])
-            ref['rendement'] = nico._nb(champs[8])
-            if action_archivee:
-                ref['action'] = action_archivee
-    provenance_reference = 'Ligne TRI archivée' if ref['tri'] == archive else 'Référence recalculée'
+    champs = archive.split(' | ') if archive else []
+    archive_valide = (16 <= len(champs) <= 19 and champs[0] == 'NICO'
+                      and champs[1].upper() == ticker and champs[3] == devise)
+    ref_calculee = dict(ref)
+    if archive_valide:
+        ref['tri'] = archive
+        ref['statut'] = champs[4]
+        ref['detenue'] = champs[4] == 'PF'
+        ref['prix'] = nico._nb(champs[5])
+        ref['rendement'] = nico._nb(champs[8])
+        if action_archivee:
+            ref['action'] = action_archivee
+    provenance_reference = 'Ligne TRI archivée' if archive_valide else 'Référence recalculée'
     marche = marche_verifiee(entree['marche'], date, devise, jour_dossier(nico, nico.G(d, 'meta.date_cours'))) if 'marche' in entree else None
     veille = dernier_controle(entree['veille'], date) if 'veille' in entree else None
     pub = veille.get('publication') if veille else None
     pub_ref = jour_dossier(nico, nico.G(d, 'resultats.publication.date'))
-    nouvelle = bool(pub and (not pub_ref or jour(pub['date'], 'publication') > pub_ref
-                            or (jour(pub['date'], 'publication') == pub_ref
-                                and pub['periode'].strip() != str(nico.G(d, 'resultats.publication.periode') or '').strip())))
+    date_veille = jour(pub['date'], 'publication') if pub else None
+    probablement_couverte = bool(date_veille and not pub_ref and date_ref and date_veille <= date_ref)
+    periode_ref = str(nico.G(d, 'resultats.publication.periode') or '').strip()
+    revision_ref = nico.G(d, 'resultats.publication.revision', 0)
+    if type(revision_ref) is not int or revision_ref < 0:
+        raise ValueError('Révision de publication invalide dans le dossier de référence')
+    meme_publication = pub and date_veille == pub_ref and pub['periode'] == periode_ref
+    revision = pub.get('revision', 0) if pub else 0
+    corrigee = bool(meme_publication and revision > revision_ref)
+    nouvelle = bool(date_veille and not probablement_couverte and (
+        not pub_ref or date_veille > pub_ref or (date_veille == pub_ref and pub['periode'] != periode_ref) or corrigee))
     publication_integree = False
+    variation = None
     changements = entree.get('changements', [])
     if not isinstance(changements, list) or len(changements) > 3:
         raise ValueError('changements doit contenir au plus trois faits')
@@ -269,6 +466,12 @@ def analyser_ligne(nico, entree, date, racine, pf, proximite, precedents):
             raise ValueError('actualisation._source est réservé au moteur')
         candidat = copy.deepcopy(d)
         fusionner(candidat, actualisation)
+        pub_patch = nico.G(actualisation, 'resultats.publication')
+        nouvelle_identite_pub = (jour_dossier(nico, nico.G(candidat, 'resultats.publication.date')),
+                                 nico.G(candidat, 'resultats.publication.periode'))
+        if (isinstance(pub_patch, dict) and 'revision' not in pub_patch
+                and nouvelle_identite_pub != (pub_ref, periode_ref)):
+            candidat['resultats']['publication'].pop('revision', None)
         if identite(nico, candidat) != (ticker, devise):
             raise ValueError('L’actualisation doit conserver le même instrument et la même devise')
         if marche:
@@ -284,11 +487,18 @@ def analyser_ligne(nico, entree, date, racine, pf, proximite, precedents):
             raise ValueError('L’actualisation ne peut pas supprimer ou antidater la publication de référence')
         calc = nico.traiter_dossier(candidat, str(src), pf)
         courant = instantane(nico, candidat, calc)
-        if pub and date_pub and date_pub == jour(pub['date'], 'publication') and nico.G(candidat, 'resultats.publication.periode') == pub['periode']:
+        revision_candidat = nico.G(candidat, 'resultats.publication.revision', 0)
+        if (type(revision_candidat) is not int or revision_candidat < 0
+                or (date_pub == pub_ref and nico.G(candidat, 'resultats.publication.periode') == periode_ref
+                    and revision_candidat < revision_ref)):
+            raise ValueError('L’actualisation ne peut pas antidater une révision de publication')
+        if (date_veille and date_pub == date_veille and nico.G(candidat, 'resultats.publication.periode') == pub['periode']
+                and revision_candidat == revision):
             publication_integree = True
+        variation = variation_plafond(nico, d, src, registre_ref, ref_calculee, courant)
 
-    risques = nico.G(candidat, 'risques.registre') or []
-    vigie = entree.get('prochain_test') or next((x.get('indicateur') for x in risques if isinstance(x, dict) and x.get('indicateur')), None)
+    risque = nico.risque_prioritaire(candidat)
+    vigie = entree.get('prochain_test') or (nico.suivi_risque(risque) if risque else None)
     vigie = vigie or nico.G(candidat, 'verdict.suivi_condition')
     libelle, niveau, hausse = seuil(nico, calc)
     if not actualisation and ref['prix'] is not None and libelle == 'Plafond NICO':
@@ -303,9 +513,11 @@ def analyser_ligne(nico, entree, date, racine, pf, proximite, precedents):
         echec.append('Contrôle de publication antérieur au dossier de référence')
     elif pub is None and pub_ref:
         echec.append('Publication non retrouvée malgré une référence existante')
-    elif pub and pub_ref and jour(pub['date'], 'publication') < pub_ref:
+    elif date_veille and pub_ref and date_veille < pub_ref:
         echec.append('La publication fournie précède celle du dossier de référence')
-    elif actualisation and pub and not publication_integree and not nouvelle:
+    elif meme_publication and revision < revision_ref:
+        echec.append('La révision fournie précède celle du dossier de référence')
+    elif actualisation and pub and not publication_integree and not nouvelle and (pub_ref or date_pub):
         echec.append('Publication actualisée incohérente avec la veille')
     if not marche:
         echec.append('Cours daté non fourni')
@@ -316,6 +528,11 @@ def analyser_ligne(nico, entree, date, racine, pf, proximite, precedents):
     classification = nico.G(candidat, 'profil.actifs')
     if not classification and re.search(r'\b(mines?|minier(?:e)?s?|mining|petrole|oil\s*(?:and|&)\s*gas)\b', secteur):
         lourd.append('Route Actifs à vérifier avant migration du dossier')
+    if actualisation:
+        f = nico.G(calc, 'cash_action.financement')
+        ancien_f = nico.G(calc_ref, 'cash_action.financement')
+        if f and f != ancien_f and f['non_couvert_m'] > 0:
+            lourd.append('Besoin de financement non couvert à examiner')
     if courant['route'] != ref['route']:
         lourd.append(f'Méthode modifiée : {ref["route"]} → {courant["route"]}')
     if these and these['etat'] == 'Fragilisée':
@@ -341,13 +558,26 @@ def analyser_ligne(nico, entree, date, racine, pf, proximite, precedents):
             [libelle + (' atteint' if atteint else ' proche')] if atteint or proche else [])
         if not motifs:
             motifs = ['Dossier actualisé à partir du lot' if actualisation else 'Nouveaux éléments de thèse']
+    elif probablement_couverte:
+        priorite, motifs = RAPIDE, []
     else:
         priorite, motifs = RAPIDE, ['Aucun nouveau communiqué identifié' if veille['publication'] is None
                                     else 'Dernière publication déjà couverte']
-    ancien = precedents.get((ticker, devise), {}).get('prix_personnel')
-    prix = entree.get('prix_personnel', ancien)
+    if corrigee:
+        motifs.append('Révision officielle du communiqué · version %s' % revision)
+    if probablement_couverte:
+        motifs.append('Publication probablement couverte par le dossier de référence, à confirmer')
+    ancien = precedents.get(cle, {}).get('prix_personnel')
+    prix = entree.get('prix_personnel', (prix_importes or {}).get(cle, ancien))
     personne = prix_personnel(prix, date, devise) if prix is not None else None
-    previsions = comparer_previsions(nico.G(d, 'suivi.previsions') or [], entree.get('observations', []), date)
+    if personne and personne.get('empreinte_hypotheses') == calc.get('empreinte_hypotheses') and calc.get('empreinte_hypotheses'):
+        personne['etat'] = 'Hypothèses de référence identiques'
+    observations = entree.get('observations')
+    if observations is None:
+        p = nico.G(candidat, 'resultats.publication') or {}
+        observations = [dict(k, date=date_veille.isoformat(), periode=pub['periode'], source=pub['source'])
+                        for k in p.get('kpis', []) if isinstance(k, dict)] if publication_integree and isinstance(p.get('kpis'), list) else []
+    previsions = comparer_previsions(nico.G(d, 'suivi.previsions') or [], observations, date)
     exportable = actualisation and priorite == CIBLEE and (not nouvelle or publication_integree)
     ligne = dict(ticker=ticker, societe=nom, devise=devise, priorite=priorite, motifs=motifs, veille=veille, marche=marche,
                  reference=ref, provenance_reference=provenance_reference, courant=courant if actualisation else None,
@@ -357,10 +587,16 @@ def analyser_ligne(nico, entree, date, racine, pf, proximite, precedents):
                  publication_reference=pub_ref.isoformat() if pub_ref else None, nouvelle_publication=nouvelle,
                  publication_integree=publication_integree, fichier_reference=entree['reference'],
                  mode='Recalcul' if actualisation else 'Contrôle')
+    for cle, valeur in (('variation_plafond', variation), ('prochaine_publication', prochain_evenement(entree, date)),
+                        ('performance', comparer_performance(entree, date)), ('cash_action', calc.get('cash_action'))):
+        if valeur:
+            ligne[cle] = valeur
+    if revision:
+        ligne['revision_publication'] = revision
     return ligne, (candidat, calc) if exportable else None
 
 
-def analyser_lot(nico, lot, racine, pf, sortie):
+def analyser_lot(nico, lot, racine, pf, sortie, donnees=None, prix_importes=None, journal=None):
     date = jour(lot.get('date'), 'date')
     proximite = lot.get('proximite_pct', 5)
     if not nombre(proximite) or not 0 <= proximite <= 100:
@@ -368,16 +604,16 @@ def analyser_lot(nico, lot, racine, pf, sortie):
     entrees = lot.get('dossiers')
     if not isinstance(entrees, list) or not entrees:
         raise ValueError('dossiers doit être une liste non vide')
-    precedents = {}
+    precedents = precedents_journal(journal, date)
     if lot.get('revue_precedente'):
         ancien = lire_json(racine / lot['revue_precedente'])
         if jour(ancien.get('date'), 'date de la revue précédente') >= date:
             raise ValueError('La revue précédente doit précéder le lot courant')
-        precedents = {(x['ticker'], x['devise']): x for x in ancien['dossiers']}
+        precedents.update({(x['ticker'], x['devise']): x for x in ancien['dossiers']})
     lignes, erreurs, vus = [], [], set()
     for i, entree in enumerate(entrees, 1):
         try:
-            ligne, dossier = analyser_ligne(nico, objet(entree, 'dossier'), date, racine, pf, proximite, precedents)
+            ligne, dossier = analyser_ligne(nico, objet(entree, 'dossier'), date, racine, pf, proximite, precedents, donnees, prix_importes)
             identifiant = (ligne['ticker'], ligne['devise'])
             if identifiant in vus:
                 raise ValueError(f'Instrument en double : {ligne["ticker"]} {ligne["devise"]}')
@@ -408,7 +644,7 @@ def analyser_lot(nico, lot, racine, pf, sortie):
 def ecrire_atomique(chemin, contenu):
     tmp = None
     try:
-        with NamedTemporaryFile(mode='w', dir=chemin.parent, encoding='utf-8', delete=False) as flux:
+        with NamedTemporaryFile(mode='w', dir=chemin.parent, encoding='utf-8', newline='', delete=False) as flux:
             tmp = Path(flux.name)
             flux.write(contenu)
         os.replace(tmp, chemin)
@@ -439,7 +675,22 @@ strong{color:var(--text)}.values{display:grid;grid-template-columns:repeat(auto-
 .values div{background:var(--bg);border-radius:8px;padding:9px 11px}.values span{display:block;color:var(--muted);font-size:.8rem}
 ul{padding-left:20px}li+li{margin-top:5px}.content p+p{margin-top:7px}
 textarea{width:100%;min-height:90px;resize:vertical;border:1px solid var(--line);border-radius:8px;padding:10px;background:var(--bg);color:var(--text)}
+.copier-tri{font:inherit;background:var(--bg);color:var(--teal);border:1px solid var(--line);
+border-radius:8px;padding:9px 12px;cursor:pointer}.copier-tri+span{margin-left:8px;font-size:.85rem}
+.priorites .libelle-mobile{display:none}
 @media(max-width:640px){main{padding:24px 15px 55px}th,td{padding:8px}.scroller table{min-width:660px}.content .scroller table{min-width:500px}}
+@media(max-width:600px){
+  .priorites{overflow:visible;border:0;border-radius:0}
+  .priorites table,.priorites tbody{display:block;min-width:0;background:transparent}
+  .priorites thead{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+  .priorites tbody tr{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));margin-bottom:12px;
+    border:1px solid var(--line);border-radius:12px;background:var(--surface);padding:4px}
+  .priorites td{display:block;min-width:0;border:0;overflow-wrap:anywhere}
+  .priorites td:nth-child(-n+3){grid-column:1/-1}
+  .priorites td:nth-child(n+4){border-top:1px solid var(--line)}
+  .priorites .libelle-mobile{display:block;color:var(--muted);font-size:.8rem}
+  .priorites .tag{white-space:normal}
+}
 """
 
 
@@ -450,7 +701,7 @@ def rendu_html(nico, bilan):
         return e(str(v)) if v not in (None, '') else 'n.d.'
 
     def prix(v, devise):
-        return e(nico.fplafond(v) + ' ' + devise) if positif(v) else 'n.d.'
+        return e(nico.fplafond(v, devise) + ' ' + devise) if positif(v) else 'n.d.'
 
     def cours(v, devise):
         return e(nico.fprix(v) + ' ' + devise) if positif(v) else 'n.d.'
@@ -462,6 +713,7 @@ def rendu_html(nico, bilan):
     def tag(priorite):
         return f'<span class="tag tone-{PRIORITE.index(priorite)}">{e(priorite)}</span>'
 
+    colonnes = ('Société', 'Revue', 'Action du dossier', 'Cours fourni', 'Seuil à suivre', 'Dernière publication')
     tableau, fiches = [], []
     for i, x in enumerate(bilan['dossiers']):
         identifiant = f'dossier-{i + 1}'
@@ -479,10 +731,17 @@ def rendu_html(nico, bilan):
         if s['ecart_pct'] is not None:
             distance = '<small>' + e(nico.fr(s['ecart_pct'], 1, True)) + ' %</small>'
         mot = ' · '.join(x['motifs'])
-        tableau.append(f'<tr><td><a href="#{identifiant}"><strong>{e(x["ticker"])}</strong></a>'
-                       f'<small>{propre(x["societe"])}</small></td><td>{tag(x["priorite"])}<small>{e(mot)}</small></td>'
-                       f'<td>{texte_action}<small>{propre(recalcule["statut"])} · {propre(recalcule["route"])}</small></td>'
-                       f'<td>{q}{date_cours}</td><td>{niveau}{distance}</td><td>{propre(pub["date"] if pub else None)}</td></tr>')
+        cellules = (
+            f'<a href="#{identifiant}"><strong>{e(x["ticker"])}</strong></a><small>{propre(x["societe"])}</small>',
+            f'{tag(x["priorite"])}<small>{e(mot)}</small>',
+            f'{texte_action}<small>{propre(recalcule["statut"])} · {propre(recalcule["route"])}</small>',
+            q + date_cours, niveau + distance, propre(pub['date'] if pub else None),
+        )
+        ligne = []
+        for index, (titre, valeur) in enumerate(zip(colonnes, cellules)):
+            libelle = f'<span class="libelle-mobile" aria-hidden="true">{titre}</span>' if index >= 2 else ''
+            ligne.append(f'<td role="cell">{libelle}{valeur}</td>')
+        tableau.append('<tr role="row">' + ''.join(ligne) + '</tr>')
         description = f'<p>{e(x["provenance_reference"])} · {propre(ref["date"])} · {e(ref["route"])}</p>'
         if m:
             description += f'<p>Cours contrôlé le {e(m["date"])} · {e(m["source"])}</p>'
@@ -498,6 +757,26 @@ def rendu_html(nico, bilan):
                    f'<div><span>Rendement au cours du dossier</span><strong>{rendements}</strong></div></div>')
         faits = ''.join(f'<li><strong>{e(t["fait"])}</strong> · {e(t["impact"])}<br><small>{e(t["source"])}</small></li>' for t in x['faits'])
         contenu = description + valeurs
+        effet = x.get('variation_plafond')
+        if effet:
+            contenu += ('<p>Variation à partir du prix recalculé · temps %s %s sur %s j · '
+                        'autres changements %s %s.</p>') % (
+                e(nico.fr(effet['temps'], 2, True)), e(x['devise']), effet['jours'],
+                e(nico.fr(effet['autres'], 2, True)), e(x['devise']))
+        evenement = x.get('prochaine_publication')
+        if evenement:
+            contenu += '<p>Prochaine publication · %s%s · %s · %s</p>' % (
+                e(evenement['date']), ' (estimée)' if evenement['estimee'] else '',
+                e(evenement['etat']), e(evenement['source']))
+        cash = x.get('cash_action')
+        if cash and cash.get('decisif'):
+            contenu += nico.cash_action_html({'cash_action': cash}).replace(' id="cash-action"', '')
+        perf = x.get('performance', [])
+        if perf:
+            lignes_perf = ''.join('<li>%s mois · %s · titre %s %% · IWDA %s %% · %s pts · %s</li>' % (
+                p['mois'], e(p['nature']), e(nico.fr(p['titre_pct'], 1, True)), e(nico.fr(p['iwda_pct'], 1, True)),
+                e(nico.fr(p['ecart_pts'], 1, True)), e(p['source'])) for p in perf)
+            contenu += '<h3>Performance observée</h3><ul>' + lignes_perf + '</ul>'
         if faits:
             contenu += f'<h3>Ce qui a changé</h3><ul>{faits}</ul>'
         if x['these']:
@@ -518,7 +797,9 @@ def rendu_html(nico, bilan):
             p = x['prix_personnel']
             contenu += f'<h3>Prix personnel</h3><p>{prix(p["prix"], p["devise"])} · {e(p["date"])} · {e(p["etat"])} · {e(p["motif"])}</p>'
         if x['tri_actualise']:
-            contenu += f'<h3><label for="tri-{i}">Ligne TRI actualisée</label></h3><textarea id="tri-{i}" readonly>{e(x["tri_actualise"])}</textarea>'
+            contenu += (f'<h3><label for="tri-{i}">Ligne TRI actualisée</label></h3><textarea id="tri-{i}" readonly>{e(x["tri_actualise"])}</textarea>'
+                        f'<button type="button" class="copier-tri" data-tri="tri-{i}">Copier la ligne TRI</button>'
+                        f'<span id="etat-tri-{i}" role="status"></span>')
             if x.get('dossier_html'):
                 contenu += (f'<p><a href="{e(x["dossier_html"])}">Ouvrir le dossier complet</a> · '
                             f'<a href="{e(x["dossier_json"])}">JSON de référence suivant</a></p>')
@@ -530,16 +811,21 @@ def rendu_html(nico, bilan):
     if erreurs:
         erreurs = '<h2>Entrées à corriger</h2><ul>' + erreurs + '</ul>'
     contexte = '<p>' + propre(bilan['contexte']) + '</p>' if bilan['contexte'] else ''
+    entetes = ''.join(f'<th scope="col" role="columnheader">{titre}</th>' for titre in colonnes)
     return (f'<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>Revue trimestrielle NICO</title><style>{CSS}</style></head><body><main><header>'
             f'<h1>Revue trimestrielle</h1><p>NICO {e(bilan["version"])} · {e(bilan["date"])} · {len(bilan["dossiers"])} '
             f'dossiers sur {bilan["nombre_entrees"]}</p>{contexte}</header><div class="metrics">{compte_html}</div>'
-            '<h2>Priorités du lot</h2><div class="scroller"><table><thead><tr><th>Société</th><th>Revue</th>'
-            '<th>Action du dossier</th><th>Cours fourni</th><th>Seuil à suivre</th><th>Dernière publication</th></tr></thead>'
-            '<tbody>' + ''.join(tableau) + '</tbody></table></div>' + erreurs
+            '<h2>Priorités du lot</h2><div class="scroller priorites"><table role="table"><thead role="rowgroup"><tr role="row">'
+            + entetes + '</tr></thead><tbody role="rowgroup">' + ''.join(tableau) + '</tbody></table></div>' + erreurs
             + '<h2>Détail des sociétés</h2>' + ''.join(fiches) + '</main><script>'
             'function ouvrir(){const x=document.getElementById(location.hash.slice(1));if(x?.tagName==="DETAILS")x.open=true;}'
-            'addEventListener("hashchange",ouvrir);ouvrir();</script></body></html>')
+            'addEventListener("hashchange",ouvrir);ouvrir();'
+            'document.querySelectorAll("[data-tri]").forEach(b=>b.addEventListener("click",async()=>{'
+            'const t=document.getElementById(b.dataset.tri),s=document.getElementById("etat-"+t.id);'
+            'try{await navigator.clipboard.writeText(t.value);s.textContent=" Ligne copiée.";}' 
+            'catch{t.focus();t.select();s.textContent=" Ligne sélectionnée. Utilise Ctrl+C.";}}));'
+            '</script></body></html>')
 
 
 def main_revue(nico, arguments):
@@ -547,6 +833,9 @@ def main_revue(nico, arguments):
     parser.add_argument('lot', type=Path)
     parser.add_argument('-o', '--sortie', type=Path)
     parser.add_argument('--pf', type=Path, help='registre courant pour les dossiers actualisés')
+    parser.add_argument('--donnees', type=Path, help='cours et publications fournis par instrument')
+    parser.add_argument('--prix-perso', type=Path, action='append', help='fichier JSON exporté depuis les réglettes')
+    parser.add_argument('--journal', type=Path, help='dossier local des revues historisées')
     args = parser.parse_args(arguments)
     try:
         lot = objet(lire_json(args.lot), 'lot')
@@ -554,14 +843,26 @@ def main_revue(nico, arguments):
             raise ValueError('Registre courant introuvable')
         sortie = args.sortie or args.lot.resolve().parent
         sortie.mkdir(parents=True, exist_ok=True)
-        bilan = analyser_lot(nico, lot, args.lot.resolve().parent, str(args.pf.resolve()) if args.pf else None, sortie)
+        donnees = donnees_par_instrument(args.donnees)
+        prix = index_prix_personnels(args.prix_perso, jour(lot.get('date'), 'date'))
+        bilan = analyser_lot(nico, lot, args.lot.resolve().parent, str(args.pf.resolve()) if args.pf else None,
+                            sortie, donnees, prix, args.journal)
         base = sortie / ('Revue_NICO_' + bilan['date'])
         ecrire_atomique(base.with_suffix('.json'), encoder(nico, bilan))
         ecrire_atomique(base.with_suffix('.html'), rendu_html(nico, bilan))
+        calendrier = calendrier_ics(bilan)
+        if calendrier:
+            ecrire_atomique(base.with_suffix('.ics'), calendrier)
+        else:
+            base.with_suffix('.ics').unlink(missing_ok=True)
+        if args.journal:
+            journaliser(nico, args.journal, bilan)
     except (ValueError, OSError, KeyError, TypeError) as exc:
         parser.error(str(exc))
     print(f'{len(bilan["dossiers"])} dossiers · {len(bilan["erreurs"])} entrées à corriger')
     print(base.with_suffix('.html'))
     print(base.with_suffix('.json'))
+    if calendrier:
+        print(base.with_suffix('.ics'))
     if bilan['erreurs']:
         raise SystemExit(1)
