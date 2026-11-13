@@ -23,8 +23,8 @@ TOB, TAX_PV = 0.0035, 0.10
 REGLAGES_FORMAT = 'reglages-1'          # V26.7 : clé des réglettes indépendante du numéro de version
 REGLAGES_ANCIENS = ('V26.6', 'V26.5.1', 'V26.5')  # clés des versions précédentes, relues si la nouvelle est vide
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V27.1.1"
-VERSION_DATE = "12/11/2026"
+VERSION = "V27.1.2"
+VERSION_DATE = "13/11/2026"
 DEVISES_SANS_DECIMALES = frozenset('BIF CLP DJF GNF ISK JPY KMF KRW PYG RWF UGX UYI VND VUV XAF XOF XPF'.split())
 # Journal des versions archive dans NICO_Historique_Versions.md (hors Projet, sur le PC de Nico).
 # V26.7 : « ⛏️ L'actif » pour les minières et pétrolières (profil.actifs) — trois prix de la matière fixés par une règle (R9),
@@ -1636,6 +1636,38 @@ def actualite_majeure_html(D):
         esc(fait), esc(effet), date.strftime('%d/%m/%Y'), esc(source)), 'bleu')
 
 
+def ecart_resultat(publie, base, unite):
+    if not (num(publie) and num(base)):
+        return 'n.d.'
+    ecart = publie - base
+    unite = unite.strip()
+    if unite == '%':
+        unite, decimales = 'pt', 1
+    elif base > 0:
+        ecart = ecart / base * 100
+        unite, decimales = '%', 1
+    else:
+        decimales = 2
+    if not num(ecart):
+        return 'n.d.'
+    if ecart and round(ecart, decimales) == 0:
+        seuil = fr(10 ** -decimales, decimales)
+        return '%s (< %s %s)' % ('+' if ecart > 0 else '−', seuil, unite)
+    return '%s %s' % (fr(ecart, decimales, signe=ecart != 0), unite)
+
+
+def surprise_resultat_html(publie, attendu, unite, sens='haut'):
+    texte = ecart_resultat(publie, attendu, unite)
+    if texte == 'n.d.':
+        couleur = 'gris'
+    elif publie == attendu:
+        couleur = 'blanc'
+    else:
+        favorable = publie < attendu if sens == 'bas' else publie > attendu
+        couleur = 'vert' if favorable else 'rouge'
+    return '<span class="dr-surprise-valeur dr-%s">%s</span>' % (couleur, esc(texte))
+
+
 def publication_resultats_html(D, R, pastilles=True):
     """Une saisie pour la synthèse et le détail sourcé des derniers résultats."""
     pub = G(D, 'resultats.publication')
@@ -1662,15 +1694,6 @@ def publication_resultats_html(D, R, pastilles=True):
             return 'n.d.'
         return fr(x, 4 if 0 < abs(x) < 0.1 else 2).rstrip('0').rstrip(',')
 
-    def ecart(publie, base, unite):
-        if not num(base):
-            return 'n.d.'
-        if unite == '%':
-            return fr(publie - base, 1, True) + ' pt'
-        if base <= 0:
-            return fr(publie - base, 2, True) + ' ' + unite
-        return fr((publie / base - 1) * 100, 1, True) + ' %'
-
     rows = []
     for row in lignes('chiffres', 3):
         if len(row) < 4:
@@ -1681,10 +1704,12 @@ def publication_resultats_html(D, R, pastilles=True):
         date_cons = _date_complete(date_attendue)
         if not (num(attendu) and isinstance(src, str) and src.strip() and date_cons and date_cons < date):
             attendu = None
-        var_an, surprise = ecart(publie, avant, unite), ecart(publie, attendu, unite)
+        var_an = ecart_resultat(publie, avant, unite)
+        surprise = surprise_resultat_html(publie, attendu, unite)
         preuve = '%s · %s' % (src, date_cons.strftime('%d/%m/%Y')) if num(attendu) else 'n.d.'
-        rows.append('<tr>' + ''.join('<td>%s</td>' % esc(x) for x in (
-            '%s (%s)' % (nom, unite), chiffre(avant), chiffre(attendu), chiffre(publie), var_an, surprise, preuve)) + '</tr>')
+        chiffres = ''.join('<td>%s</td>' % esc(x) for x in (
+            '%s (%s)' % (nom, unite), chiffre(avant), chiffre(attendu), chiffre(publie), var_an))
+        rows.append('<tr>%s<td>%s</td><td>%s</td></tr>' % (chiffres, surprise, esc(preuve)))
 
     guidance = pub.get('guidance')
     direction = ''
@@ -1763,7 +1788,7 @@ def kpis_operationnels(D, pub, date):
             if (dc and dc < date and num(c.get('valeur')) and isinstance(c.get('source'), str)
                     and c['source'].strip() and sens in ('haut', 'bas')):
                 atteint = k['valeur'] >= c['valeur'] if sens == 'haut' else k['valeur'] <= c['valeur']
-                objectif.update(attendu=c['valeur'], statut='atteint' if atteint else 'raté',
+                objectif.update(attendu=c['valeur'], statut='atteint' if atteint else 'raté', sens=sens,
                                 consensus_source=c['source'], consensus_date=dc.isoformat())
         objectifs[identifiant] = objectif
     return objectifs
@@ -1854,9 +1879,11 @@ def derniers_resultats_html(bilan, contexte, date, detail):
                 esc(jour), plage, esc(o['unite']), esc(o['ecart_prevision']))
         if o.get('consensus_source'):
             comparaison += '<p class="sub">Consensus · %s · %s</p>' % (esc(o['consensus_date']), esc(o['consensus_source']))
+        surprise = surprise_resultat_html(o.get('publie'), o.get('attendu'), o.get('unite', ''), o.get('sens', 'haut'))
         return ('<div class="dr-objectif"><h4>%s</h4><dl><div><dt>Consensus</dt><dd>%s</dd></div>'
-                '<div><dt>Réalisé</dt><dd>%s</dd></div></dl><p>%s</p>%s</div>') % (
-            esc(o['nom']), valeur('attendu'), valeur('publie'),
+                '<div><dt>Réalisé</dt><dd>%s</dd></div></dl><p class="dr-surprise">Surprise vs consensus %s</p>'
+                '<p>%s</p>%s</div>') % (
+            esc(o['nom']), valeur('attendu'), valeur('publie'), surprise,
             {'atteint': '✓ Consensus atteint', 'raté': '✗ Consensus raté', 'n.d.': 'Consensus non comparable'}[o['statut']],
             comparaison)
 
@@ -1885,11 +1912,13 @@ CSS_DERNIERS_RESULTATS = """
 .dr-objectif,.dr-points{padding:14px;border:1px solid var(--bord);border-radius:10px;overflow-wrap:anywhere}
 .dr-objectif dl{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:12px 0}
 .dr-objectif dt{color:var(--txt2);font-size:.84rem}.dr-objectif dd{margin:0;font-size:1.3rem;font-weight:750}.dr-objectif p{margin:0;font-size:.85rem}
+.dr-objectif .dr-surprise{margin:0 0 4px}.dr-surprise-valeur{font-weight:750;margin-inline-start:.25em}.dr-blanc{color:#fff}
 .dr-bilan{border:1px solid currentColor;border-radius:100px;padding:5px 10px;font-size:.88rem;font-weight:750}
 .dr-rouge,.dr .dr-negatifs h4,.dr-negatifs li::marker{color:#ff828b}.dr-orange{color:#f5ae6b}
 .dr-vert,.dr .dr-positifs h4,.dr-positifs li::marker{color:#4ede9a}.dr-fluo{color:#aaff47;background:#172604}.dr-gris{color:#c0cbd2}
 .dr-positifs li{color:#a5e7c8}.dr-negatifs li{color:#ffb2b7}
-.dr-points ul{padding-left:1.2em;margin:0}.dr-points li+li{margin-top:7px}
+.dr-points ul{list-style:disc;padding-left:1.25em;margin:0}
+.dr-points li{padding:0;margin:0}.dr-points li+li{margin-top:7px}.dr-points li::before{content:none}
 .dr-note{text-align:center;padding:12px}.dr-note span{display:block;color:var(--txt2)}.dr-note strong{display:block;font-size:2.5rem;line-height:1.2;margin:5px 0}
 @media(max-width:560px){.dr-grille{grid-template-columns:1fr}.dr-objectif dd{font-size:1.1rem}}
 """
