@@ -23,8 +23,8 @@ TOB, TAX_PV = 0.0035, 0.10
 REGLAGES_FORMAT = 'reglages-1'          # V26.7 : clé des réglettes indépendante du numéro de version
 REGLAGES_ANCIENS = ('V26.6', 'V26.5.1', 'V26.5')  # clés des versions précédentes, relues si la nouvelle est vide
 POIDS_DEF = {'baissier': .25, 'central': .50, 'haussier': .25}
-VERSION = "V27.1.2"
-VERSION_DATE = "13/11/2026"
+VERSION = "V27.2.1"
+VERSION_DATE = "22/11/2026"
 DEVISES_SANS_DECIMALES = frozenset('BIF CLP DJF GNF ISK JPY KMF KRW PYG RWF UGX UYI VND VUV XAF XOF XPF'.split())
 # Journal des versions archive dans NICO_Historique_Versions.md (hors Projet, sur le PC de Nico).
 # V26.7 : « ⛏️ L'actif » pour les minières et pétrolières (profil.actifs) — trois prix de la matière fixés par une règle (R9),
@@ -2737,7 +2737,7 @@ def rendu(D, R):
     A('<meta name="viewport" content="width=device-width,initial-scale=1">')
     A('<title>Dossier %s \u2014 %s</title><style>%s%s%s%s%s%s</style></head><body><div class="wrap">' % (
         esc(meta.get('societe')), esc(meta.get('ticker')), CSS, CSS_V24, CSS_V25, CSS_V254, CSS_V255 + CSS_PARTITION + CSS_SIGNAUX,
-        CSS_V26 + CSS_DERNIERS_RESULTATS + (CSS_AJUSTEMENT_PRIX if ajustement else '') + (CSS_PARI if (R.get('pari') or {}).get('actif') else '')
+        CSS_V26 + CSS_DERNIERS_RESULTATS + CSS_VISITE + (CSS_AJUSTEMENT_PRIX if ajustement else '') + (CSS_PARI if (R.get('pari') or {}).get('actif') else '')
         + (CSS_PARI + CSS_ACTIF if actif and not (R.get('pari') or {}).get('actif') else '')))
 
     # -- en-tete
@@ -3012,7 +3012,7 @@ def rendu(D, R):
         q1 = 'La porte qualité reste fermée.'
     croissance = (marche_html(D, R) + croissance_html(D, R, dev)
                   + dossier_detail('Capital réinvesti, débouchés et trajectoire',
-                                   T_('ep1', 'vent', 'boule', 'traj')))
+                                   T_('boule', 'traj')))
     longevite = dossier_detail('Durée, protections et stress', duree_html(D, R) + T_('risq_cartes'))
     suite_prix = [re.sub(r'(?<=ne tient pas compte )de (le|les) ', lambda m: 'du ' if m[1] == 'le' else 'des ', x)
                   for x in r.get('suite', [])]
@@ -3084,12 +3084,9 @@ def rendu(D, R):
     lecture_annexe = arbitre if voie not in ('A', 'B') and not memo else ''
     cash = cash_action_html(R)
     cash_en_tete = bool(G(R, 'cash_action.decisif'))
-    return (T_('tete', 'ouverture') + conclusion_html(D, R) + (cash if cash_en_tete else '') + arbitrage_place_html(R)
-            + (resultats if R.get('derniers_resultats') else '') + sommaire_rail(stations, voie, action)
-            + raccourci_prix + lecture_annexe + T_('alertes')
-            + rail + T_('registre') + suivi + ('' if cash_en_tete else cash) + controles_decision
-            + ('' if sans_valo else T_('plan')) + partition_html(D, R) + tactique
-            + T_('nico') + memo + annexe + T_('script'))
+    # V27.2 : présentation « La visite » ; données et calculs inchangés.
+    return rendu_visite(D, R, BK, stations, voie, prix, croissance, longevite, gouvernance,
+                        resultats, suivi, annexe, tactique, controles_decision)
 
 
 # ------------------------------------------------------------------ Repères de risque, création de valeur et autofinancement
@@ -9467,6 +9464,607 @@ tr.pm-hl td{background:rgba(240,153,74,.10)}
 """
 
 
+
+
+# ------------------------------------------------------------------ V27.2 : « La visite » — rendu seulement.
+# Ne jamais écrire dans D/R, appeler warn/chk ou prolonger une série depuis ces fonctions.
+
+VISITE_PALIERS = ((85, 'A', '#22c55e'), (80, 'B', '#4ade80'), (75, 'C', '#a3e635'),
+                  (70, 'D', '#facc15'), (65, 'E', '#fb923c'), (60, 'F', '#f97316'), (0, 'G', '#ef4444'))
+
+
+def visite_certificat(D, R):
+    q = R.get('q') or {}
+    score = q.get('Q')
+    lettre = next((l for seuil, l, _ in VISITE_PALIERS if num(score) and score >= seuil), 'n.d.')
+    actif = bool(G(R, 'actifs.actif'))
+    hors = bool(R.get('exclusion') or R.get('assurance_or'))
+    lignes = ''.join('<div class="vis-peb-ligne%s" style="--peb:%s;width:%s%%">'
+                     '<b>%s</b><span>%s</span>%s</div>' % (
+                         ' vis-peb-selection' if lettre == lab else '', couleur, 44 + i * 8, lab,
+                         '≥ %s' % seuil if i == 0 else '%s–%s' % (seuil, VISITE_PALIERS[i - 1][0] - 1)
+                         if seuil else '< 60', '<strong>◀</strong>' if lettre == lab else '')
+                     for i, (seuil, lab, couleur) in enumerate(VISITE_PALIERS))
+    faibles = [p for p in (q.get('pil') or {}).values() if num(p.get('pct'))]
+    faible = min(faibles, key=lambda p: p['pct']) if faibles else None
+    note = 'Note de qualité opérationnelle, distincte du risque et de la décision d’achat.'
+    if actif:
+        note = 'Qualité pour mémoire : la grille Actifs gouverne la décision, voir le prix.'
+    elif hors:
+        note = 'Qualité pour mémoire : ce profil ne relève pas de l’achat opérationnel standard.'
+    return ('<aside class="vis-certificat" aria-label="Certificat de qualité">'
+            '<svg class="vis-batiment" viewBox="0 0 260 130" role="img" aria-label="Illustration symbolique de la visite, sans donnée financière">'
+            '<path d="M20 120H240" stroke="#334155" stroke-width="3"/>'
+            '<path d="M65 120V35H195V120" fill="#1e293b" stroke="#64748b"/>'
+            '<path d="M53 36L130 8L207 36Z" fill="#7f1d1d"/>'
+            '<g fill="#fde68a"><rect x="80" y="50" width="19" height="21" rx="2"/>'
+            '<rect x="120" y="50" width="19" height="21" rx="2"/><rect x="160" y="50" width="19" height="21" rx="2"/>'
+            '<rect x="80" y="85" width="19" height="21" rx="2"/><rect x="160" y="85" width="19" height="21" rx="2"/></g>'
+            '<rect x="120" y="89" width="19" height="31" rx="2" fill="#0e7490"/>'
+            '<path d="M42 119V96M32 105Q42 76 52 105Z" fill="#166534" stroke="#166534"/>'
+            '<path d="M220 119V96M210 105Q220 76 230 105Z" fill="#166534" stroke="#166534"/></svg>'
+            '<h3>🏅 Certificat de qualité</h3><p><b>%s</b> · %s %% · couverture %s %%</p>'
+            '<div class="vis-peb">%s</div><p class="sub">%s</p>%s%s</aside>') % (
+                lettre, fr(score, 0), fr(q.get('cov'), 0), lignes, note,
+                '<p class="sub">Point faible : %s · %s %%.</p>' % (esc(faible['lab']), fr(faible['pct'], 0)) if faible else '',
+                '<p class="sub">Évaluation partielle : des contrôles restent inconnus.</p>'
+                if q.get('partiel') or q.get('provisoire') else '')
+
+
+def visite_loyer_donnees(D, R):
+    """Projection existante, sans repli sur le BPA ni annualisation/extrapolation.
+
+    Les années du tableau sont la référence. Un dividende n'est associé que si
+    le premier exercice, l'année et la position dans le scénario concordent.
+    """
+    tb = G(D, 'croissance.tableau') or {}
+    tb = tb if isinstance(tb, dict) else {}
+    annees = tb.get('annees') if isinstance(tb.get('annees'), list) else []
+    lignes = tb.get('lignes') if isinstance(tb.get('lignes'), list) else []
+    ne = tb.get('n_estime')
+    ne = ne if isinstance(ne, int) and not isinstance(ne, bool) and 0 <= ne <= len(annees) else None
+    nh = len(annees) - ne if ne is not None else len(annees)
+    fcf = next((x[1] for x in lignes if isinstance(x, (list, tuple)) and len(x) >= 2
+                and str(x[0]).strip().upper().startswith('FCF/ACTION') and isinstance(x[1], list)), [])
+    premier = _date_complete(G(D, 'valo.premier_exercice'))
+    evaluation = _date_complete(G(D, 'meta.date_eval'))
+    horizon = _nb(G(D, 'boule_neige.horizon_ans'))
+    horizon = horizon if num(horizon) and horizon >= 0 else None
+    dps = G(D, 'valo.scenarios.central.dps')
+    dps = dps if isinstance(dps, list) else []
+    financier = est_financier(D)
+    sans_flux = bool(R.get('assurance_or') or R.get('exclusion'))
+    rows = []
+    for j, lab in enumerate(annees[nh:]):
+        an = _annee(lab)
+        an_debut = _annee(annees[nh]) if ne else None
+        aligne = bool(premier and an and an == premier.year + j and an_debut == premier.year)
+        # Les clôtures n + j restent dans le calendrier fiscal existant.
+        cloture = None
+        if aligne:
+            try:
+                cloture = premier.replace(year=premier.year + j)
+            except ValueError:
+                cloture = premier.replace(year=premier.year + j, day=28)
+        delai = ((cloture - evaluation).days / 365.2425) if cloture and evaluation else None
+        visible = None if horizon is None else (delai <= horizon + 1e-9 if num(delai) else j + 1 <= horizon)
+        cash = _nb(fcf[nh + j]) if nh + j < len(fcf) and not financier and not sans_flux else None
+        dividende = _nb(dps[j]) if aligne and j < len(dps) and not sans_flux else None
+        rows.append(dict(annee=str(lab), cash=cash, dividende=dividende, visible=visible, aligne=aligne))
+    # Si le tableau manque, on affiche les dates connues, jamais une barre inventée.
+    if not rows and premier and not sans_flux:
+        for j in range(4):
+            try:
+                cloture = premier.replace(year=premier.year + j)
+            except ValueError:
+                cloture = premier.replace(year=premier.year + j, day=28)
+            delai = (cloture - evaluation).days / 365.2425 if evaluation else None
+            visible = None if horizon is None else (delai <= horizon + 1e-9 if num(delai) else j + 1 <= horizon)
+            rows.append(dict(annee=str(premier.year + j), cash=None,
+                             dividende=_nb(dps[j]) if j < len(dps) else None, visible=visible, aligne=True))
+    cours = _nb(G(D, 'meta.cours'))
+    if G(R, 'action.cours_invalide') or not num(cours) or cours <= 0:
+        cours = None
+    # On ne rend sélectionnable qu'un plafond que le moteur autorise à publier.
+    prix = R.get('PA') if R.get('valorisation_valide') else None
+    if G(R, 'actifs.actif'):
+        prix = G(R, 'actifs.prix') if G(R, 'actifs.prix_publiable') else None
+    elif G(R, 'pari.actif'):
+        prix = G(R, 'pari.prix') if G(R, 'pari.prix_publiable') else None
+    if not num(prix) or prix <= 0 or sans_flux:
+        prix = None
+    # Même troncature que le plafond d'ordre affiché (notamment JPY/KRW).
+    prix = _nb(fplafond(prix, G(D, 'meta.devise'))) if num(prix) else None
+    return dict(annees=rows, cours=cours, prix=prix, horizon=horizon,
+                devise=str(G(D, 'meta.devise') or ''), financier=financier, sans_flux=sans_flux,
+                pari=bool(G(R, 'pari.actif')))
+
+
+def visite_loyer_svg(data, prix):
+    rows = data['annees']
+    n = max(1, len(rows)) + 1
+    largeur = max(780, 140 * n + 80)
+    vals = [100 * v / prix for r in rows if r['visible'] is not False
+            for v in (r['cash'], r['dividende']) if num(v) and num(prix) and prix > 0]
+    bas, haut = min([0] + vals), max([5] + vals)
+    marge = max(2, (haut - bas) * .2)
+    lo, hi = bas - (marge if bas < 0 else 0), haut + marge
+    y = lambda v: 248 - (v - lo) / (hi - lo) * 198
+    y0 = y(0)
+    parts = ['<svg viewBox="0 0 %s 328" role="img" aria-label="Cash et dividendes par exercice sur prix choisi">'
+             '<title>Cash projeté par action rapporté au prix choisi ; aucun flux garanti.</title>'
+             '<defs><pattern id="vis-hachure" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">'
+             '<rect width="8" height="8" fill="#09282e"/><path d="M0 0V8" stroke="#22d3ee" stroke-width="3"/></pattern>'
+             '<pattern id="vis-brouillard" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">'
+             '<rect width="8" height="8" fill="#111820"/><path d="M0 0V8" stroke="#425265" stroke-width="2"/></pattern></defs>' % largeur]
+    for v in sorted(set((lo, 0, hi))):
+        parts.append('<line x1="60" x2="%s" y1="%.2f" y2="%.2f" stroke="#334155" stroke-dasharray="4 5"/>'
+                     '<text x="52" y="%.2f" text-anchor="end" fill="#94a3b8" font-size="13">%s %%</text>' %
+                     (largeur - 15, y(v), y(v), y(v) + 5, fr(v, 0)))
+    pas = (largeur - 85) / n
+    for j, row in enumerate(rows):
+        cx = 85 + pas * (j + .5)
+        cash = 100 * row['cash'] / prix if num(row['cash']) and num(prix) and prix > 0 else None
+        div = 100 * row['dividende'] / prix if num(row['dividende']) and num(prix) and prix > 0 else None
+        if row['visible'] is False:
+            parts.append('<rect x="%.2f" y="50" width="72" height="198" rx="8" fill="url(#vis-brouillard)"/>'
+                         '<text x="%.2f" y="143" text-anchor="middle" fill="#94a3b8" font-size="14">non prouvé</text>' % (cx - 36, cx))
+        else:
+            if num(cash):
+                yy, hh = min(y0, y(cash)), abs(y(cash) - y0)
+                parts.append('<rect x="%.2f" y="%.2f" width="66" height="%.2f" rx="5" fill="%s" stroke="%s"/>' %
+                             (cx - 36, yy, hh, '#c55362' if cash < 0 else 'url(#vis-hachure)', '#ff787d' if cash < 0 else '#22d3ee'))
+                parts.append('<text x="%.2f" y="%.2f" text-anchor="middle" fill="%s" font-size="24" font-weight="700">%s %%</text>' %
+                             (cx - 4, max(24, yy - 12), '#ff9297' if cash < 0 else '#a5f3fc', fr(cash, 1)))
+            else:
+                parts.append('<text x="%.2f" y="145" text-anchor="middle" fill="#94a3b8" font-size="19">n.d.</text>' % cx)
+            if num(div):
+                # Barre étroite distincte : un dividende peut excéder le FCF annuel.
+                parts.append('<rect x="%.2f" y="%.2f" width="10" height="%.2f" rx="2" fill="#facc15"/>' %
+                             (cx + 35, min(y0, y(div)), abs(y(div) - y0)))
+        parts.append('<text x="%.2f" y="282" text-anchor="middle" fill="#e2e8f0" font-size="16">%s</text>'
+                     '<text x="%.2f" y="306" text-anchor="middle" fill="#94a3b8" font-size="12">estimé</text>' %
+                     (cx, esc(row['annee']), cx))
+    cx = 85 + pas * (n - .5)
+    parts.append('<rect x="%.2f" y="50" width="85" height="198" rx="8" fill="url(#vis-brouillard)"/>'
+                 '<text x="%.2f" y="132" text-anchor="middle" fill="#cbd5e1" font-size="22">🌫️</text>'
+                 '<text x="%.2f" y="162" text-anchor="middle" fill="#94a3b8" font-size="13">non prouvé</text>'
+                 '<text x="%.2f" y="282" text-anchor="middle" fill="#94a3b8" font-size="14">Au-delà</text></svg>' %
+                 (cx - 42, cx, cx, cx))
+    return ''.join(parts)
+
+
+def visite_loyer_html(D, R, data):
+    prix = data['cours']
+    mode = 'cours'
+    if not num(prix) and num(data['prix']):
+        prix, mode = data['prix'], 'prix'
+    if data['sans_flux']:
+        txt = ('L’or ne génère ni cash opérationnel ni dividende : cette lecture locative est sans objet.'
+               if R.get('assurance_or') else 'Profil hors périmètre : aucune production de cash ni décision d’achat n’est simulée ici.')
+        return '<p class="sub">%s</p>' % txt
+    boutons = ''.join('<button type="button" class="vis-prix-bouton%s" data-vis-prix="%s" aria-pressed="%s"%s>%s</button>' %
+                      (' on' if mode == cle else '', cle, 'true' if mode == cle else 'false',
+                       '' if num(val) else ' disabled', titre)
+                      for cle, val, titre in (('cours', data['cours'], 'Au cours actuel'), ('prix', data['prix'], 'À mon prix d’achat')))
+    rows = data['annees']
+    trs = ''.join('<tr><td>%s · estimé</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % (
+        esc(r['annee']), '%s %s' % (fr(r['cash'], 2), esc(data['devise'])) if num(r['cash']) else 'n.d.',
+        '%s %%' % fr(100 * r['cash'] / prix, 1) if num(r['cash']) and num(prix) else 'n.d.',
+        '%s %s' % (fr(r['dividende'], 2), esc(data['devise'])) if num(r['dividende']) else 'n.d.',
+        'Au-delà de la visibilité · non prouvé' if r['visible'] is False else 'Visibilité déclarée · estimation'
+        if r['visible'] is True else 'Visibilité n.d.') for r in rows)
+    situation = 'Le cash est produit par le business ; seule la distribution décidée arrive sur ton compte.'
+    if data['financier']:
+        situation = 'Banque ou assureur : le FCF standard n’est pas comparable. Cash projeté n.d. ; pas de conversion automatique du BPA en cash.'
+    elif data['pari']:
+        situation = 'Bien en construction : le business peut consommer du cash. Les pertes et les financements restent visibles.'
+    horizon = '%s ans' % fr(data['horizon'], 0) if num(data['horizon']) else 'n.d.'
+    payload = json.dumps(data, ensure_ascii=False, allow_nan=False).replace('<', '\\u003c')
+    return ('<p>%s</p><div class="vis-prix-choix" role="group" aria-label="Prix utilisé pour le graphique">%s</div>'
+            '<p class="sub" id="vis-prix-lecture">Prix de lecture : %s %s · %s.</p>'
+            '<div class="vis-graph-scroll" id="vis-loyer-graph">%s</div>'
+            '<p class="vis-legende">🟦 Cash produit · 🟨 dividende brut prévu · hachures : projection, jamais bail garanti.</p>'
+            '<p id="vis-loyer-message" class="vis-message">Le rendement du cash est distinct du TRI boursier, qui inclut les distributions et la revente. '
+            'Changer le prix de lecture ne modifie ni la décision ni la ligne TRI.</p>'
+            '<p class="sub">Visibilité déclarée : %s. Aucune année supplémentaire n’est chiffrée sans donnée existante. '
+            'Un FCF manquant reste n.d. ; un dividende absent reste n.d. et non zéro.</p>'
+            '<details class="dossier-repli"><summary>Montants, périodes et définition du loyer</summary>'
+            '<div class="scroll"><table><thead><tr><th>Exercice</th><th>FCF/action</th><th>Sur prix choisi</th>'
+            '<th>Dividende brut/action</th><th>Visibilité</th></tr></thead><tbody id="vis-loyer-table">%s</tbody></table></div>'
+            '<p>FCF/action repris du tableau de croissance existant, dans la devise de cotation ; sa définition et ses '
+            'retraitements restent ceux du dossier. Vérifier l’entretien, la croissance, le BFR et les droits des autres apporteurs de capitaux. '
+            'Le cash après seul entretien n’est pas assimilé automatiquement au FCF après tous les investissements.</p>'
+            '<p>Les dividendes proviennent du scénario central, rapprochés par exercice, avant fiscalité et frais. '
+            'Ils ne s’ajoutent pas au FCF comme une seconde production. Ils peuvent être financés par la trésorerie ou la dette '
+            'et dépasser le FCF annuel. La fiscalité déjà prévue par le moteur reste dans son calcul du TRI.</p>'
+            '<p>Exercices annuels complets : acheter en cours d’année ne donne pas droit au cash produit avant l’achat. '
+            'Le cumul du cash produit ne rembourse pas automatiquement l’investissement. Rachats et dilution ne se comptent qu’une fois.</p>'
+            '<p>La durée visible ne garantit ni contrats ni cash futurs. Les exercices au-delà de cette durée restent lisibles '
+            'dans ce tableau comme hypothèses, mais sont masqués par le brouillard sur le graphique.</p></details>'
+            '<script type="application/json" id="nico-visite-donnees">%s</script>') % (
+                situation, boutons, fr(prix, 2), esc(data['devise']), 'cours actuel' if mode == 'cours' else 'prix d’achat du moteur',
+                visite_loyer_svg(data, prix), horizon, trs or '<tr><td colspan="5">n.d. · aucune série FCF projetée renseignée</td></tr>', payload)
+
+
+def visite_pieces_html(R):
+    images = {'modele': ('🌅', 'Le salon avec vue'), 'capital': ('🍳', 'La cuisine qui produit'),
+              'visibilite': ('📜', 'Les baux'), 'cash': ('🔌', 'Les compteurs'),
+              'bilan': ('🧱', 'Les fondations'), 'direction': ('🗝️', 'Le gestionnaire')}
+    pieces = []
+    for cle, lab, _ in PIL:
+        p = G(R, 'q.pil.' + cle) or {}
+        pct = p.get('pct')
+        icone, titre = images[cle]
+        preuves = ''.join('<li>%s</li>' % esc(t) for t in p.get('textes', []) if t)
+        couleur = 'var(--l%s)' % L_PCT(pct) if num(pct) else 'var(--gris)'
+        pieces.append('<article class="vis-piece"><h3>%s %s</h3><p class="sub">%s</p>'
+                      '<strong>%s</strong>%s<p class="sub">%s/3 contrôles observés</p>'
+                      '<details class="dossier-repli"><summary>Pourquoi cette note ?</summary>%s</details></article>' % (
+                          icone, titre, esc(lab), '%s %%' % fr(pct, 0) if num(pct) else 'n.d.',
+                          '<div class="bar"><i style="width:%s%%;background:%s"></i></div>' % (max(0, min(100, pct)), couleur)
+                          if num(pct) else '<p class="sub">Non observé</p>', p.get('obs', 0),
+                          '<ul>%s</ul>' % preuves if preuves else '<p>n.d. · preuves non renseignées</p>'))
+    return '<div class="vis-pieces">%s</div>' % ''.join(pieces)
+
+
+def visite_alerte_prioritaire(D):
+    f = risque_prioritaire(D)
+    if not f:
+        return '<p class="sub">Risque prioritaire non renseigné : cela ne signifie pas absence de risque.</p>'
+    return '<aside class="vis-risque"><strong>🚨 À regarder avant la visite</strong><p>%s</p><p class="sub">%s</p></aside>' % (
+        esc(f.get('fait') or 'Risque à documenter.'), esc(suivi_risque(f)))
+
+
+def visite_offre_html(D, R):
+    action = R.get('action') or {}
+    act = action.get('act') or 'À DOCUMENTER'
+    libelle = {'ACHETER': '✍️ Coup de cœur, je signe',
+               'ATTENDRE LE PRIX': '🏷️ Coup de cœur, j’attends mon prix',
+               'NE PAS ACHETER': '🚪 Je passe mon tour'}.get(act)
+    if not libelle:
+        if act.startswith(('NE PAS ACHETER', 'SORTIR', 'VENDRE', 'ALLÉGER')):
+            libelle = '🚪 ' + act
+        elif act.startswith(('ACHAT TACTIQUE', 'ACHETER', 'RENFORCER')):
+            libelle = '✍️ ' + act
+        elif act.startswith(('ATTENDRE', 'SURVEILLER', 'DOCUMENTER', 'VÉRIFIER', 'DOSSIER')):
+            libelle = '🤔 À revisiter'
+        else:
+            libelle = '🔑 ' + act
+    plan = terminus_html(D, R).replace('<h2>Plan et suivi</h2>', '<h2>🔑 Mon offre · plan et suivi</h2>')
+    c = G(R, 'confiance.pct')
+    conf = (' · 🎯 confiance <b>%s %%</b> %s' % (fr(c, 0), esc(contexte_confiance(D, R)))
+            if num(c) and not (R.get('exclusion') or R.get('assurance_or')) else '')
+    phrase = '<div class="vis-offre"><h3>%s</h3><p>Décision du moteur : <b>%s</b>%s</p><p>%s</p></div>' % (
+        esc(libelle), esc(act), conf, esc(raison_decision(D, R, action)))
+    return plan.replace('<div class="rail-decision">', '<div class="rail-decision">' + phrase, 1)
+
+
+def visite_annonce_html(D, R, data):
+    titre = ('🏗️ Un bien en construction' if data['pari'] else '🏢 Un bien à examiner')
+    if R.get('assurance_or'):
+        titre = '🟡 Un actif de protection'
+    elif G(R, 'actifs.actif'):
+        titre = '⛏️ Un actif et sa durée de vie'
+    prix = ('<span>🏷️ Prix d’achat du moteur ≤ <b>%s %s</b></span>' %
+            (fplafond(data['prix'], data['devise']), esc(data['devise']))) if num(data['prix']) else '<span>🏷️ Prix d’achat publiable : n.d.</span>'
+    cap = R.get('cap_cours')
+    preservation = ('<span>🛡️ Baissier modélisé au cours : <b>%s/100 préservés</b> · estimation</span>' % fr(cap, 0)) if num(cap) else ''
+    premiere = data['annees'][0] if data['annees'] else {}
+    cash = premiere.get('cash')
+    ratio = 100 * cash / data['cours'] if num(cash) and num(data['cours']) and premiere.get('visible') is not False else None
+    accroche = ('<div class="vis-accroche"><span>Cash annuel produit / cours actuel · %s</span><strong>%s</strong>'
+                '<small>Estimation économique · dividendes présentés séparément</small></div>') % (
+                    esc(premiere.get('annee') or 'exercice n.d.'), '%s %%' % fr(ratio, 0) if num(ratio) else 'n.d.')
+    return ('<section class="vis-annonce" id="annonce"><div><p class="vis-kicker">📋 L’ANNONCE · LA VISITE NICO</p>'
+            '%s<p class="sub">%s</p>%s<div class="vis-reperes">%s%s</div>'
+            '<p class="vis-sous-titre">Les revenus, les fondations, les travaux, puis le prix.</p>'
+            '<div class="vis-ancrages"><a href="#loyer">💶 Voir le loyer</a><a href="#detecteurs">🚨 Voir les risques</a>'
+            '<a href="#decision">🔑 Voir l’offre</a><a href="#boussole">🎯 Rendement × confiance</a><a href="#ligne-tri">Copier la ligne TRI</a></div></div>%s</section>') % (
+                entete_html(D, R), titre, visite_tuiles_html(D, R, data), prix, preservation, visite_certificat(D, R))
+
+
+def _visite_tx(R):
+    """Taux exigé de la branche qui gouverne (Actifs, pari ou Voie A), lecture seule."""
+    if G(R, 'actifs.actif') and num(G(R, 'actifs.tx')):
+        return G(R, 'actifs.tx')
+    if G(R, 'pari.actif') and num(G(R, 'pari.tx')):
+        return G(R, 'pari.tx')
+    return R.get('tx')
+
+
+def _visite_niv_rdt(rdt, tx):
+    """Grille figée de Nico : seuil = taux exigé, puis −5 et −10 pts."""
+    if not (num(rdt) and num(tx)):
+        return 'gris'
+    return 'l5' if rdt >= tx else 'l4' if rdt >= tx - 5 else 'l3' if rdt >= tx - 10 else 'l2'
+
+
+def _visite_niv_conf(c):
+    return 'gris' if not num(c) else 'l5' if c >= 80 else 'l4' if c >= 65 else 'l3' if c >= 50 else 'l2'
+
+
+def _visite_rdt_prix(D, R, pa):
+    """Rendement retenu au prix d'achat, même définition qu'au cours (minimum central / flux pondérés).
+    None si non calculable : le cercle n'est alors pas dessiné plutôt que placé au hasard."""
+    if not (num(pa) and pa > 0):
+        return None
+    if G(R, 'actifs.actif'):
+        return None
+    if G(R, 'pari.actif'):
+        r = G(R, 'pari.rdt_prix')
+        return r if num(r) else None
+    ctx, scs = R.get('ctx'), G(D, 'valo.scenarios')
+    if not (R.get('valorisation_valide') and ctx and isinstance(scs, dict) and isinstance(scs.get('central'), dict)):
+        return None
+    try:
+        dispo = [t for t in (tri(flux(pa, scs['central'], ctx)[0]), tri(flux_pond(pa, scs, ctx))) if num(t)]
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        return None
+    return min(dispo) if dispo else None
+
+
+def visite_tuiles_html(D, R, data):
+    """V27.2.1 : les trois chiffres de l'annonce — loyer, gain attendu, confiance. Lecture seule."""
+    premiere = data['annees'][0] if data['annees'] else {}
+    cash = premiere.get('cash')
+    loyer = 100 * cash / data['cours'] if num(cash) and num(data['cours']) and premiere.get('visible') is not False else None
+    rdt, tx = R.get('retenu'), _visite_tx(R)
+    c = G(R, 'confiance.pct')
+    hors = bool(R.get('exclusion') or R.get('assurance_or'))
+    tuile = '<div class="vis-tuile"><span>%s</span><strong class="t-%s">%s</strong><small>%s</small></div>'
+    t1 = tuile % ('💶 Loyer · ' + esc(premiere.get('annee') or 'exercice n.d.'), 'cy',
+                  '%s %%' % fr(loyer, 1) if num(loyer) else 'n.d.', 'cash produit pour 100 investis au cours')
+    t2 = tuile % ('📈 Gain attendu au cours', _visite_niv_rdt(rdt, tx) if not hors else 'gris',
+                  ('%s %%<em>/an</em>' % fr(rdt, 1)) if num(rdt) and not hors else 'n.d.',
+                  ('ton seuil : %s %%/an net' % fr(tx, 1)) if num(tx) and not hors else 'seuil n.d.')
+    t3 = tuile % ('🎯 Indice de confiance', _visite_niv_conf(c) if not hors else 'gris',
+                  ('%s %%' % fr(c, 0)) if num(c) and not hors else 'n.d.',
+                  esc(contexte_confiance(D, R)) if num(c) and not hors else 'non calculée')
+    return '<div class="vis-tuiles">%s%s%s</div>' % (t1, t2, t3)
+
+
+def visite_boussole_html(D, R, data):
+    """V27.2.1 : rendement × confiance. Lecture seule : ni prix, ni taux, ni verdict ne changent."""
+    if R.get('exclusion') or R.get('assurance_or'):
+        return ''
+    rdt, tx = R.get('retenu'), _visite_tx(R)
+    c = G(R, 'confiance.pct')
+    if not (num(tx) and num(c)):
+        return ('<section class="vis-boussole" id="boussole"><h2>🎯 Rendement × confiance</h2>'
+                '<p class="sub">Lecture impossible : taux exigé ou confiance n.d.</p></section>')
+    pa = data.get('prix')
+    devise = data.get('devise') or ''
+    cours = data.get('cours')
+    rpa = _visite_rdt_prix(D, R, pa) if (num(pa) and num(cours) and cours > pa * 1.005) else None
+    vals = [tx] + ([rdt] if num(rdt) else []) + ([rpa] if num(rpa) else [])
+    lo = max(-30, 5 * math.floor((min(vals) - 8) / 5.0))
+    hi = min(60, 5 * math.ceil((max(vals) + 8) / 5.0))
+    X0, X1, Y0, Y1 = 70, 610, 270, 30
+    fx = lambda v: X0 + (min(95, max(30, v)) - 30) / 65.0 * (X1 - X0)
+    fy = lambda v: Y0 - (min(hi, max(lo, v)) - lo) / float(hi - lo) * (Y0 - Y1)
+    xa, xb, ys = fx(65), fx(80), fy(tx)
+    zones = ((X0, Y1, xa - X0, ys - Y1, 'rgba(240,153,74,.11)'), (xa, Y1, xb - xa, ys - Y1, 'rgba(78,222,154,.09)'),
+             (xb, Y1, X1 - xb, ys - Y1, 'rgba(78,222,154,.22)'), (X0, ys, xa - X0, Y0 - ys, 'rgba(240,96,95,.13)'),
+             (xa, ys, xb - xa, Y0 - ys, 'rgba(126,151,157,.08)'), (xb, ys, X1 - xb, Y0 - ys, 'rgba(242,207,91,.12)'))
+    svg = ['<svg viewBox="0 0 640 330" role="img" aria-label="Rendement attendu et confiance">'
+           '<title>Plus haut = plus de rendement ; plus à droite = plus de confiance.</title>']
+    svg += ['<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="%s"/>' % z for z in zones]
+    svg.append('<rect x="%s" y="%s" width="%s" height="%s" fill="none" stroke="#2b3d42"/>' % (X0, Y1, X1 - X0, Y0 - Y1))
+    svg.append('<line x1="%s" x2="%s" y1="%.1f" y2="%.1f" stroke="#f2cf5b" stroke-width="2" stroke-dasharray="7 5"/>' % (X0, X1, ys, ys))
+    for xv in (xa, xb):
+        svg.append('<line x1="%.1f" x2="%.1f" y1="%s" y2="%s" stroke="#3b5058" stroke-dasharray="3 5"/>' % (xv, xv, Y1, Y0))
+    etiquettes = (((xb + X1) / 2, Y1 + 24, '💎 La perle', '#4ede9a'), ((X0 + xa) / 2, Y1 + 24, '🎲 Risqué', '#f0994a'),
+                  ((xb + X1) / 2, Y0 - 12, '🏷️ Sain mais cher', '#f2cf5b'), ((X0 + xa) / 2, Y0 - 12, '⚠️ Fragile', '#f0605f'))
+    svg += ['<text x="%.1f" y="%.1f" text-anchor="middle" fill="%s" font-size="15" font-weight="700">%s</text>' % (x, y, col, t)
+            for x, y, t, col in etiquettes]
+    for v in (30, 50, 65, 80, 95):
+        svg.append('<text x="%.1f" y="%s" text-anchor="middle" fill="#94a3b8" font-size="13">%s %%</text>' % (fx(v), Y0 + 20, v))
+    svg.append('<text x="%s" y="%s" text-anchor="middle" fill="#a9c0c5" font-size="13">confiance au prix d’achat →</text>' % ((X0 + X1) / 2, Y0 + 42))
+    for v in (lo, hi):
+        if abs(fy(v) - ys) > 14:
+            svg.append('<text x="%s" y="%.1f" text-anchor="end" fill="#94a3b8" font-size="13">%s %%</text>' % (X0 - 8, fy(v) + 5, fr(v, 0)))
+    svg.append('<text x="%s" y="%.1f" text-anchor="end" fill="#f2cf5b" font-size="13" font-weight="700">%s %%</text>' % (X0 - 8, ys + 5, fr(tx, 0)))
+    svg.append('<text x="18" y="%s" fill="#a9c0c5" font-size="13" transform="rotate(-90 18 %s)" text-anchor="middle">gain attendu %%/an ↑</text>' % ((Y0 + Y1) / 2, (Y0 + Y1) / 2))
+    cx = fx(c)
+    if num(rdt):
+        cy = fy(rdt)
+        if num(rpa):
+            gy = fy(rpa)
+            svg.append('<line x1="%.1f" x2="%.1f" y1="%.1f" y2="%.1f" stroke="#f2cf5b" stroke-width="2" stroke-dasharray="4 4"/>' % (cx, cx, cy, gy))
+            svg.append('<circle class="vis-cercle-prix" cx="%.1f" cy="%.1f" r="9" fill="none" stroke="#f2cf5b" stroke-width="3" data-rdt-prix="%.4f"/>' % (cx, gy, rpa))
+            svg.append('<text x="%.1f" y="%.1f" text-anchor="%s" fill="#f2cf5b" font-size="13">à ton prix d’achat ≤ %s %s · %s %%/an · confiance %s %%</text>' % (
+                cx + (14 if cx < 400 else -14), gy - 12, 'start' if cx < 400 else 'end', esc(fplafond(pa, devise)), esc(devise), fr(rpa, 1), fr(c, 0)))
+            ty = cy + 5 if cy >= gy else cy + 22
+            etiquette = 'aujourd’hui · %s %%/an' % fr(rdt, 1)
+        else:
+            ty = cy + 5
+            etiquette = 'aujourd’hui · %s %%/an · confiance %s %%' % (fr(rdt, 1), fr(c, 0))
+        svg.append('<circle cx="%.1f" cy="%.1f" r="10" fill="#39d6e0" stroke="#000" stroke-width="3"/>' % (cx, cy))
+        svg.append('<text x="%.1f" y="%.1f" text-anchor="%s" fill="#39d6e0" font-size="14" font-weight="700">%s</text>' % (
+            cx + (16 if cx < 430 else -16), ty, 'start' if cx < 430 else 'end', etiquette))
+    svg.append('</svg>')
+    ok = num(rdt) and rdt >= tx
+    if not num(rdt):
+        phrase = '⚪ Rendement non calculé : le bien ne peut pas être placé sur la carte (confiance %s %%).' % fr(c, 0)
+    elif c >= 80:
+        phrase = ('💎 La perle : le rendement visé, avec un avenir sain.' if ok else
+                  '🏷️ Bien sain, mais trop cher aujourd’hui : la confiance est là, il manque le prix.')
+    elif c >= 65:
+        phrase = ('⚖️ Bon rendement, confiance correcte : les preuves doivent encore se renforcer.' if ok else
+                  '🤔 Confiance moyenne et rendement sous le seuil : à revoir au bon prix.')
+    else:
+        phrase = ('🎲 Rendement alléchant mais avenir incertain : prudence sur la taille.' if ok else
+                  '⚠️ Confiance faible et rendement sous le seuil : même au bon prix, ce bien resterait fragile.')
+    act = str(G(R, 'action.act') or '')
+    raison = _premiere_phrase(G(R, 'action.pourquoi') or R.get('verdict_final') or '', 150)
+    achat = act.startswith(('ACHETER', 'RENFORCER', 'ACHAT', 'GARDER'))
+    attente_prix = act.startswith('ATTENDRE LE PRIX')
+    suite = (' — ' + raison.rstrip('.')) if raison else ''
+    fin = '' if suite.endswith('…') else '.'
+    if act and ok and not achat:
+        zone = '💎 La perle' if c >= 80 else '⚖️ zone correcte' if c >= 65 else '🎲 zone risquée'
+        phrase = '🔒 Sur la carte, le bien est en %s, mais la décision du moteur prime : %s%s%s' % (zone, act, suite, fin)
+    elif act and num(rdt) and not ok and not (achat or attente_prix):
+        phrase += ' 🔒 Décision du moteur : %s%s%s' % (act, suite, fin)
+    return ('<section class="vis-boussole" id="boussole"><h2>🎯 Rendement × confiance : est-ce une perle ?</h2>'
+            '<p class="vis-boussole-phrase">%s</p><div class="vis-graph-scroll vis-boussole-graph">%s</div>'
+            '<p class="sub">Ta règle : 12 %% estimés avec un indice de confiance de 95/100 valent mieux que 18 %% avec un indice de 69/100. '
+            'On cherche donc le coin en haut à droite, pas seulement le point le plus haut.</p>'
+            '<p class="sub">L’indice de confiance (30 à 95) se lit au prix d’achat de référence, pas automatiquement au cours du jour. '
+            'C’est une convention de sélection fondée sur un faisceau d’indices, pas une probabilité mesurée. '
+            'Il ne change ni le prix, ni le taux exigé, ni la décision : en cas de blocage, la décision du moteur prime.</p></section>') % (esc(phrase), ''.join(svg))
+
+
+def visite_chapitre(cle, numero, titre, question, contenu):
+    return ('<section class="vis-station" id="%s"><div class="vis-num">%s</div>'
+            '<h2>%s</h2><p class="vis-question">%s</p><div class="vis-contenu">%s</div></section>') % (
+                cle, numero, titre, question, contenu or '<p class="sub">n.d. · éléments non renseignés</p>')
+
+
+def rendu_visite(D, R, BK, stations, voie, prix, croissance, longevite, gouvernance,
+                 resultats, suivi, annexe, tactique, controles_decision):
+    """Réassemble les blocs existants ; prix/portes/confiance/ligne NICO restent intacts."""
+    def bloc(*cles):
+        return ''.join(''.join(BK.get(cle, [])) for cle in cles)
+    data = visite_loyer_donnees(D, R)
+    ouverture = (bloc('tete') + visite_annonce_html(D, R, data) + visite_boussole_html(D, R, data) + conclusion_html(D, R)
+                 + visite_alerte_prioritaire(D) + bloc('alertes') + arbitrage_place_html(R))
+    navs = (('loyer', '💶 Loyer'), ('quartier', '🏘️ Quartier'), ('immeuble', '🏢 Immeuble'),
+            ('qualite', '🛋️ Pièce par pièce'), ('detecteurs', '🚨 Détecteurs'),
+            ('croissance', '📈 Potentiel'), ('prix', '🏷️ Prix'), ('decision', '🔑 Offre'))
+    nav = '<nav class="vis-parcours" aria-label="Parcours de visite">%s</nav>' % ''.join(
+        '<a href="#%s">%s</a>' % p for p in navs)
+    inspection = (resultats if R.get('derniers_resultats') else bloc('resultats'))
+    inspection = ('<div class="vis-inspection"><h3>🔎 Dernière inspection · résultats récents</h3>%s</div>' % inspection
+                  if inspection else '<p class="sub">Dernière inspection : n.d. · publication non renseignée.</p>')
+    # On garde la boussole, l'activité et le positionnement réels, sans inventer de bail ou d'occupation.
+    activite = business_html(D) + verdict_titre_html(R) + boussole_html(D)
+    quartier = bloc('ep1', 'vent') + monde_html(R)
+    immeuble = activite + gouvernance + inspection
+    pieces = visite_pieces_html(R) + revenus_html(D) + bloc('rentabilite')
+    risques = bloc('registre') + suivi + angles_morts_html(R) + cash_action_html(R)
+    station_duree = next((s for s in stations if s['cle'] == 'longevite'), None)
+    if station_duree:
+        duree = '<h3>%s</h3><p>%s</p>%s' % (esc(station_duree['valeur']), esc(station_duree['reponse']), station_duree['contenu'])
+    else:
+        l = R.get('longevite') or {}
+        duree = '<h3>Durée visible : %s ans · exigée par le cours : %s ans</h3><p>%s</p>%s' % (
+            fr(l.get('H'), 0), fr(l.get('tm'), 0), esc(longevite_soutien(D, R)), longevite)
+    potentiel = croissance + '<div id="longevite">%s</div>' % duree
+    # Les branches financières particulières gardent leurs stations et identifiants propres.
+    particuliers = [s for s in stations if s['cle'] not in ('qualite', 'croissance', 'longevite', 'prix')]
+    prix_detail = prix + ''.join(chapitre_rail(D, i + 1, s) for i, s in enumerate(particuliers))
+    if voie not in ('A', 'B', 'pari', 'actif') and not R.get('exclusion') and not R.get('assurance_or'):
+        prix_detail += '<p class="sub">Lecture long terme pour mémoire ; les portes d’achat restent celles de la conclusion.</p>'
+    # Les profils sans valorisation conservent leur arrêt explicite en tête du prix.
+    if R.get('exclusion'):
+        prix_detail = '<p>⛔ Hors périmètre : aucun prix d’achat publié.</p>'
+    elif R.get('assurance_or'):
+        prix_detail = '<p>Actif de protection sans flux opérationnel : la valorisation d’un business ne s’applique pas.</p>'
+    fin = (visite_offre_html(D, R) + controles_decision + bloc('plan') + partition_html(D, R)
+           + tactique + bloc('nico') + annexe)
+    if 'id="ligne-tri"' not in fin:
+        fin = fin.replace('<h2>Ligne pour l\'outil de tri</h2>', '<h2 id="ligne-tri">Ligne pour l\'outil de tri</h2>', 1)
+    script = bloc('script').replace('</div></body></html>', '<script>%s</script></div></body></html>' % JS_VISITE)
+    return (ouverture + nav
+            + visite_chapitre('loyer', 1, '💶 Le loyer', 'Pour 100 investis, combien de cash ce business produit-il chaque année ?', visite_loyer_html(D, R, data))
+            + visite_chapitre('quartier', 2, '🏘️ Le quartier', 'Le besoin et le marché vont-ils durer ?', quartier)
+            + visite_chapitre('immeuble', 3, '🏢 L’immeuble et son gestionnaire', 'Quelle activité j’achète, et qui la gère ?', immeuble)
+            + visite_chapitre('qualite', 4, '🛋️ L’état des lieux, pièce par pièce', 'Que montrent les six piliers de qualité ?', pieces)
+            + visite_chapitre('detecteurs', 5, '🚨 Les détecteurs et les travaux', 'Qu’est-ce qui peut abîmer le business ou exiger du cash ?', risques)
+            + visite_chapitre('croissance', 6, '📈 Le potentiel', 'Comment et combien de temps le cash peut-il grandir ?', potentiel)
+            + visite_chapitre('prix', 7, '🏷️ Le prix', 'Quel prix permet le rendement exigé, selon les hypothèses du moteur ?', prix_detail)
+            + fin + script)
+
+
+CSS_VISITE = r'''
+.vis-annonce,.vis-station{border:1px solid var(--bord);border-radius:18px;background:var(--carte);margin:28px 0;padding:28px}
+.vis-annonce{display:grid;grid-template-columns:1.35fr 1fr;gap:26px;align-items:center;text-align:left;border-left:4px solid var(--cy)}
+.vis-annonce .dossier-entete{margin:0;padding:0;text-align:left}.vis-annonce h1{font-size:clamp(26px,4vw,38px)}
+.vis-kicker{font:700 13px ui-monospace,monospace;letter-spacing:.1em;color:var(--cy)}
+.vis-sous-titre{font-size:17px;color:var(--txt2)}.vis-ancrages,.vis-parcours{display:flex;flex-wrap:wrap;gap:9px;justify-content:center}
+.vis-reperes{display:flex;flex-wrap:wrap;gap:10px;font-size:14px}.vis-reperes span{padding:8px 10px;border:1px solid var(--bord);border-radius:10px}
+.vis-accroche{border:1px solid #155e75;border-radius:14px;background:#03222a;padding:14px 18px;margin:15px 0}.vis-accroche span,.vis-accroche small{display:block;font-size:13px;color:var(--txt2)}.vis-accroche strong{display:block;color:var(--cy);font:700 42px ui-monospace,monospace;line-height:1.25;margin:5px 0}
+.vis-ancrages{justify-content:flex-start}.vis-ancrages a,.vis-parcours a{border:1px solid var(--bord);border-radius:24px;padding:7px 12px;color:var(--cy);font-size:14px;text-decoration:none}
+.vis-parcours{margin:25px 0}.vis-certificat{text-align:left;min-width:0}.vis-certificat p{font-size:15px}.vis-peb{padding-right:18px;max-width:300px}
+.vis-peb-ligne{position:relative;display:flex;gap:10px;align-items:center;height:27px;margin:3px 0;padding:0 9px;background:var(--peb);color:#07120d;border-radius:0 14px 14px 0;font:700 13px ui-monospace,monospace}
+.vis-peb-ligne strong{position:absolute;right:-23px;color:#fff}.vis-peb-selection{outline:2px solid #fff;outline-offset:1px}
+.vis-batiment{display:block;width:190px;height:95px;margin:0 auto 8px}
+.vis-num{display:grid;place-items:center;width:38px;height:38px;border:1px solid var(--sous-titre);border-radius:50%;margin:0 auto 8px;color:var(--sous-titre)}
+.vis-station>h2{font-size:27px;color:var(--sous-titre);margin:7px 0}.vis-question{color:var(--cy);font-size:19px;margin:5px auto 20px}
+.vis-contenu{text-align:left}.vis-contenu p{max-width:none}.vis-contenu .c{margin:16px 0}.vis-contenu h3{line-height:1.35}
+.vis-prix-choix{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin:18px 0}.vis-prix-bouton{font:inherit;font-size:15px;min-height:44px;padding:8px 14px;background:#101820;border:1px solid var(--bord);color:var(--txt);border-radius:24px;cursor:pointer}
+.vis-prix-bouton.on{border-color:var(--cy);color:var(--cy)}.vis-prix-bouton:disabled{opacity:.45;cursor:default}.vis-prix-bouton:focus-visible{outline:2px solid var(--cy);outline-offset:3px}
+.vis-graph-scroll{overflow-x:auto}.vis-graph-scroll svg{display:block;min-width:680px;width:100%;height:auto;max-height:440px}.vis-legende{font-size:14px;color:var(--txt2);text-align:center}.vis-message{border-left:3px solid var(--cy);padding:12px 16px;background:#062027;font-size:16px}
+.vis-pieces{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.vis-piece{border:1px solid var(--bord);border-radius:12px;padding:18px;min-width:0}
+.vis-piece h3{font-size:18px}.vis-piece strong{font-size:24px;color:var(--cy)}.vis-piece p,.vis-piece li{font-size:15px}.vis-piece details{font-size:14px}
+.vis-risque{padding:16px 20px;border:1px solid #8b5a35;border-radius:12px;text-align:left;background:#241b13;margin:18px 0}.vis-risque p{margin:8px 0}
+.vis-inspection>h3{color:var(--cy)}.vis-offre{padding:18px;border:1px solid var(--cy);border-radius:14px;background:#062027}.vis-offre h3{color:var(--cy);font-size:23px}
+.vis-station .rail-chap{margin:20px 0}.vis-contenu details,.vis-contenu ul,.vis-contenu dl{text-align:left}
+@media(max-width:760px){.vis-annonce{grid-template-columns:1fr}.vis-pieces{grid-template-columns:1fr}.vis-annonce,.vis-station{padding:18px}.vis-parcours a{font-size:13px}.vis-certificat{max-width:340px;width:100%;margin:auto}}
+.vis-tuiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:15px 0}
+.vis-tuile{border:1px solid #155e75;border-radius:14px;background:#03222a;padding:12px 14px;min-width:0}
+.vis-tuile span,.vis-tuile small{display:block;font-size:13px;color:var(--txt2);line-height:1.35}
+.vis-tuile strong{display:block;font:700 clamp(22px,2.7vw,31px) ui-monospace,monospace;line-height:1.25;margin:4px 0;white-space:nowrap}
+.vis-tuile strong em{font-size:.5em;font-style:normal;opacity:.8}
+.t-cy{color:var(--cy)}.t-l5{color:var(--l5)}.t-l4{color:var(--l4)}.t-l3{color:var(--l3)}.t-l2{color:var(--l2)}.t-gris{color:var(--gris)}
+.vis-boussole{border:2px solid var(--l4);border-radius:18px;background:var(--carte);margin:28px 0;padding:26px;text-align:center}
+.vis-boussole h2{font-size:26px;color:var(--sous-titre);margin:0 0 8px}
+.vis-boussole-phrase{font-size:clamp(19px,2.4vw,24px);font-weight:650;margin:6px auto 14px;max-width:none}
+.vis-boussole-graph svg{display:block;width:100%;max-width:720px;min-width:520px;height:auto;margin:0 auto}
+@media(max-width:760px){.vis-tuiles{grid-template-columns:1fr}.vis-boussole{padding:16px}}
+@media print{.vis-prix-choix{display:none}.vis-graph-scroll svg{min-width:0}.vis-pieces{grid-template-columns:repeat(2,1fr)}.vis-station{break-inside:auto}.vis-piece{break-inside:avoid}}
+'''
+
+
+JS_VISITE = r'''
+(() => {
+    'use strict';
+    const node = document.getElementById('nico-visite-donnees');
+    if (!node) return;
+    const d = JSON.parse(node.textContent);
+    const fmt = (x, n = 0) => Number.isFinite(x) ? new Intl.NumberFormat('fr-FR', {maximumFractionDigits:n, minimumFractionDigits:n}).format(x) : 'n.d.';
+    const esc = x => String(x).replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
+    const valid = x => typeof x === 'number' && Number.isFinite(x);
+    const ratio = (x, p) => valid(x) && valid(p) && p > 0 ? 100 * x / p : null;
+    function render(key) {
+        const p = d[key];
+        if (!valid(p) || p <= 0) return;
+        document.querySelectorAll('[data-vis-prix]').forEach(b => {const on = b.dataset.visPrix === key; b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on));});
+        document.getElementById('vis-prix-lecture').textContent = 'Prix de lecture : ' + fmt(p, 2) + ' ' + d.devise + ' · ' + (key === 'cours' ? 'cours actuel' : 'prix d’achat du moteur') + '.';
+        const rows = d.annees;
+        const values = rows.filter(r => r.visible !== false).flatMap(r => [ratio(r.cash, p), ratio(r.dividende, p)]).filter(valid);
+        const min = Math.min(0, ...values), max = Math.max(5, ...values), margin = Math.max(2, (max - min) * .2);
+        const lo = min - (min < 0 ? margin : 0), hi = max + margin;
+        const n = Math.max(1, rows.length) + 1, w = Math.max(780, 140 * n + 80), step = (w - 85) / n;
+        const y = v => 248 - (v - lo) / (hi - lo) * 198, zero = y(0);
+        let svg = '<svg viewBox="0 0 ' + w + ' 328" role="img" aria-label="Cash et dividendes par exercice sur prix choisi"><title>Cash projeté : production économique, aucun flux garanti.</title><defs><pattern id="vis-hachure" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="8" height="8" fill="#09282e"/><path d="M0 0V8" stroke="#22d3ee" stroke-width="3"/></pattern><pattern id="vis-brouillard" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="8" height="8" fill="#111820"/><path d="M0 0V8" stroke="#425265" stroke-width="2"/></pattern></defs>';
+        for (const v of [...new Set([lo, 0, hi])]) svg += '<line x1="60" x2="' + (w - 15) + '" y1="' + y(v) + '" y2="' + y(v) + '" stroke="#334155" stroke-dasharray="4 5"/><text x="52" y="' + (y(v) + 5) + '" text-anchor="end" fill="#94a3b8" font-size="13">' + fmt(v) + ' %</text>';
+        rows.forEach((r, i) => {
+            const x = 85 + step * (i + .5), c = ratio(r.cash, p), v = ratio(r.dividende, p);
+            if (r.visible === false) {
+                svg += '<rect x="' + (x - 36) + '" y="50" width="72" height="198" rx="8" fill="url(#vis-brouillard)"/><text x="' + x + '" y="143" text-anchor="middle" fill="#94a3b8" font-size="14">non prouvé</text>';
+            } else {
+                if (valid(c)) {const yy = Math.min(zero, y(c)); svg += '<rect x="' + (x - 36) + '" y="' + yy + '" width="66" height="' + Math.abs(y(c) - zero) + '" rx="5" fill="' + (c < 0 ? '#c55362' : 'url(#vis-hachure)') + '" stroke="' + (c < 0 ? '#ff787d' : '#22d3ee') + '"/><text x="' + (x - 4) + '" y="' + Math.max(24, yy - 12) + '" text-anchor="middle" fill="' + (c < 0 ? '#ff9297' : '#a5f3fc') + '" font-size="24" font-weight="700">' + fmt(c, 1) + ' %</text>';}
+                else svg += '<text x="' + x + '" y="145" text-anchor="middle" fill="#94a3b8" font-size="19">n.d.</text>';
+                if (valid(v)) svg += '<rect x="' + (x + 35) + '" y="' + Math.min(zero, y(v)) + '" width="10" height="' + Math.abs(y(v) - zero) + '" rx="2" fill="#facc15"/>';
+            }
+            svg += '<text x="' + x + '" y="282" text-anchor="middle" fill="#e2e8f0" font-size="16">' + esc(r.annee) + '</text><text x="' + x + '" y="306" text-anchor="middle" fill="#94a3b8" font-size="12">estimé</text>';
+        });
+        const x = 85 + step * (n - .5);
+        svg += '<rect x="' + (x - 42) + '" y="50" width="85" height="198" rx="8" fill="url(#vis-brouillard)"/><text x="' + x + '" y="132" text-anchor="middle" fill="#cbd5e1" font-size="22">🌫️</text><text x="' + x + '" y="162" text-anchor="middle" fill="#94a3b8" font-size="13">non prouvé</text><text x="' + x + '" y="282" text-anchor="middle" fill="#94a3b8" font-size="14">Au-delà</text></svg>';
+        document.getElementById('vis-loyer-graph').innerHTML = svg;
+        document.getElementById('vis-loyer-table').innerHTML = rows.map(r => '<tr><td>' + esc(r.annee) + ' · estimé</td><td>' + (valid(r.cash) ? fmt(r.cash, 2) + ' ' + esc(d.devise) : 'n.d.') + '</td><td>' + (valid(ratio(r.cash,p)) ? fmt(ratio(r.cash,p), 1) + ' %' : 'n.d.') + '</td><td>' + (valid(r.dividende) ? fmt(r.dividende, 2) + ' ' + esc(d.devise) : 'n.d.') + '</td><td>' + (r.visible === false ? 'Au-delà de la visibilité · non prouvé' : r.visible === true ? 'Visibilité déclarée · estimation' : 'Visibilité n.d.') + '</td></tr>').join('') || '<tr><td colspan="5">n.d. · aucune série FCF projetée renseignée</td></tr>';
+        const known = rows.filter(r => r.visible !== false && valid(r.cash));
+        const total = known.reduce((s,r) => s + r.cash, 0);
+        document.getElementById('vis-loyer-message').textContent = known.length ? 'Cash cumulé produit sur ' + known.length + '/' + rows.length + ' exercices renseignés dans la visibilité : ' + fmt(100*total/p) + ' % du prix choisi. Ce cash n’est pas automatiquement encaissé ni un remboursement. Le TRI boursier reste distinct.' : 'Production de cash n.d. : aucune donnée ne sera remplacée par le BPA ou une barre inventée. Le TRI boursier reste distinct.';
+        document.getElementById('vis-loyer-message').textContent += ' Ce bouton ne modifie ni la décision ni la ligne TRI.';
+    }
+    document.querySelectorAll('[data-vis-prix]').forEach(b => b.addEventListener('click', () => render(b.dataset.visPrix)));
+    render(valid(d.cours) ? 'cours' : 'prix');
+})();
+'''
 
 def lire_dossier(src):
     with open(src, encoding='utf-8') as f:
