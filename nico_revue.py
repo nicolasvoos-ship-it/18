@@ -101,7 +101,8 @@ def seuil(nico, calc):
     objectif = nico._nb(tactique.get('objectif'))
     if positif(objectif):
         return 'Objectif tactique', objectif, True
-    if nico.G(calc, 'action.act') in ('ACHAT TACTIQUE (VOIE B)', 'RENFORCER TACTIQUEMENT (VOIE B)',
+    acte = nico.G(calc, 'action.admissibilite') or nico.G(calc, 'action.act')
+    if acte in ('ACHAT TACTIQUE (VOIE B)', 'RENFORCER TACTIQUEMENT (VOIE B)',
                                      'ATTENDRE LE SIGNAL (VOIE B)', 'SURVEILLER (VOIE B HORS ZONE)'):
         if nico.G(calc, 'voie_b.statut') in ('EN ATTENTE', 'HORS ZONE'):
             declencheur = nico.G(calc, 'voie_b.declencheur')
@@ -111,7 +112,7 @@ def seuil(nico, calc):
     prix = calc.get('PA')
     actions = ('ACHETER', 'ACHETER (POCHE PARI)', 'ATTENDRE LE PRIX', 'RENFORCER',
                'RENFORCER (POCHE PARI)', 'GARDER — TAILLE ATTEINTE', 'GARDER, NE PAS RENFORCER')
-    if not nico.G(calc, 'action.dossier_a_corriger') and nico.G(calc, 'action.act') in actions and positif(prix):
+    if not nico.G(calc, 'action.dossier_a_corriger') and acte in actions and positif(prix):
         return 'Plafond NICO', prix, False
     return '', None, False
 
@@ -126,7 +127,8 @@ def instantane(nico, d, r):
     route = ('Hors périmètre' if r.get('exclusion') else 'Assurance or' if r.get('assurance_or')
              else 'Actifs' if actif else 'Poche pari' if pari else 'Voie B' if nico.G(r, 'pf.tactique_ligne')
              else 'Voie A')
-    return dict(action=nico.G(r, 'action.act') or 'À valider', statut=p[4], detenue=bool(r.get('detenue')),
+    return dict(version_moteur=nico.VERSION, version_valorisation=nico.VERSION_VALORISATION,
+                arbitrage=r.get('arbitrage_place'), regles=r.get('audit_regles'), action=nico.G(r, 'action.act') or 'À valider', statut=p[4], detenue=bool(r.get('detenue')),
                 prix=r.get('PA') if positif(r.get('PA')) else None,
                 rendement=r.get('retenu') if nombre(r.get('retenu')) else None, route=route, tri=texte,
                 date=d['meta'].get('date_eval'), cours=nico.vv(nico.G(d, 'meta.cours')),
@@ -253,6 +255,41 @@ def variation_plafond(nico, d, src, registre, reference, courant):
                 autres=courant['prix'] - apres_temps, jours=(nouvelle - initiale).days)
 
 
+def benchmark_portefeuille(data, date):
+    """Chaîne des sous-périodes en EUR, frontières valorisées avant/après flux externes."""
+    if data is None:
+        return None
+    data = objet(data, 'benchmark_portefeuille')
+    if data.get('devise') != 'EUR' or data.get('cash_et_or_inclus') is not True:
+        raise ValueError('Benchmark : portefeuille complet en EUR, cash et or inclus requis')
+    if data.get('rendement_total_iwda') is not True:
+        raise ValueError('Benchmark : série IWDA en rendement total requise')
+    source = chaine(data.get('source'), 'benchmark.source')
+    conventions = chaine(data.get('conventions_frais_fiscalite'), 'benchmark.conventions_frais_fiscalite')
+    points = data.get('points')
+    if not isinstance(points, list) or len(points) < 2:
+        raise ValueError('Benchmark : deux valorisations au minimum')
+    produit, precedent, premiere = 1.0, None, None
+    for point in points:
+        point = objet(point, 'point du benchmark')
+        d = jour(point.get('date'), 'date du point')
+        avant, flux, iwda = (point.get(k) for k in ('valeur_avant_flux', 'flux_externe', 'iwda_eur'))
+        if (d > date or (precedent and d <= precedent[0]) or not nombre(avant) or avant < 0
+                or not nombre(flux) or avant + flux < 0 or not positif(iwda)):
+            raise ValueError('Benchmark : vérifier dates, NAV, flux externes et niveau IWDA')
+        if precedent:
+            if precedent[1] <= 0:
+                raise ValueError('Benchmark : capital de départ de sous-période nul')
+            produit *= avant / precedent[1]
+        else:
+            premiere = d, iwda
+        precedent = d, avant + flux, iwda
+    pf = 100 * (produit - 1)
+    indice = 100 * (precedent[2] / premiere[1] - 1)
+    return dict(debut=premiere[0].isoformat(), fin=precedent[0].isoformat(), portefeuille_pct=pf,
+                iwda_pct=indice, ecart_pts=pf-indice, source=source, conventions=conventions, points=len(points))
+
+
 def comparer_performance(entree, date):
     """Compare deux séries de rendement total dans une devise commune."""
     retours = entree.get('performance', [])
@@ -275,8 +312,9 @@ def comparer_performance(entree, date):
             raise ValueError('Mesure de performance en double')
         vus.add(cle)
         valeurs = [p.get(k) for k in ('titre_debut', 'titre_fin', 'iwda_debut', 'iwda_fin')]
-        if not all(positif(x) for x in valeurs) or p.get('rendement_total') is not True:
-            raise ValueError('performance attend quatre niveaux de rendement total positifs et comparables')
+        perte_totale = nombre(valeurs[1]) and valeurs[1] == 0 and p.get('perte_totale_confirmee') is True
+        if not (positif(valeurs[0]) and (positif(valeurs[1]) or perte_totale) and positif(valeurs[2]) and positif(valeurs[3])) or p.get('rendement_total') is not True:
+            raise ValueError('performance attend des niveaux comparables ; zéro final uniquement pour une perte totale confirmée et sourcée')
         t0, t1, b0, b1 = valeurs
         rt, rb = 100 * (t1 / t0 - 1), 100 * (b1 / b0 - 1)
         if not (nombre(rt) and nombre(rb) and nombre(rt - rb)):
@@ -602,8 +640,9 @@ def analyser_lot(nico, lot, racine, pf, sortie, donnees=None, prix_importes=None
     if not nombre(proximite) or not 0 <= proximite <= 100:
         raise ValueError('proximite_pct doit être compris entre 0 et 100')
     entrees = lot.get('dossiers')
-    if not isinstance(entrees, list) or not entrees:
-        raise ValueError('dossiers doit être une liste non vide')
+    if not isinstance(entrees, list) or (not entrees and lot.get('benchmark_portefeuille') is None):
+        raise ValueError('Fournir au moins un dossier ou un benchmark de portefeuille')
+    benchmark = benchmark_portefeuille(lot.get('benchmark_portefeuille'), date)
     precedents = precedents_journal(journal, date)
     if lot.get('revue_precedente'):
         ancien = lire_json(racine / lot['revue_precedente'])
@@ -638,7 +677,7 @@ def analyser_lot(nico, lot, racine, pf, sortie, donnees=None, prix_importes=None
                 abs(seuil_x['ecart_pct']) if seuil_x['ecart_pct'] is not None else math.inf, x['ticker'])
     lignes.sort(key=ordre)
     return dict(version=nico.VERSION, date=date.isoformat(), proximite_pct=proximite, contexte=lot.get('contexte'),
-                dossiers=lignes, erreurs=erreurs, nombre_entrees=len(entrees))
+                dossiers=lignes, erreurs=erreurs, nombre_entrees=len(entrees), benchmark_portefeuille=benchmark)
 
 
 def ecrire_atomique(chemin, contenu):
@@ -811,6 +850,16 @@ def rendu_html(nico, bilan):
     if erreurs:
         erreurs = '<h2>Entrées à corriger</h2><ul>' + erreurs + '</ul>'
     contexte = '<p>' + propre(bilan['contexte']) + '</p>' if bilan['contexte'] else ''
+    b = bilan.get('benchmark_portefeuille')
+    observations_regles = [(x.get('courant') or x['reference']).get('regles') or {} for x in bilan['dossiers']]
+    for cle, titre in [('protection_change_porte_prix', 'Plafond baissier modifiant la porte prix'), ('budget_perte_reduit_taille', 'Budget de perte limitant la taille')]:
+        obs = [r[cle] for r in observations_regles if isinstance(r.get(cle), bool)]
+        if obs:
+            contexte += '<p>%s : %s dossier(s) sur %s évaluables dans ce lot.</p>' % (titre, sum(obs), len(obs))
+    if b:
+        contexte += ('<section><h2>Portefeuille réel contre IWDA</h2><p>%s au %s · rendement total en EUR · portefeuille %s %% · IWDA %s %% · écart %s points.</p><p>%s · %s</p></section>'
+                     % (e(b['debut']), e(b['fin']), nico.fr(b['portefeuille_pct'], 2), nico.fr(b['iwda_pct'], 2),
+                        nico.fr(b['ecart_pts'], 2, True), e(b['conventions']), e(b['source'])))
     entetes = ''.join(f'<th scope="col" role="columnheader">{titre}</th>' for titre in colonnes)
     return (f'<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>Revue trimestrielle NICO</title><style>{CSS}</style></head><body><main><header>'
