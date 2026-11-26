@@ -10073,7 +10073,7 @@ def visite_annonce_html(D, R, data):
             '<p class="vis-sous-titre">Les revenus, les fondations, les travaux, puis le prix.</p>'
             '<div class="vis-ancrages"><a href="#loyer">💶 Voir le loyer</a><a href="#detecteurs">🚨 Voir les risques</a>'
             '<a href="#decision">🔑 Voir l’offre</a><a href="#boussole">🎯 Rendement × confiance</a><a href="#ligne-tri">Copier la ligne TRI</a></div></div>%s</section>') % (
-                entete_html(D, R), titre, visite_tuiles_html(D, R, data), prix, preservation, '')
+                entete_html(D, R), titre, visite_tuiles_html(D, R, data), prix, preservation, visite_certificat(D, R))
 
 
 def _visite_tx(R):
